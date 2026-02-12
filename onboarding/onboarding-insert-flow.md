@@ -13,8 +13,8 @@ This document provides a comprehensive overview of how log data flows through Vi
   - [4. In-Memory Batching](#4-in-memory-batching)
   - [5. Storage Interface](#5-storage-interface)
   - [6. Storage Router](#6-storage-router)
-  - [7. Partition Layer](#7-partition-layer)
-  - [8. Disk Storage](#8-disk-storage)
+  - [7. Day-Based Partitioning (logstorage.Storage)](#7-day-based-partitioning-logstoragestorage)
+  - [8. Partition Layer](#8-partition-layer)
 - [Deployment Modes](#deployment-modes)
   - [Local Storage Mode](#local-storage-mode)
   - [Distributed Storage Mode](#distributed-storage-mode)
@@ -184,11 +184,18 @@ type CommonParams struct {
 }
 ```
 
+The struct shown above is a focused subset for ingestion flow explanation. The actual `CommonParams` in code also includes `PreserveJSONKeys`, `IsTimeFieldSet`, `DebugRequestURI`, and `DebugRemoteAddr`.
+
 **HTTP Parameters Mapping**:
+- Headers `AccountID` / `ProjectID` → `TenantID`
 - Query arg `_time_field` or Header `VL-Time-Field` → `TimeFields`
 - Query arg `_msg_field` or Header `VL-Msg-Field` → `MsgFields`
 - Query arg `_stream_fields` or Header `VL-Stream-Fields` → `StreamFields`
+- Query arg `ignore_fields` or Header `VL-Ignore-Fields` → `IgnoreFields`
+- Query arg `decolorize_fields` or Header `VL-Decolorize-Fields` → `DecolorizeFields`
+- Query arg `preserve_json_keys` or Header `VL-Preserve-JSON-Keys` → `PreserveJSONKeys`
 - Query arg `extra_fields` or Header `VL-Extra-Fields` → `ExtraFields`
+- Query arg `debug` or Header `VL-Debug` → `Debug`
 
 **Location**: [`app/vlinsert/insertutil/common_params.go:49-106`](../app/vlinsert/insertutil/common_params.go#L49)
 
@@ -198,31 +205,49 @@ type CommonParams struct {
 
 **File**: [`app/vlinsert/insertutil/common_params.go`](../app/vlinsert/insertutil/common_params.go#L210)
 
-The `LogMessageProcessor` is responsible for accumulating log rows in memory before flushing to storage.
+The `logMessageProcessor` is the concurrency-safe orchestration layer that wraps a `*logstorage.LogRows` buffer. It is responsible for:
+- Thread-safe accumulation of log rows into the in-memory `LogRows` buffer
+- Deciding **when** to flush (buffer full, periodic timer, or request end)
+- Tracking ingestion metrics (rows count, bytes count, flush duration)
+- Enforcing per-row limits (max fields) and debug mode
+
+#### `logMessageProcessor` vs `*logstorage.LogRows` — why both?
+
+These two types serve different layers:
+
+| | `logMessageProcessor` | `*logstorage.LogRows` |
+|---|---|---|
+| **Layer** | Ingestion orchestration (`app/vlinsert/`) | Storage data structure (`lib/logstorage/`) |
+| **Responsibility** | Mutex locking, flush scheduling, metrics, debug mode, field-count limits | Holding raw row data (fields, timestamps, stream IDs) in memory with arena allocation |
+| **Analogy** | A batching writer that decides *when* to flush | The batch buffer itself that holds *what* to flush |
+| **Lifecycle** | Created per HTTP request (or per stream connection), closed via `MustClose()` | Obtained from a `sync.Pool` via `GetLogRows()`, returned via `PutLogRows()` |
+| **Concurrency** | Thread-safe (mutex-protected) | NOT thread-safe — relies on the processor's mutex |
+
+In short: `logMessageProcessor` owns a `LogRows` and adds concurrency control, batching policy, and metrics on top of it. `LogRows` is a dumb buffer that knows how to store rows efficiently but has no flushing or concurrency logic.
 
 **Key Functions**:
 - [`NewLogMessageProcessor(protocolName, isStreamMode)`](../app/vlinsert/insertutil/common_params.go#L348) - Create new processor
-- [`AddRow(timestamp, fields, streamFieldsLen)`](../app/vlinsert/insertutil/common_params.go#L254) - Add log row
-- [`AddInsertRow(r)`](../app/vlinsert/insertutil/common_params.go#L290) - Add pre-marshaled row
-- [`MustClose()`](../app/vlinsert/insertutil/common_params.go#L335) - Flush and close
-- [`flushLocked()`](../app/vlinsert/insertutil/common_params.go#L320) - Flush to storage
+- [`AddRow(timestamp, fields, streamFieldsLen)`](../app/vlinsert/insertutil/common_params.go#L254) - Add a parsed log row to the in-memory `LogRows` buffer (`lmp.lr`)
+- [`AddInsertRow(r)`](../app/vlinsert/insertutil/common_params.go#L290) - Add a pre-marshaled `InsertRow` to the in-memory `LogRows` buffer (`lmp.lr`)
+- [`MustClose()`](../app/vlinsert/insertutil/common_params.go#L335) - Flush remaining buffered rows to storage and release resources
+- [`flushLocked()`](../app/vlinsert/insertutil/common_params.go#L320) - Send buffered `LogRows` to `logRowsStorage.MustAddRows()`, then reset the buffer
 
 ```go
 type logMessageProcessor struct {
-    mu            sync.Mutex
-    wg            sync.WaitGroup
-    stopCh        chan struct{}
-    lastFlushTime time.Time
+    mu            sync.Mutex       // Protects all fields below; LogRows is not thread-safe on its own
+    wg            sync.WaitGroup   // Tracks the background periodic-flush goroutine (stream mode only)
+    stopCh        chan struct{}     // Signals the periodic-flush goroutine to stop
+    lastFlushTime time.Time        // When the last flush happened; used by periodic flush to avoid redundant flushes
 
-    cp *CommonParams
-    lr *logstorage.LogRows  // In-memory buffer
+    cp *CommonParams               // Ingestion parameters (tenant, stream fields, debug flags, etc.)
+    lr *logstorage.LogRows         // The actual in-memory row buffer; obtained from sync.Pool via GetLogRows()
 
-    rowsIngestedTotal  *metrics.Counter
-    bytesIngestedTotal *metrics.Counter
-    flushDuration      *metrics.Summary
+    rowsIngestedTotal  *metrics.Counter  // Prometheus counter: total rows flushed to storage
+    bytesIngestedTotal *metrics.Counter  // Prometheus counter: total estimated bytes flushed
+    flushDuration      *metrics.Summary  // Prometheus summary: time spent in each flush call
 
-    unflushedRows  int
-    unflushedBytes int
+    unflushedRows  int             // Rows added since last flush (for metrics; reset on flush)
+    unflushedBytes int             // Estimated bytes added since last flush (for metrics; reset on flush)
 }
 ```
 
@@ -241,8 +266,77 @@ lmp := cp.NewLogMessageProcessor("nativeinsert", false)
 
 Rows are accumulated in memory to reduce disk I/O. Flushing occurs when:
 1. Buffer is full (`lmp.lr.NeedFlush()` returns true)
-2. Periodic timer (every ~1 second in stream mode)
+2. Periodic timer (every ~1 second in stream mode — see below)
 3. Request completion (`MustClose()` called)
+
+#### What is "stream mode"?
+
+The `isStreamMode` parameter passed to [`NewLogMessageProcessor`](../app/vlinsert/insertutil/common_params.go#L348) distinguishes two connection patterns:
+
+| | Stream mode (`true`) | Non-stream mode (`false`) |
+|---|---|---|
+| **Connection lifetime** | Long-lived — stays open indefinitely | Short-lived — one HTTP request/response cycle |
+| **When data arrives** | Continuously, possibly with idle gaps | All at once in the request body |
+| **Natural flush point** | None — connection may stay open for hours | `MustClose()` at end of HTTP handler |
+| **Periodic flush needed?** | Yes — otherwise rows could sit in buffer indefinitely during idle periods | No — `MustClose()` guarantees a flush when the request ends |
+
+**Protocols by mode**:
+- **Stream mode**: `syslog_tcp`, `syslog_udp`, `syslog_unix`, `journald`, `jsonline`, `elasticsearch_bulk`
+- **Non-stream mode**: `loki_json`, `loki_protobuf`, `datadog`, `opentelemetry_protobuf`, `nativeinsert`, `internalinsert`
+
+When stream mode is enabled, [`initPeriodicFlush()`](../app/vlinsert/insertutil/common_params.go#L227) spawns a background goroutine with a ~1-second ticker. On each tick, if at least 1 second has elapsed since the last flush, it calls `flushLocked()`. This bounds the maximum latency for data to reach storage, even when logs trickle in slowly.
+
+#### How the buffer works internally
+
+The in-memory buffer is [`*logstorage.LogRows`](../lib/logstorage/log_rows.go#L21) — a pool-allocated data structure from `lib/logstorage/`. Its internal layout:
+
+```
+LogRows
+├── a (arena)                   // Contiguous byte slice for all string data (field names, values, stream tags).
+│                                // Grows as rows are added; reset to [:0] on flush (memory reused, not freed).
+├── fieldsBuf []Field           // Flat buffer of all Field structs across all rows.
+├── rows [][]Field              // Each element is a sub-slice of fieldsBuf for one log entry's fields.
+├── streamIDs []streamID        // One per row: tenantID + 128-bit hash of stream tags.
+├── timestamps []int64          // One per row.
+├── streamTagsCanonicals []string  // One per row: canonical serialized stream tags.
+└── (settings)                  // streamFields, ignoreFields, decolorizeFields, extraFields, defaultMsgValue
+                                 // — preserved across flushes via ResetKeepSettings().
+```
+
+**Flush threshold** ([`NeedFlush()`](../lib/logstorage/log_rows.go#L298)):
+```go
+func (lr *LogRows) NeedFlush() bool {
+    return len(lr.a.b) > (maxUncompressedBlockSize/8)*7 || len(lr.rows) > maxUncompressedBlockSize/100
+}
+```
+Where `maxUncompressedBlockSize` = 2 MB. This means flush when **either**:
+- Arena exceeds ~1.75 MB of accumulated byte data, **or**
+- Row count exceeds ~20,971 entries
+
+After flush, [`ResetKeepSettings()`](../lib/logstorage/log_rows.go#L272) truncates all data slices to `[:0]` (reusing allocated capacity) while preserving field configuration.
+
+#### Ownership flow: who owns what?
+
+The relationship between the three participants is unintuitive at first glance, so here it is explicitly:
+
+```
+logMessageProcessor (app/vlinsert/insertutil/)
+│
+│  owns ──→  *logstorage.LogRows          ← the buffer (lib/logstorage/)
+│              created via GetLogRows()     ← obtained from sync.Pool
+│              returned via PutLogRows()    ← returned to pool in MustClose()
+│
+│  calls ──→  logRowsStorage.MustAddRows(lmp.lr)   ← the flush target
+│              ↑
+│              a package-level singleton (LogRowsStorage interface)
+│              injected at startup via SetLogRowsStorage(&vlstorage.Storage{})
+```
+
+- **`logMessageProcessor`** (in `app/vlinsert/`) owns and manages a `LogRows` instance. It decides *when* to flush.
+- **`LogRows`** (in `lib/logstorage/`) is the buffer. It holds row data and knows its own capacity limits (`NeedFlush`), but has no idea where to send data.
+- **`logRowsStorage`** (the `LogRowsStorage` interface singleton) is the flush target. The processor passes its `LogRows` pointer directly to `logRowsStorage.MustAddRows(lmp.lr)`, which reads the rows out of the buffer and writes them to storage.
+
+Note that `LogRows` is defined in `lib/logstorage/` (the storage library), but it is *owned by* `logMessageProcessor` in `app/vlinsert/` (the ingestion layer). This is because `LogRows` is a data-transfer structure — it's designed to be filled by ingestion code and consumed by storage code. The storage package defines it because it knows the internal format needed for writing.
 
 ```go
 func (lmp *logMessageProcessor) AddInsertRow(r *logstorage.InsertRow) {
@@ -253,10 +347,10 @@ func (lmp *logMessageProcessor) AddInsertRow(r *logstorage.InsertRow) {
     n := logstorage.EstimatedJSONRowLen(r.Fields)
     lmp.unflushedBytes += n
 
-    // Add to buffer
+    // Add to the LogRows buffer
     lmp.lr.MustAddInsertRow(r)
 
-    // Check if flush needed
+    // Flush the buffer to storage if it has accumulated enough data
     if lmp.lr.NeedFlush() {
         lmp.flushLocked()
     }
@@ -330,25 +424,32 @@ func (lmp *logMessageProcessor) flushLocked() {
 
 **File**: [`app/vlstorage/main.go`](../app/vlstorage/main.go#L109)
 
-The `vlstorage.Storage` struct implements the `LogRowsStorage` interface and routes data to either local or distributed storage.
+The `vlstorage.Storage` struct implements the `LogRowsStorage` interface and routes data to either local or distributed storage. This is a thin routing layer — it does not process data itself.
 
 **Key Functions**:
-- `Init()` - Initialize storage mode (line 109)
-- `initLocalStorage()` - Initialize local storage (line 117)
-- `initNetworkStorage()` - Initialize distributed storage (line 164)
-- `Storage.MustAddRows(lr)` - Route data to storage (line 543)
-- `Storage.CanWriteData()` - Check write readiness (line 524)
+- [`Init()`](../app/vlstorage/main.go#L109) - Initialize storage mode
+- [`initLocalStorage()`](../app/vlstorage/main.go#L117) - Initialize local storage
+- [`initNetworkStorage()`](../app/vlstorage/main.go#L164) - Initialize distributed storage
+- [`Storage.MustAddRows(lr)`](../app/vlstorage/main.go#L543) - Route data to storage
+- [`Storage.CanWriteData()`](../app/vlstorage/main.go#L524) - Check write readiness
+
+**Important naming clarification**: There are **two different types both named `Storage`** in the call chain:
+- `vlstorage.Storage` (this section) — an empty struct in `app/vlstorage/` that acts as a router. It has no fields.
+- `logstorage.Storage` (next section) — the actual storage engine in `lib/logstorage/` that manages partitions and disk I/O.
+
+The router delegates to the engine: `vlstorage.Storage.MustAddRows()` → `localStorage.MustAddRows()` (which is `*logstorage.Storage`).
 
 ```go
-// Storage implements insertutil.LogRowsStorage interface
-type Storage struct{}  // Empty struct - just a namespace
+// vlstorage.Storage implements insertutil.LogRowsStorage interface.
+// It is an empty struct — just a namespace for the routing methods.
+type Storage struct{}
 
 func (*Storage) MustAddRows(lr *logstorage.LogRows) {
     if localStorage != nil {
-        // LOCAL MODE: Store data on disk
+        // LOCAL MODE: delegate to logstorage.Storage (the actual storage engine)
         localStorage.MustAddRows(lr)
     } else {
-        // DISTRIBUTED MODE: Send to remote nodes
+        // DISTRIBUTED MODE: fan out rows to remote storage nodes
         lr.ForEachRow(netstorageInsert.AddRow)
     }
 }
@@ -372,8 +473,8 @@ func (*Storage) CanWriteData() error {
 **Mode Selection**:
 
 ```go
-var localStorage *logstorage.Storage
-var netstorageInsert *netinsert.Storage
+var localStorage *logstorage.Storage       // non-nil in local mode
+var netstorageInsert *netinsert.Storage    // non-nil in distributed mode
 
 func Init() {
     if len(*storageNodeAddrs) == 0 {
@@ -388,101 +489,96 @@ func Init() {
 
 ---
 
-### 7. Partition Layer
-
-**File**: [`lib/logstorage/partition.go`](../lib/logstorage/partition.go#L74)
-
-Data is organized into day-based partitions. Each partition has two components:
-
-**Key Functions**:
-- [`mustOpenPartition(s, path)`](../lib/logstorage/partition.go#L74) - Open existing partition
-- [`mustCreatePartition(path)`](../lib/logstorage/partition.go#L52) - Create new partition
-- [`mustAddRows(lr)`](../lib/logstorage/partition.go#L135) - Add rows to partition
-- [`mustClosePartition(pt)`](../lib/logstorage/partition.go#L121) - Close partition
-- **indexdb**: Stream registration and indexing
-- **datadb**: Actual log data storage
-
-```go
-type partition struct {
-    s    *Storage        // Parent storage
-    path string          // Path to partition directory
-    name string          // Partition name (YYYYMMDD)
-    idb  *indexdb        // Index database
-    ddb  *datadb         // Data database
-}
-
-func (pt *partition) mustAddRows(lr *LogRows) {
-    // Register new streams in indexdb
-    for i, rowIdx := range pendingRows {
-        streamID := &streamIDs[rowIdx]
-        if !pt.idb.hasStreamID(streamID) {
-            pt.idb.mustRegisterStream(streamID, streamTagsCanonical)
-        }
-    }
-
-    // Add rows to datadb
-    pt.ddb.mustAddRows(lr)
-}
-```
-
-**Partition Directory Structure**:
-```
-victoria-logs-data/
-└── partitions/
-    ├── 20260211/      # Partition for Feb 11, 2026
-    │   ├── indexdb/   # Stream indexes
-    │   └── datadb/    # Log data (columnar format)
-    ├── 20260212/      # Partition for Feb 12, 2026
-    │   ├── indexdb/
-    │   └── datadb/
-    └── ...
-```
-
-**Location**: [`lib/logstorage/partition.go:23-178`](../lib/logstorage/partition.go#L23)
-
----
-
-### 8. Disk Storage
+### 7. Day-Based Partitioning (logstorage.Storage)
 
 **File**: [`lib/logstorage/storage.go`](../lib/logstorage/storage.go#L1139)
 
-The `logstorage.Storage` manages partitions and handles data retention.
+This is where `localStorage.MustAddRows(lr)` lands in local mode. The `logstorage.Storage` engine is responsible for:
+- Splitting incoming rows by day (each day gets its own partition)
+- Validating timestamps against retention bounds
+- Managing partition lifecycle (creation, lookup, reference counting)
+- Optimizing the common case where all rows belong to the same day ("hot partition")
 
 **Key Functions**:
 - `MustOpenStorage(path, cfg)` - Open storage (called during initialization)
-- [`MustAddRows(lr)`](../lib/logstorage/storage.go#L1139) - Add rows to storage
-- [`getPartitionForWriting(day)`](../lib/logstorage/storage.go#L1233) - Get partition for specific day
+- [`MustAddRows(lr)`](../lib/logstorage/storage.go#L1139) - Split rows by day and dispatch to partitions
+- [`getPartitionForWriting(day)`](../lib/logstorage/storage.go#L1244) - Look up or create partition for a given day
 - `IsReadOnly()` - Check if storage is read-only
 - `MustClose()` - Close storage
 
+#### How rows get from `logstorage.Storage` to `partition`
+
+The connection between the storage engine and partitions is **not direct** — it goes through a `partitionWrapper`:
+
+```
+logstorage.Storage
+│
+│  s.partitions []*partitionWrapper      ← sorted slice, one per day
+│       │
+│       ├── partitionWrapper { day: 20260211, pt: *partition, refCount: ... }
+│       ├── partitionWrapper { day: 20260212, pt: *partition, refCount: ... }  ← s.ptwHot
+│       └── ...
+│
+│  s.ptwHot *partitionWrapper            ← cached pointer to most recently used partition
+```
+
+**`partitionWrapper`** ([`storage.go:538`](../lib/logstorage/storage.go#L538)) is a reference-counted handle around `*partition`:
+
+```go
+type partitionWrapper struct {
+    refCount atomic.Int32    // Active readers/writers; partition closes when this reaches zero
+    mustDrop atomic.Bool     // If true, delete partition directory after close
+    day      int64           // Day number (unix timestamp / nsecsPerDay)
+    pt       *partition      // The actual partition
+    doneCh   chan struct{}   // Closed when refCount reaches zero
+}
+```
+
+Reference counting ensures a partition is not closed while a concurrent write or read is using it. Callers `incRef()` before using a partition and `decRef()` when done.
+
+#### Fast path vs slow path
+
 ```go
 func (s *Storage) MustAddRows(lr *LogRows) {
-    // Fast path - try adding all rows to hot partition
-    if ptwHot != nil && ptwHot.canAddAllRows(lr) {
-        ptwHot.pt.mustAddRows(lr)
-        return
+    // ── FAST PATH ──────────────────────────────────────────────
+    // Most batches contain rows from a single day (e.g., "now").
+    // If the hot partition can accept ALL rows, skip day-splitting entirely.
+    s.partitionsLock.Lock()
+    ptwHot := s.ptwHot
+    if ptwHot != nil {
+        ptwHot.incRef()
+    }
+    s.partitionsLock.Unlock()
+
+    if ptwHot != nil {
+        if ptwHot.canAddAllRows(lr) {       // Do all timestamps fall within this day?
+            ptwHot.pt.mustAddRows(lr)        // Yes → write directly to partition
+            ptwHot.decRef()
+            return
+        }
+        ptwHot.decRef()
     }
 
-    // Slow path - split rows among partitions by day
+    // ── SLOW PATH ──────────────────────────────────────────────
+    // Rows span multiple days, or there is no hot partition yet.
+    // Split rows by day into separate LogRows, then dispatch each.
     now := time.Now().UnixNano()
-    minAllowedDay := s.getMinAllowedDay(now)
-    maxAllowedDay := s.getMaxAllowedDay(now)
+    minAllowedDay := s.getMinAllowedDay(now)    // Based on -retentionPeriod
+    maxAllowedDay := s.getMaxAllowedDay(now)    // Based on -futureRetention
 
-    m := make(map[int64]*LogRows)
+    m := make(map[int64]*LogRows)               // day → rows for that day
     for i, ts := range lr.timestamps {
-        day := ts / nsecsPerDay
+        day := ts / nsecsPerDay                 // nsecsPerDay = 86400 * 1e9
 
-        // Validate timestamp against retention
-        if day < minAllowedDay {
+        if day < minAllowedDay {                // Too old → drop
             s.rowsDroppedTooSmallTimestamp.Add(1)
             continue
         }
-        if day > maxAllowedDay {
+        if day > maxAllowedDay {                // Too far in future → drop
             s.rowsDroppedTooBigTimestamp.Add(1)
             continue
         }
 
-        // Add to appropriate day partition
         lrPart := m[day]
         if lrPart == nil {
             lrPart = GetLogRows(nil, nil, nil, nil, "")
@@ -491,16 +587,27 @@ func (s *Storage) MustAddRows(lr *LogRows) {
         lrPart.mustAddInternal(lr.streamIDs[i], ts, lr.rows[i], lr.streamTagsCanonicals[i])
     }
 
-    // Write each day's data to its partition
     for day, lrPart := range m {
-        ptw := s.getPartitionForWriting(day)
+        ptw := s.getPartitionForWriting(day)    // Binary search + create if missing
         if ptw != nil {
-            ptw.pt.mustAddRows(lrPart)
+            ptw.pt.mustAddRows(lrPart)           // Dispatch to partition
+            ptw.decRef()
         }
-        PutLogRows(lrPart)
+        PutLogRows(lrPart)                       // Return temporary LogRows to pool
     }
 }
 ```
+
+**`canAddAllRows`** ([`storage.go:594`](../lib/logstorage/storage.go#L594)) checks if every timestamp in the batch falls within the hot partition's day boundary (`[day * nsecsPerDay, (day+1) * nsecsPerDay - 1]`).
+
+#### Partition lookup and creation
+
+**`getPartitionForWriting(day)`** ([`storage.go:1244`](../lib/logstorage/storage.go#L1244)):
+1. **Binary search** `s.partitions` (sorted by day) for the requested day
+2. **If found**: increment ref count and return
+3. **If missing**: check if it was previously deleted or detached → return `nil` (rows dropped)
+4. **Otherwise**: create the partition on demand (`mustCreatePartition` + `mustOpenPartition`), insert into the sorted slice, and return
+5. **Always updates `s.ptwHot`** to the returned partition (so the next call hits the fast path)
 
 **Storage Configuration**:
 ```go
@@ -515,7 +622,120 @@ type StorageConfig struct {
 }
 ```
 
-**Location**: [`lib/logstorage/storage.go:1139-1217`](../lib/logstorage/storage.go#L1139)
+The struct above is intentionally trimmed to fields most relevant to this insert-path walkthrough. The actual `StorageConfig` also contains `DefaultParallelReaders`, `SnapshotsMaxAge`, `LogNewStreams`, and `LogIngestedRows`.
+
+Important behavior detail: although the flag default for `-maxBackfillAge` is `0`, storage normalizes non-positive values to `retention`, so the effective default is "bounded by retention", not "disabled".
+
+**Location**: [`lib/logstorage/storage.go:1139-1293`](../lib/logstorage/storage.go#L1139)
+
+---
+
+### 8. Partition Layer
+
+**File**: [`lib/logstorage/partition.go`](../lib/logstorage/partition.go#L74)
+
+A partition holds all log data for a single day. It has two sub-databases:
+- **indexdb**: Maps stream IDs to stream tag metadata. Used during queries to find which streams match a filter.
+- **datadb**: Stores the actual log rows in a columnar format.
+
+**Key Functions**:
+- [`mustOpenPartition(s, path)`](../lib/logstorage/partition.go#L74) - Open existing partition from disk
+- [`mustCreatePartition(path)`](../lib/logstorage/partition.go#L52) - Create new partition directory
+- [`mustAddRows(lr)`](../lib/logstorage/partition.go#L135) - Register streams + write rows
+- [`mustClosePartition(pt)`](../lib/logstorage/partition.go#L121) - Close partition
+
+```go
+type partition struct {
+    s    *Storage        // Parent storage (for accessing shared config like logNewStreams)
+    path string          // Absolute path to partition directory on disk
+    name string          // Partition name (YYYYMMDD format)
+    idb  *indexdb        // Stream index — maps streamID → stream tag metadata
+    ddb  *datadb         // Data storage — log rows in columnar format
+}
+```
+
+#### What `mustAddRows` does
+
+By the time rows reach `partition.mustAddRows()`, they have already been split by day (section 7), so all rows in the batch belong to this partition's day. The method does two things:
+
+```go
+func (pt *partition) mustAddRows(lr *LogRows) {
+    // ── PHASE 1: Stream registration ─────────────────────────
+    // Identify streamIDs that are not yet known to this partition's indexdb.
+    // Uses a fast in-memory cache (pt.hasStreamIDInCache) to avoid hitting
+    // indexdb for every row. Only truly new streams get registered.
+    var pendingRows []int
+    streamIDs := lr.streamIDs
+    for i := range lr.timestamps {
+        streamID := &streamIDs[i]
+        if pt.hasStreamIDInCache(streamID) {
+            continue
+        }
+        if len(pendingRows) == 0 || !streamIDs[pendingRows[len(pendingRows)-1]].equal(streamID) {
+            pendingRows = append(pendingRows, i)
+        }
+    }
+    if len(pendingRows) > 0 {
+        // Sort and deduplicate, then register each new stream in indexdb
+        for _, rowIdx := range pendingRows {
+            streamID := &streamIDs[rowIdx]
+            if !pt.idb.hasStreamID(streamID) {
+                pt.idb.mustRegisterStream(streamID, lr.streamTagsCanonicals[rowIdx])
+            }
+            pt.putStreamIDToCache(streamID)
+        }
+    }
+
+    // ── PHASE 2: Data storage ────────────────────────────────
+    // Write all rows to the data database (columnar on-disk format).
+    pt.ddb.mustAddRows(lr)
+}
+```
+
+**Phase 1 (stream registration)** ensures the indexdb knows about every log stream before data is written. A stream is identified by its `streamID` (tenant + 128-bit hash of stream tag values). The in-memory cache (`hasStreamIDInCache`) makes this cheap for streams that have already been seen in this partition.
+
+**Phase 2 (data storage)** writes the actual log row data to `datadb`, which manages the columnar on-disk format.
+
+#### What happens next? (Handoff to the Storage Engine)
+
+This is where the insert flow document ends and the **storage engine** takes over. The call `pt.ddb.mustAddRows(lr)` enters the LSM-tree pipeline inside `datadb`:
+
+```
+pt.ddb.mustAddRows(lr)                          ← YOU ARE HERE (end of insert flow)
+    ↓
+rowsBuffer (sharded per-CPU lock-free buffer)    ← Amortizes locking cost
+    ↓  flush (buffer full or 1-second timer)
+inmemoryPart.mustInitFromRows(lr)                ← Sort by stream+time, encode into columnar blocks
+    ↓                                               DATA IS NOW QUERYABLE
+mustOpenInmemoryPart(pt, mp)                     ← Wrap as searchable part
+    ↓
+ddb.inmemoryParts list                           ← Added to in-memory tier
+    ↓  background merge workers
+Small file parts → Big file parts                ← Three-tier LSM compaction
+    ↓
+DISK: partitions/YYYYMMDD/datadb/<mergeIdx>/     ← Final resting place
+```
+
+Similarly, `pt.idb.mustRegisterStream()` writes stream metadata into the `indexdb`, which is backed by VictoriaMetrics' `mergeset` library (a sorted key-value store with its own merge/compaction).
+
+**For the full details of everything below `ddb.mustAddRows()`** — the sharded buffer, in-memory parts, block encoding, column compression, bloom filters, merge/compaction, and on-disk file format — see:
+
+> **[Storage Engine & On-Disk Format Guide](./onboarding-storage-engine.md)** — sections [3. DataDB Layer](./onboarding-storage-engine.md#3-datadb-layer) through [10. IndexDB](./onboarding-storage-engine.md#10-indexdb-stream-metadata)
+
+**Partition Directory Structure**:
+```
+victoria-logs-data/
+└── partitions/
+    ├── 20260211/      # Partition for Feb 11, 2026
+    │   ├── indexdb/   # Stream indexes (streamID → stream tag metadata)
+    │   └── datadb/    # Log data (columnar format: timestamps, fields, etc.)
+    ├── 20260212/      # Partition for Feb 12, 2026
+    │   ├── indexdb/
+    │   └── datadb/
+    └── ...
+```
+
+**Location**: [`lib/logstorage/partition.go:23-178`](../lib/logstorage/partition.go#L23)
 
 ---
 
@@ -543,6 +763,8 @@ func initLocalStorage() {
     localStorage = logstorage.MustOpenStorage(*storageDataPath, cfg)
 }
 ```
+
+This snippet is abbreviated for readability. The actual initialization also sets additional `StorageConfig` fields such as `DefaultParallelReaders`, `MaxDiskSpaceUsageBytes`, `MaxDiskUsagePercent`, `FutureRetention`, `MaxBackfillAge`, `SnapshotsMaxAge`, `LogNewStreams`, and `LogIngestedRows`.
 
 **Data Flow**:
 ```
@@ -618,6 +840,8 @@ func (s *Storage) AddRow(streamHash uint64, r *logstorage.InsertRow) {
     sn.addRow(r)                         // Send to that node
 }
 ```
+
+`sn.addRow(r)` appends to a per-node pending buffer. Network send can happen immediately when the buffer hits 2MB, or later via the background flusher (about once per second).
 
 **Adaptive Stream Routing**:
 - For the first 1000 rows of a stream, routing is `streamHash % nodesCount` for locality.
@@ -805,6 +1029,8 @@ func parseData(irp insertutil.InsertRowProcessor, data []byte) error {
 
 ### Complete Distributed Flow
 
+The diagram below is a logical end-to-end path. In practice, forwarding from Node A to Node B is buffered and may be asynchronous (periodic flush or full-buffer flush), so it is not necessarily a synchronous send per ingested row.
+
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │ CLIENT → Node A (Frontend/Ingestion Node)                       │
@@ -855,12 +1081,12 @@ func parseData(irp insertutil.InsertRowProcessor, data []byte) error {
 |--------|------------------|-------------------|
 | **Purpose** | Accept logs from external clients | Accept logs from other VictoriaLogs nodes |
 | **Data Format** | Pre-marshaled `InsertRow` objects (same encoding as `/internal/insert`) | Pre-marshaled `InsertRow` objects |
-| **Tenant ID** | Header tenant is authoritative; row tenant in payload is overwritten | Row tenant in payload is used; AccountID/ProjectID headers are ignored |
+| **Tenant ID** | Header tenant is authoritative; row tenant in payload is overwritten | Row tenant in payload is used; AccountID/ProjectID headers are not used for row tenant (if present and valid, they are parsed then reset/ignored) |
 | **Stream/Time/Msg/Decolorize params** | `_stream_fields`, `_time_field`, `_msg_field`, `decolorize_fields` are ignored with warning | Same params are ignored with warning |
 | **Field Parsing** | No JSON/text field parsing; binary row decode only | No parsing (already marshaled) |
 | **Compression** | Optional (client-dependent) | Usually zstd from sender |
 | **Usage** | External native clients (for example, `vlagent`) | Internal cluster communication |
-| **Security Flag** | `-insert.disable` | `-internalinsert.disable` |
+| **Security Flag** | `-insert.disable` | `-internalinsert.disable` (and also disabled by `-insert.disable`) |
 | **Performance** | Low overhead binary decode + limited parameter handling | Minimal overhead (pre-processed) |
 
 ### Why Two Different Endpoints?
@@ -869,7 +1095,7 @@ func parseData(irp insertutil.InsertRowProcessor, data []byte) error {
 
 2. **Efficiency**: both endpoints use the same binary `InsertRow` format, so neither needs JSON/text parsing
 
-3. **Security**: Can disable `/internal/insert` with `-internalinsert.disable` to prevent external abuse
+3. **Security**: Can disable `/internal/insert` with `-internalinsert.disable` (or globally with `-insert.disable`) to prevent external abuse
 
 4. **Avoid Double-Processing**: `/internal/insert` skips external-API semantics and ingests already-marshaled rows directly
 
@@ -996,7 +1222,7 @@ Important guardrails that affect correctness and troubleshooting:
     Allow data this far into future (default: 2d)
 
 -maxBackfillAge duration
-    Maximum age for historical data (default: 0 - disabled)
+    Maximum age for historical data (flag default: 0; effective behavior: values <= 0 are normalized to retention)
 
 -inmemoryDataFlushInterval duration
     Flush interval for in-memory data (default: 5s)

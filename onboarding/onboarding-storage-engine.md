@@ -40,7 +40,7 @@ VictoriaLogs stores log data in a **part-based LSM-tree** (Log-Structured Merge-
 4. In-memory parts are **flushed to disk** as small file-backed parts
 5. Background **merge workers** continuously compact small parts into larger ones
 
-This guide is intentionally scoped to the local storage engine (`lib/logstorage`) used by `vlstorage` when local storage is enabled.
+This guide is intentionally scoped to the local storage engine (`lib/logstorage`) used by `vlstorage` when local storage is enabled. For how data reaches `Storage.MustAddRows()` — HTTP endpoints, common parameters, batching, the storage router, and distributed mode — see the **[Data Ingestion Flow Guide](./onboarding-insert-flow.md)**.
 
 Each partition contains two subsystems:
 - **datadb** — stores the actual log data in parts (columnar blocks with bloom filters)
