@@ -4,6 +4,8 @@ This folder contains in-repo onboarding guides for engineers who need to underst
 
 Use this file as the entry point and reading plan.
 
+If you encounter unfamiliar terms (LSM-tree, bloom filter, mergeset, etc.), see the [Glossary](./glossary.md).
+
 ## Recommended Order
 
 1. [`onboarding-system-overview.md`](./onboarding-system-overview.md)
@@ -61,6 +63,14 @@ Common commands and where they are defined:
   - [`make apptest`](../Makefile#L308)
 - Integration test harness overview:
   - [`apptest/README.md`](../apptest/README.md)
+
+## Planned Docs (TODO)
+
+The following topics are not yet covered and should get their own onboarding guides:
+
+- **vmui frontend** (`app/vmui/`) — React web UI: build system, component structure, how it calls `/select/logsql/*` endpoints, local dev workflow.
+- **vlagent internals** (`app/vlagent/`) — Log collection agent: Kubernetes collector, native insert client, configuration, retry/backpressure behavior.
+- **vlogscli internals** (`app/vlogscli/`) — Interactive CLI: REPL loop, query execution, output formatting, connection handling.
 
 ## What To Learn Next After These Docs
 

@@ -9,6 +9,8 @@ It answers:
 - Where startup, routing, flow control, and metrics are implemented
 - Which files to open first when changing a specific subsystem
 
+For unfamiliar terms (LSM-tree, bloom filter, mergeset, zstd, etc.), see the [Glossary](./glossary.md).
+
 ## Table of Contents
 
 - [Overview](#overview)
