@@ -30,7 +30,7 @@ VictoriaLogs ingests log data through multiple HTTP endpoints (e.g., `/insert/na
 
 ### What is "Native Insert"?
 
-"Native" refers to VictoriaLogs' own internal binary protocol — as opposed to standard text/JSON formats from other ecosystems. When a client sends data to `/insert/native`, it sends pre-serialized `InsertRow` objects in VictoriaLogs' binary encoding (tenant ID, stream tags, timestamp, and fields already marshaled into a compact binary representation). The server only needs to decode the binary data — no JSON parsing, no field mapping, no timestamp format detection.
+"Native" refers to VictoriaLogs' own internal binary protocol — as opposed to standard text/JSON formats from other ecosystems. When a client sends data to `/insert/native`, it sends pre-serialized `InsertRow` objects in VictoriaLogs' binary encoding. The server decodes these rows and applies limited common ingestion options (for example, tenant override from headers, ignore/extra/debug handling). It does not perform JSON parsing or timestamp-format detection.
 
 ### How Does It Differ from Other Formats?
 
@@ -38,7 +38,7 @@ The other ingestion endpoints accept **industry-standard formats** that require 
 
 | Endpoint | Client sends | Parsing work |
 |----------|-------------|-------------|
-| `/insert/native` | VictoriaLogs binary (`InsertRow` objects) | Minimal — binary decode only |
+| `/insert/native` | VictoriaLogs binary (`InsertRow` objects) | Binary decode + limited common-params processing (e.g., tenant override, ignore/extra/debug); no JSON parsing |
 | `/insert/jsonline` | Newline-delimited JSON (`{"msg":"foo","ts":"..."}`) | JSON parsing per line, field extraction, timestamp detection |
 | `/insert/elasticsearch/_bulk` | Elasticsearch bulk format (alternating command + data JSON lines) | JSON parsing, Elasticsearch timestamp format handling (ISO8601, Unix ms/s) |
 | `/insert/loki/api/v1/push` | Loki protobuf or JSON (Grafana's push format) | Protobuf/JSON decoding, stream label extraction |
@@ -47,9 +47,9 @@ The other ingestion endpoints accept **industry-standard formats** that require 
 | Syslog (TCP/UDP socket) | RFC 3164/5424 syslog | Text parsing, priority/facility extraction, timezone handling |
 | `/insert/journald/upload` | systemd journal binary export | Binary format parsing, field extraction |
 
-All formats eventually converge on the same internal path: fields + timestamp → `AddRow()` → storage. The difference is how much work happens before that point. Native insert skips essentially all of it because the data is already in VictoriaLogs' internal format.
+All formats eventually converge on the same storage path. Most text protocols go through field/timestamp extraction and then `AddRow()`. Native/internal protocols decode pre-marshaled `InsertRow` objects and use `AddInsertRow()` instead.
 
-**Who uses native insert?** Primarily `vlagent` (VictoriaLogs' own log collection agent) and inter-node cluster communication (via `/internal/insert`). The standard-format endpoints exist for ecosystem compatibility — letting users send logs from fluent-bit, Promtail, OpenTelemetry Collector, Datadog Agent, rsyslog, and other tools without a format conversion layer.
+**Who uses native insert?** Primarily `vlagent` (VictoriaLogs' own log collection agent). Cluster communication uses `/internal/insert`, which shares the same binary row format but has a different trust/parameter model.
 
 ### Deployment Modes
 
@@ -83,7 +83,7 @@ Parse & Add Rows                          [nativeinsert.go:94](../app/vlinsert/n
     ↓
 In-Memory Buffer Accumulation             [common_params.go:290](../app/vlinsert/insertutil/common_params.go#L290)
     ↓
-Flush Trigger (buffer full/periodic)      [common_params.go:320](../app/vlinsert/insertutil/common_params.go#L320)
+Flush Trigger (buffer full / request end) [common_params.go:320](../app/vlinsert/insertutil/common_params.go#L320)
     ↓
 logRowsStorage.MustAddRows(lr)            [common_params.go:323](../app/vlinsert/insertutil/common_params.go#L323)
     ↓
@@ -98,12 +98,12 @@ vlstorage.Storage.MustAddRows(lr)         [main.go:543](../app/vlstorage/main.go
     │       ↓
     │   indexdb + datadb writes           [partition.go:162](../lib/logstorage/partition.go#L162)
     │       ↓
-    │   DISK: victoria-logs-data/YYYYMMDD/{indexdb,datadb}
+    │   DISK: victoria-logs-data/partitions/YYYYMMDD/{indexdb,datadb}
     │
     └─→ [DISTRIBUTED MODE]
         lr.ForEachRow(netstorageInsert.AddRow)  [main.go:549](../app/vlstorage/main.go#L549)
             ↓
-        Hash-based Node Selection         [netinsert.go:376](../app/vlstorage/netinsert/netinsert.go#L376)
+        Adaptive Stream Routing            [netinsert.go:376](../app/vlstorage/netinsert/netinsert.go#L376)
             ↓
         Marshal & Batch (2MB blocks)      [netinsert.go:157](../app/vlstorage/netinsert/netinsert.go#L157)
             ↓
@@ -333,13 +333,6 @@ func (lmp *logMessageProcessor) flushLocked() {
 The `vlstorage.Storage` struct implements the `LogRowsStorage` interface and routes data to either local or distributed storage.
 
 **Key Functions**:
-- [`Init()`](../app/vlstorage/main.go#L109) - Initialize storage mode
-- [`initLocalStorage()`](../app/vlstorage/main.go#L117) - Initialize local storage
-- [`initNetworkStorage()`](../app/vlstorage/main.go#L164) - Initialize distributed storage
-- [`Storage.MustAddRows(lr)`](../app/vlstorage/main.go#L543) - Route data to storage
-- [`Storage.CanWriteData()`](../app/vlstorage/main.go#L524) - Check write readiness
-
-**Key Functions**:
 - `Init()` - Initialize storage mode (line 109)
 - `initLocalStorage()` - Initialize local storage (line 117)
 - `initNetworkStorage()` - Initialize distributed storage (line 164)
@@ -435,13 +428,14 @@ func (pt *partition) mustAddRows(lr *LogRows) {
 **Partition Directory Structure**:
 ```
 victoria-logs-data/
-├── 20260211/          # Partition for Feb 11, 2026
-│   ├── indexdb/       # Stream indexes
-│   └── datadb/        # Log data (columnar format)
-├── 20260212/          # Partition for Feb 12, 2026
-│   ├── indexdb/
-│   └── datadb/
-└── ...
+└── partitions/
+    ├── 20260211/      # Partition for Feb 11, 2026
+    │   ├── indexdb/   # Stream indexes
+    │   └── datadb/    # Log data (columnar format)
+    ├── 20260212/      # Partition for Feb 12, 2026
+    │   ├── indexdb/
+    │   └── datadb/
+    └── ...
 ```
 
 **Location**: [`lib/logstorage/partition.go:23-178`](../lib/logstorage/partition.go#L23)
@@ -568,7 +562,7 @@ Partition by day
     ↓
 indexdb + datadb
     ↓
-Disk: /data/victoria-logs-data/YYYYMMDD/
+Disk: /data/victoria-logs-data/partitions/YYYYMMDD/
 ```
 
 **Characteristics**:
@@ -616,19 +610,19 @@ func initNetworkStorage() {
 - [`NewStorage(addrs, authCfgs, isTLSs, concurrency, disableCompression)`](../app/vlstorage/netinsert/netinsert.go#L322) - Create network storage
 - [`AddRow(streamHash, r)`](../app/vlstorage/netinsert/netinsert.go#L375) - Add row to remote storage
 - [`sendInsertRequestToAnyNode(pendingData)`](../app/vlstorage/netinsert/netinsert.go#L381) - Retry logic
-- [`DebugFlush()`](../app/vlstorage/netinsert/netinsert.go#L147) - Force flush for debugging
+- [`DebugFlush()`](../app/vlstorage/netinsert/netinsert.go#L366) - Force flush for debugging
 ```go
 func (s *Storage) AddRow(streamHash uint64, r *logstorage.InsertRow) {
-    idx := s.srt.getNodeIdx(streamHash)  // Hash-based routing
+    idx := s.srt.getNodeIdx(streamHash)  // Adaptive stream routing policy
     sn := s.sns[idx]                     // Select storage node
     sn.addRow(r)                         // Send to that node
 }
 ```
 
-**Stream Affinity**: All logs from the same stream (identified by stream fields) are routed to the same storage node. This ensures:
-- Efficient querying (stream data is co-located)
-- Consistent hashing for balanced distribution
-- Reduced cross-node queries
+**Adaptive Stream Routing**:
+- For the first 1000 rows of a stream, routing is `streamHash % nodesCount` for locality.
+- After 1000 rows, rows from that stream are randomly spread across nodes for better parallel query performance.
+- This balances locality for small streams with fan-out for high-volume streams.
 
 **Batching**:
 
@@ -702,6 +696,7 @@ func (sn *storageNode) mustSendInsertRequest(pendingData *bytesutil.ByteBuffer) 
 - Failed node temporarily disabled for 10 seconds
 - Data automatically re-routed to healthy nodes
 - Retries until successful or shutdown
+- If all nodes stay unavailable and shutdown happens, pending data can be dropped
 - Metrics track node reachability
 
 **Characteristics**:
@@ -765,7 +760,7 @@ func RequestHandler(w http.ResponseWriter, r *http.Request) {
     // Get common params (mostly ignored for /internal/insert)
     cp, err := insertutil.GetCommonParams(r)
 
-    // Reset params since they're already embedded in marshaled data
+    // Reset params unsupported by /internal/insert
     cp.TenantID = logstorage.TenantID{}
     cp.TimeFields = nil
     cp.MsgFields = nil
@@ -816,13 +811,13 @@ func parseData(irp insertutil.InsertRowProcessor, data []byte) error {
 │                                                                  │
 │  POST /insert/native                                            │
 │    ↓                                                            │
-│  Parse JSON/Native format                                       │
+│  Decode native InsertRow binary payload                         │
 │    ↓                                                            │
-│  Extract fields, parse timestamps                               │
+│  Override row tenant with AccountID/ProjectID headers           │
 │    ↓                                                            │
-│  Marshal to InsertRow                                           │
+│  AddInsertRow() to ingestion buffer                             │
 │    ↓                                                            │
-│  Hash stream → Select Node B                                    │
+│  Apply stream routing policy → Select Node B                    │
 │    ↓                                                            │
 │  Batch & Compress                                               │
 │    ↓                                                            │
@@ -840,7 +835,7 @@ func parseData(irp insertutil.InsertRowProcessor, data []byte) error {
 │    ↓                                                            │
 │  Unmarshal InsertRow objects                                    │
 │    ↓                                                            │
-│  NO re-parsing (already processed)                              │
+│  NO field/timestamp re-parsing (already marshaled)              │
 │    ↓                                                            │
 │  LogMessageProcessor buffer                                     │
 │    ↓                                                            │
@@ -850,7 +845,7 @@ func parseData(irp insertutil.InsertRowProcessor, data []byte) error {
 │    ↓                                                            │
 │  indexdb + datadb                                               │
 │    ↓                                                            │
-│  DISK: victoria-logs-data/YYYYMMDD/{indexdb,datadb}            │
+│  DISK: victoria-logs-data/partitions/YYYYMMDD/{indexdb,datadb} │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
@@ -859,24 +854,24 @@ func parseData(irp insertutil.InsertRowProcessor, data []byte) error {
 | Aspect | `/insert/native` | `/internal/insert` |
 |--------|------------------|-------------------|
 | **Purpose** | Accept logs from external clients | Accept logs from other VictoriaLogs nodes |
-| **Data Format** | Client-specific protocol | Pre-marshaled `InsertRow` objects |
-| **Tenant ID** | Extracted from HTTP headers | Embedded in data (headers ignored) |
-| **Stream/Time Fields** | Configurable via query params | Already processed (ignored) |
-| **Field Parsing** | Full parsing and validation | No parsing (already done) |
+| **Data Format** | Pre-marshaled `InsertRow` objects (same encoding as `/internal/insert`) | Pre-marshaled `InsertRow` objects |
+| **Tenant ID** | Header tenant is authoritative; row tenant in payload is overwritten | Row tenant in payload is used; AccountID/ProjectID headers are ignored |
+| **Stream/Time/Msg/Decolorize params** | `_stream_fields`, `_time_field`, `_msg_field`, `decolorize_fields` are ignored with warning | Same params are ignored with warning |
+| **Field Parsing** | No JSON/text field parsing; binary row decode only | No parsing (already marshaled) |
 | **Compression** | Optional (client-dependent) | Usually zstd from sender |
-| **Usage** | External (vlagent, fluent-bit, etc.) | Internal cluster communication |
+| **Usage** | External native clients (for example, `vlagent`) | Internal cluster communication |
 | **Security Flag** | `-insert.disable` | `-internalinsert.disable` |
-| **Performance** | Full processing overhead | Minimal overhead (pre-processed) |
+| **Performance** | Low overhead binary decode + limited parameter handling | Minimal overhead (pre-processed) |
 
 ### Why Two Different Endpoints?
 
-1. **Separation of Concerns**: `/insert/native` handles external clients with full parameter processing; `/internal/insert` handles trusted pre-processed data
+1. **Separation of Concerns**: `/insert/native` is externally exposed and enforces header-based tenant override; `/internal/insert` is for trusted inter-node traffic and keeps tenant from payload
 
-2. **Efficiency**: `/internal/insert` skips parsing/validation since data is already in internal format
+2. **Efficiency**: both endpoints use the same binary `InsertRow` format, so neither needs JSON/text parsing
 
 3. **Security**: Can disable `/internal/insert` with `-internalinsert.disable` to prevent external abuse
 
-4. **Avoid Double-Processing**: Data sent to `/internal/insert` has already been through field mapping, time parsing, etc.
+4. **Avoid Double-Processing**: `/internal/insert` skips external-API semantics and ingests already-marshaled rows directly
 
 ---
 
@@ -937,7 +932,7 @@ Multiple levels of batching reduce I/O:
 
 ### 5. Background Flushing
 
-Periodic background flushing ensures data durability:
+Periodic background flushing reduces the in-memory window and improves durability:
 
 ```go
 func (lmp *logMessageProcessor) initPeriodicFlush() {
@@ -958,6 +953,21 @@ func (lmp *logMessageProcessor) initPeriodicFlush() {
     })
 }
 ```
+
+### 6. Ingestion Limits and Drop Conditions
+
+Important guardrails that affect correctness and troubleshooting:
+
+- `-insert.maxLineSizeBytes` (default 256KB): overlong lines are skipped by `LineReader` (`vl_too_long_lines_skipped_total`).
+- `-insert.maxFieldsPerLine` (default 1000): rows with too many fields are dropped (`vl_rows_dropped_total{reason="too_many_fields"}`).
+- Distributed `netinsert` has a hard 2MB per-row transfer limit (`maxInsertBlockSize`); oversized rows are skipped.
+- In distributed mode, pending blocks can be dropped on shutdown if all storage nodes are unavailable.
+
+**Key references**:
+- [`app/vlinsert/insertutil/line_reader.go#L105`](../app/vlinsert/insertutil/line_reader.go#L105)
+- [`app/vlinsert/insertutil/common_params.go#L263`](../app/vlinsert/insertutil/common_params.go#L263)
+- [`app/vlstorage/netinsert/netinsert.go#L163`](../app/vlstorage/netinsert/netinsert.go#L163)
+- [`app/vlstorage/netinsert/netinsert.go#L216`](../app/vlstorage/netinsert/netinsert.go#L216)
 
 ---
 
@@ -1070,14 +1080,14 @@ The VictoriaLogs ingestion flow is designed for:
 
 1. **Performance**: Multi-level batching and background flushing minimize I/O
 2. **Scalability**: Distributed mode enables horizontal scaling
-3. **Reliability**: Retry logic and failover ensure data durability
+3. **Reliability**: Retry logic and failover improve availability, but do not provide hard durability guarantees during prolonged full-cluster outage + shutdown
 4. **Flexibility**: Support for both local and distributed deployments
 5. **Efficiency**: Object pooling and compression reduce resource usage
 6. **Simplicity**: Clean interfaces and separation of concerns
 
 The key insight is the **dual-path architecture**:
 - Simple path: Single node, direct to disk
-- Complex path: Distributed nodes with hash-based routing and network transport
+- Complex path: Distributed nodes with adaptive stream routing and network transport
 
 Both paths converge at the `LogRowsStorage` interface, making the system modular and testable.
 
@@ -1099,7 +1109,7 @@ All file and line number references must use the following format:
 
 **Key requirements**:
 - Use capital `L` prefix before the line number (e.g., `#L28`, not `#28`)
-- Use relative paths from repository root
+- Use consistent relative paths from this document location (this file currently uses `../` to reach repo root)
 - Include line numbers wherever possible
 
 #### Standard Patterns
@@ -1179,7 +1189,7 @@ When adding new file references to this document:
 
 Before committing changes to this document:
 
-- [ ] All file paths use relative paths from repository root
+- [ ] All file paths use a consistent relative base (as used throughout this file)
 - [ ] All line number anchors use `#L` prefix (capital L)
 - [ ] All links tested and navigate correctly in VS Code
 - [ ] No plain text file references (should be clickable markdown links)

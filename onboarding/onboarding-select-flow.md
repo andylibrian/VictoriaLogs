@@ -29,7 +29,11 @@ This document provides a comprehensive overview of how log queries flow through 
 
 ## Overview
 
-VictoriaLogs exposes multiple HTTP endpoints under `/select/logsql/*` for querying log data. All query endpoints accept a LogsQL query string, parse it into an internal query representation, execute it against either local or distributed storage, and stream results back to the client as JSON.
+VictoriaLogs exposes multiple HTTP endpoints under `/select/logsql/*` for querying log data. Most of these endpoints accept a LogsQL `query` string, parse it into an internal query representation, execute it against either local or distributed storage, and return JSON results.
+
+Important exceptions:
+- `/select/tenant_ids` does not accept a LogsQL query. It scans tenant IDs over a time range.
+- `/select/logsql/query_time_range` parses query time bounds but does not execute a storage scan.
 
 ### Query Endpoints at a Glance
 
@@ -46,15 +50,19 @@ VictoriaLogs exposes multiple HTTP endpoints under `/select/logsql/*` for queryi
 | `/select/logsql/stream_ids` | List stream IDs | `application/json` |
 | `/select/logsql/stream_field_names` | List stream field names | `application/json` |
 | `/select/logsql/stream_field_values` | List values for a stream field | `application/json` |
-| `/select/logsql/tail` | Live tailing (long-lived SSE connection) | `application/x-ndjson` |
+| `/select/logsql/tail` | Live tailing (long-lived NDJSON stream) | `application/x-ndjson` |
 | `/select/logsql/query_time_range` | Return the effective time range for a query | `application/json` |
-| `/select/tenant_ids` | List tenant IDs | `application/json` |
+| `/select/tenant_ids` | List tenant IDs (requires empty `AccountID` header) | `application/json` |
 
 ### Deployment Modes
 
 The system supports two deployment modes — the same dual-path architecture used for ingestion:
 - **Local Mode**: Single node querying data from local disk
 - **Distributed Mode**: Frontend (vlselect) fans out queries to storage nodes (vlstorage) via `/internal/select/*`
+
+### Stream Endpoint Prerequisite
+
+`/select/logsql/streams`, `/select/logsql/stream_ids`, `/select/logsql/stream_field_names`, and `/select/logsql/stream_field_values` are most useful when stream-level fields are configured at ingestion via `_stream_fields`. Otherwise `_stream` defaults to `{}`, which limits stream-level query value and can hurt selectivity.
 
 ---
 
@@ -145,13 +153,33 @@ func RequestHandler(w http.ResponseWriter, r *http.Request) bool {
     path := strings.ReplaceAll(r.URL.Path, "//", "/")
 
     if strings.HasPrefix(path, "/delete/") {
+        if !*enableDelete {
+            httpserver.Errorf(w, r, "requests to /delete/* are disabled")
+            return true
+        }
         deleteHandler(w, r, path)
         return true
     }
     if strings.HasPrefix(path, "/select/") {
+        if *disableSelect {
+            httpserver.Errorf(w, r, "requests to /select/* are disabled")
+            return true
+        }
         return selectHandler(w, r, path)
     }
+    if strings.HasPrefix(path, "/internal/delete/") {
+        if !*enableInternalDelete {
+            httpserver.Errorf(w, r, "requests to /internal/delete/* are disabled")
+            return true
+        }
+        internalselect.RequestHandler(r.Context(), w, r)
+        return true
+    }
     if strings.HasPrefix(path, "/internal/select/") {
+        if *disableInternalSelect || *disableSelect {
+            httpserver.Errorf(w, r, "requests to /internal/select/* are disabled")
+            return true
+        }
         internalselect.RequestHandler(r.Context(), w, r)
         return true
     }
@@ -167,7 +195,7 @@ func RequestHandler(w http.ResponseWriter, r *http.Request) bool {
 
 **File**: [`app/vlselect/logsql/logsql.go`](../app/vlselect/logsql/logsql.go#L1326)
 
-Every query endpoint parses a common set of arguments before executing the query.
+Most `/select/logsql/*` endpoints parse a shared set of arguments via `parseCommonArgs*` before executing the query.
 
 **Key Functions**:
 - [`parseCommonArgs(r)`](../app/vlselect/logsql/logsql.go#L1358) - Parse common query arguments from HTTP request
@@ -201,7 +229,7 @@ type commonArgs struct {
 - `query` → LogsQL query string, parsed via `logstorage.ParseQueryAtTimestamp()`
 - `start` / `end` → Time range boundaries (RFC3339, Unix timestamp, or relative like `5m`)
 - `time` → Evaluation timestamp (for `now()` in LogsQL)
-- `timeout` → Per-query timeout override (capped by `-search.maxQueryDuration`)
+- `timeout` → Per-request execution timeout, handled in `selectHandler` (capped by `-search.maxQueryDuration`)
 - `extra_filters` → Additional LogsQL filters to AND with the query
 - `extra_stream_filters` → Additional stream-level filters
 - `allow_partial_response` → Allow partial results in cluster mode
@@ -212,11 +240,17 @@ type commonArgs struct {
 1. Extract `tenantID` from HTTP headers
 2. Parse optional `start`, `end`, `time` args
 3. Parse the `query` string via `logstorage.ParseQueryAtTimestamp(qStr, timestamp)`
-4. Apply `start`/`end` as a `_time` filter if provided
-5. Align `start`/`end` to `step` if step is provided
-6. Apply `extra_filters` and `extra_stream_filters`
-7. Enforce `-search.maxQueryTimeRange` if set
-8. Create `QueryContext` with the parsed query and tenant info
+4. Convert HTTP `end` from exclusive `[start, end)` to inclusive bound (`end-1ns`) for internal filtering
+5. Apply `start`/`end` as a `_time` filter if provided
+6. Align `start`/`end` to `step` (if `step` is set and parseable)
+7. Apply `extra_filters` and `extra_stream_filters`
+8. Parse `allow_partial_response` and `hidden_fields_filters`
+9. Enforce `-search.maxQueryTimeRange` if set (unless explicitly skipped by handler)
+10. Create `QueryContext` with parsed query + tenant context
+
+Notes:
+- If `time` is provided, parsing uses `time-1ns` internally to avoid boundary spillover into the next period.
+- `/select/tenant_ids` does not use `parseCommonArgs*`; it has its own parsing and security checks.
 
 **Location**: [`app/vlselect/logsql/logsql.go:1326-1500`](../app/vlselect/logsql/logsql.go#L1326)
 
@@ -226,7 +260,7 @@ type commonArgs struct {
 
 **File**: [`app/vlselect/main.go`](../app/vlselect/main.go#L246)
 
-VictoriaLogs limits concurrent query execution to prevent resource exhaustion. A single query can saturate all CPU cores, so the default limit is based on available CPUs (capped at 16).
+VictoriaLogs limits concurrent query execution to prevent resource exhaustion. A single query can saturate all CPU cores, so the default limit is CPU-based and capped at 16 (`2*CPUs` only when `CPUs <= 4`).
 
 **Key Functions**:
 - [`incRequestConcurrency(ctx, w, r)`](../app/vlselect/main.go#L246) - Acquire concurrency slot (blocks until available or timeout)
@@ -261,7 +295,7 @@ The concurrency limiter uses a buffered channel as a semaphore:
 concurrencyLimitCh = make(chan struct{}, *maxConcurrentRequests)
 ```
 
-If the channel is full, the request waits until a slot opens or the context times out (controlled by `-search.maxQueueDuration`).
+If the channel is full, the request waits until a slot opens or the request context is canceled/deadline-exceeded. In this path, the deadline comes from `timeout` / `-search.maxQueryDuration`.
 
 **Location**: [`app/vlselect/main.go:138-284`](../app/vlselect/main.go#L138)
 
@@ -320,7 +354,11 @@ This endpoint streams results as `application/stream+json` — each log row is w
 **Key Functions**:
 - [`ProcessHitsRequest(ctx, w, r)`](../app/vlselect/logsql/logsql.go#L215) - Hit count handler
 
-Adds a `| count_by_time(step, offset, fields)` pipe to the query, then aggregates results into a time-bucketed histogram.
+Adds a time-bucketed stats pipeline via `AddCountByTimePipe(step, offset, fields)`, which appends:
+- `| stats by (_time:<step> [offset ...], <fields...>) count() hits`
+- `| sort by (_time, <fields...>)`
+
+Before this, unsafe trailing pipes that can alter/remove `_time` are dropped so bucketing remains correct.
 
 **Location**: [`app/vlselect/logsql/logsql.go:215-316`](../app/vlselect/logsql/logsql.go#L215)
 
@@ -338,7 +376,9 @@ Expects the query to end with a stats pipe (e.g., `| stats count() as total`). R
 **Key Functions**:
 - [`ProcessStatsQueryRangeRequest(ctx, w, r)`](../app/vlselect/logsql/logsql.go#L854) - Range stats handler
 
-Like `stats_query`, but adds a `| group_by_time(step, offset)` pipe to produce time series data. Returns Prometheus-compatible range vector results.
+Like `stats_query`, but it augments the final `| stats ...` grouping with `_time:<step> offset <offset>` via `GetStatsLabelsAddGroupingByTime(step, offset)`.
+
+It does not add a separate `group_by_time` pipe.
 
 **Location**: [`app/vlselect/logsql/logsql.go:854-1010`](../app/vlselect/logsql/logsql.go#L854)
 
@@ -347,7 +387,7 @@ Like `stats_query`, but adds a `| group_by_time(step, offset)` pipe to produce t
 **Key Functions**:
 - [`ProcessFacetsRequest(ctx, w, r)`](../app/vlselect/logsql/logsql.go#L114) - Facets handler
 
-Drops all pipes from the query and adds a facets pipe. Returns a JSON map of field names to their top values with hit counts.
+Drops all pipes from the query and adds a facets pipe. Returns JSON in the form `{"facets":[...]}` with per-field top values and hits.
 
 **Location**: [`app/vlselect/logsql/logsql.go:114-205`](../app/vlselect/logsql/logsql.go#L114)
 
@@ -363,7 +403,10 @@ These endpoints query for metadata rather than log rows:
 - [`ProcessStreamsRequest`](../app/vlselect/logsql/logsql.go#L617) → calls `vlstorage.GetStreams(qctx, limit)`
 - [`ProcessTenantIDsRequest`](../app/vlselect/logsql/logsql.go#L1234) → calls `vlstorage.GetTenantIDs(ctx, start, end)`
 
-All metadata endpoints return `[]ValueWithHits` — a list of values with their occurrence counts — serialized as JSON arrays.
+External metadata responses are wrapped as `{"values":[{"value":"...","hits":N}, ...]}`.
+
+Special case:
+- `/select/tenant_ids` returns tenant objects (`[{ "account_id": ..., "project_id": ... }]`) and is forbidden when `AccountID` header is non-empty.
 
 ---
 
@@ -834,7 +877,7 @@ func processQueryRequest(ctx context.Context, w http.ResponseWriter, r *http.Req
 For metadata queries (`field_names`, `streams`, etc.), the response is a single compressed binary blob:
 
 ```go
-func writeValuesWithHits(w http.ResponseWriter, qctx, vhs []logstorage.ValueWithHits, disableCompression bool) error {
+func writeValuesWithHits(w http.ResponseWriter, qctx *logstorage.QueryContext, vhs []logstorage.ValueWithHits, disableCompression bool) error {
     var b []byte
     b = encoding.MarshalUint64(b, uint64(len(vhs)))  // Number of items
     for i := range vhs {
@@ -853,19 +896,19 @@ func writeValuesWithHits(w http.ResponseWriter, qctx, vhs []logstorage.ValueWith
 | Aspect | `/select/logsql/*` | `/internal/select/*` |
 |--------|-------------------|---------------------|
 | **Purpose** | Accept queries from external clients | Accept queries from vlselect frontend nodes |
-| **Response Format** | JSON (streaming NDJSON or complete JSON) | Binary protocol (compressed DataBlocks) |
+| **Response Format** | JSON (streaming NDJSON or complete JSON) | Binary protocol (`DataBlock` stream for query, compact values/hits blob for metadata) |
 | **Tenant ID** | Extracted from HTTP headers | Passed as `tenant_ids` query param |
-| **Query Parameters** | User-friendly (`start`, `end`, `query`) | Pre-processed (`tenant_ids`, `timestamp`, `query`) |
-| **Pipe Processing** | Full query with all pipes | Remote pipes only (local pipes run on frontend) |
+| **Query Parameters** | User-friendly (`start`, `end`, `query`, `extra_filters`, etc.) | Pre-processed (`tenant_ids`, `timestamp`, `query`, `hidden_fields_filters`, etc.) |
+| **Pipe Processing** | Full query with all pipes | For `/internal/select/query`, receives already split remote query from frontend; metadata internal endpoints execute their own storage-side query helpers |
 | **Compression** | Not applicable (JSON text) | zstd compression (configurable) |
 | **Security Flag** | `-select.disable` | `-internalselect.disable` |
-| **Concurrency Limit** | `-search.maxConcurrentRequests` (default: 2×CPUs, max 16) | `-internalselect.maxConcurrentRequests` (default: 100) |
+| **Concurrency Limit** | `-search.maxConcurrentRequests` (default: CPU-based, capped at 16) | `-internalselect.maxConcurrentRequests` (default: 100) |
 
 ### Why Two Different Endpoints?
 
 1. **Response Format**: External endpoints return human-readable JSON; internal endpoints use efficient binary serialization with zstd compression
 
-2. **Query Splitting**: In distributed mode, the query is split — storage nodes execute filter + some pipes, the frontend merges and applies remaining pipes. Internal endpoints only run the remote portion.
+2. **Query Splitting**: In distributed mode, `/internal/select/query` receives the pre-split remote query; the frontend merges and runs remaining local pipes. Internal metadata endpoints use dedicated storage-side metadata execution paths.
 
 3. **Security**: Internal endpoints can be disabled separately to prevent external access to cluster internals
 
@@ -1086,10 +1129,13 @@ In cluster mode, the system can return partial results when some storage nodes a
 
 ```bash
 -search.maxConcurrentRequests int
-    Maximum concurrent search requests (default: 2×CPUs, max 16)
+    Maximum concurrent search requests (default: CPU-based, capped at 16;
+    uses 2×CPUs only when CPUs <= 4)
 
 -search.maxQueueDuration duration
-    Maximum wait time when concurrency limit reached (default: 10s)
+    Configured queue wait hint (default: 10s)
+    Note: current select path wait bound is effectively request timeout
+    (`timeout` arg / `-search.maxQueryDuration`)
 
 -search.maxQueryDuration duration
     Maximum query execution time (default: 30s)
@@ -1248,7 +1294,7 @@ All file and line number references must use the following format:
 
 **Key requirements**:
 - Use capital `L` prefix before the line number (e.g., `#L28`, not `#28`)
-- Use relative paths from repository root
+- Use relative paths that are valid from this document's location (`onboarding/`)
 - Include line numbers wherever possible
 
 #### Standard Patterns
@@ -1293,7 +1339,7 @@ When adding new file references to this document:
 
 Before committing changes to this document:
 
-- [ ] All file paths use relative paths from repository root
+- [ ] All file paths are valid relative to this document location
 - [ ] All line number anchors use `#L` prefix (capital L)
 - [ ] All links tested and navigate correctly in VS Code
 - [ ] No plain text file references (should be clickable markdown links)
@@ -1305,11 +1351,11 @@ You can verify all links have the correct format using:
 
 ```bash
 # Check for links missing the #L prefix
-grep -n '\](.*\.go#[0-9]' onboarding-select-flow.md
+grep -n '\](.*\.go#[0-9]' onboarding/onboarding-select-flow.md
 
 # Count total clickable line references
-grep -o "#L[0-9]\+" onboarding-select-flow.md | wc -l
+grep -o "#L[0-9]\+" onboarding/onboarding-select-flow.md | wc -l
 
 # Find non-clickable file references
-grep -n '`app/.*\.go`' onboarding-select-flow.md | grep -v '\]('
+grep -n '`app/.*\.go`' onboarding/onboarding-select-flow.md | grep -v '\]('
 ```

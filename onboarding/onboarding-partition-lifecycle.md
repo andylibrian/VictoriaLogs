@@ -45,12 +45,12 @@ This document covers the operational lifecycle of partitions in VictoriaLogs: cr
 
 VictoriaLogs organizes log data into **per-day partitions**. Each partition is a self-contained directory that holds one calendar day's worth of logs. This design enables:
 
-- **O(1) retention**: Drop an entire day by deleting its directory
+- **Cheap directory-level retention**: Drop an entire day by deleting its directory (no data rewrite)
 - **Live attach/detach**: Add or remove partitions without restarting the server
 - **Instant snapshots**: Create snapshots via filesystem hard links
 - **Cross-storage migration**: Move partitions between NVMe and HDD storage tiers
 
-All partition management operations are exposed through `/internal/partition/*` HTTP endpoints and protected by the `-partitionManageAuthKey` flag.
+All partition management operations are exposed through `/internal/partition/*` HTTP endpoints and can be protected by the `-partitionManageAuthKey` flag.
 
 ---
 
@@ -75,14 +75,14 @@ Helper functions:
 Each partition directory contains two subdirectories:
 
 ```
-<storageDataPath>/partitions/
-└── 20260101/              # partition (YYYYMMDD)
-    ├── indexdb/            # stream metadata (mergeset tables)
-    ├── datadb/             # log data (parts, blocks, bloom filters)
-    └── snapshots/          # created on demand
-        └── 20260101120000-0000001/  # snapshot (YYYYMMDDhhmmss-hex)
-            ├── indexdb/    # hard-linked index snapshot
-            └── datadb/     # hard-linked data snapshot
+	<storageDataPath>/partitions/
+	└── 20260101/              # partition (YYYYMMDD)
+	    ├── indexdb/            # stream metadata (mergeset tables)
+	    ├── datadb/             # log data (parts, blocks, bloom filters)
+	    └── snapshots/          # created on demand
+	        └── 20260101120000-00000001/ # snapshot (YYYYMMDDhhmmss-hex)
+	            ├── indexdb/    # hard-linked index snapshot
+	            └── datadb/     # hard-linked data snapshot
 ```
 
 ### partitionWrapper and Reference Counting
@@ -211,6 +211,8 @@ Storage.PartitionDetach(name)               [storage.go:260]
 ```
 
 **Important**: The detach call blocks on `<-ptw.doneCh` at [L288](../lib/logstorage/storage.go#L288). This means the HTTP request will not return until every concurrent query or ingestion operation on that partition has completed. This guarantees the partition is fully quiesced and safe to move/delete/restore.
+
+**Restart behavior**: Detach affects only the currently running process. If the detached partition directory remains under `<storageDataPath>/partitions/`, it is attached again on restart when `MustOpenStorage()` scans and opens partition directories — [L684-715](../lib/logstorage/storage.go#L684).
 
 ### List
 
@@ -405,6 +407,10 @@ Partitions can be moved between storage tiers (e.g., NVMe → HDD) across separa
 
 Delete tasks allow deleting log entries matching a filter, processed as background tasks that survive application restarts.
 
+API availability prerequisites:
+- `/delete/*` endpoints are handled by `vlselect` and require `-delete.enable` — [`app/vlselect/main.go` L35, L94](../app/vlselect/main.go#L35)
+- In cluster mode, `vlstorage` nodes must also enable `/internal/delete/*` via `-internaldelete.enable` — [`app/vlselect/main.go` L36, L113](../app/vlselect/main.go#L36)
+
 ### DeleteTask Struct
 
 **Key File**: [`lib/logstorage/delete_task.go`](../lib/logstorage/delete_task.go#L14)
@@ -503,10 +509,12 @@ Runs every ~1 hour (jittered). Deletes partitions older than the configured `-re
 
 1. Calculate `minAllowedDay` from current time and retention — [L779](../lib/logstorage/storage.go#L779)
 2. Since `s.partitions` is sorted by day (oldest first), iterate from the beginning — [L786](../lib/logstorage/storage.go#L786)
-3. All partitions before `minAllowedDay` are scheduled for deletion — [L792-793](../lib/logstorage/storage.go#L792)
+3. When the first non-expired partition is reached, all preceding partitions are scheduled for deletion — [L792-793](../lib/logstorage/storage.go#L792)
 4. Add deleted days to `s.deletedPartitions` to prevent re-creation — [L794](../lib/logstorage/storage.go#L794)
 5. Mark each with `ptw.mustDrop.Store(true)` and call `ptw.decRef()` — [L808-809](../lib/logstorage/storage.go#L808)
 6. The partition is physically deleted when the last reference is released
+
+Current implementation note: the deletable set is built from that prefix scan. If all attached partitions are expired in a given pass, no deletion prefix is selected in that iteration — [L786-802](../lib/logstorage/storage.go#L786).
 
 **Startup cleanup**: [`MustOpenStorage()`](../lib/logstorage/storage.go#L618) also deletes future partitions beyond `-futureRetention` at [L719-737](../lib/logstorage/storage.go#L719).
 
@@ -517,6 +525,8 @@ Runs every ~1 hour (jittered). Deletes partitions older than the configured `-re
 Runs every ~10 seconds (jittered). Drops the **oldest** partitions when disk usage exceeds either:
 - `-retention.maxDiskSpaceUsageBytes` — absolute limit in bytes
 - `-retention.maxDiskUsagePercent` — percentage of filesystem capacity
+
+The watcher keeps at least the newest two per-day partitions attached — [L858-861](../lib/logstorage/storage.go#L858).
 
 ### Read-Only Mode
 
@@ -618,7 +628,7 @@ Delete tasks survive application restarts by persisting to `delete_tasks.json`. 
 
 The `s.partitions` slice is always sorted by day (oldest first). This enables:
 - O(log n) lookup during data ingestion (find the right partition) — [`getPartitionForWriting()`](../lib/logstorage/storage.go#L1250)
-- O(1) retention enforcement (delete from the beginning of the list)
+- Efficient prefix deletion of expired oldest partitions (O(k), where k is the number of leading expired partitions)
 - Efficient time-range queries (binary search for overlapping partitions)
 
 ### 5. deletedPartitions Guard

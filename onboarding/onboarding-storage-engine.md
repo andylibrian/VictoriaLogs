@@ -40,6 +40,8 @@ VictoriaLogs stores log data in a **part-based LSM-tree** (Log-Structured Merge-
 4. In-memory parts are **flushed to disk** as small file-backed parts
 5. Background **merge workers** continuously compact small parts into larger ones
 
+This guide is intentionally scoped to the local storage engine (`lib/logstorage`) used by `vlstorage` when local storage is enabled.
+
 Each partition contains two subsystems:
 - **datadb** — stores the actual log data in parts (columnar blocks with bloom filters)
 - **indexdb** — stores stream metadata as an inverted index (backed by VictoriaMetrics' `mergeset` library)
@@ -110,9 +112,11 @@ The `Storage` struct is the top-level object that owns all partitions and caches
 | Field | Line | Description |
 |-------|------|-------------|
 | `Retention` | [63](../lib/logstorage/storage.go#L63) | How long to keep data; minimum 24h |
+| `DefaultParallelReaders` | [68](../lib/logstorage/storage.go#L68) | Default parallel readers per query |
 | `FlushInterval` | [80](../lib/logstorage/storage.go#L80) | Interval for flushing in-memory data to disk; minimum 1s |
 | `FutureRetention` | [82](../lib/logstorage/storage.go#L82) | Maximum allowed future timestamp offset; minimum 24h |
 | `MaxBackfillAge` | [87](../lib/logstorage/storage.go#L87) | Maximum age for historical log ingestion |
+| `SnapshotsMaxAge` | [96](../lib/logstorage/storage.go#L96) | Automatic cleanup age for partition snapshots |
 | `MaxDiskSpaceUsageBytes` | [73](../lib/logstorage/storage.go#L73) | Optional disk space limit |
 | `MaxDiskUsagePercent` | [77](../lib/logstorage/storage.go#L77) | Optional disk usage percentage threshold |
 | `MinFreeDiskSpaceBytes` | [100](../lib/logstorage/storage.go#L100) | Triggers read-only mode when free disk space drops below this |
@@ -461,8 +465,9 @@ type partHeader struct {
 
 [`part.getBloomValuesFileForColumnName(name)`](../lib/logstorage/part.go#L202):
 - Empty name (the `_msg` column) → uses `messageBloomValues` — [L203-204](../lib/logstorage/part.go#L203)
+- FormatVersion < 1 → uses legacy `oldBloomValues` files — [L207-209](../lib/logstorage/part.go#L207)
+- FormatVersion 1..2 → hash-based shard selection via xxhash — [L210-217](../lib/logstorage/part.go#L210)
 - FormatVersion >= 3 → uses `columnIdxs` map for deterministic shard assignment — [L220-224](../lib/logstorage/part.go#L220)
-- Older formats → hash-based shard selection via xxhash — [L211-217](../lib/logstorage/part.go#L211)
 
 ---
 
@@ -827,11 +832,12 @@ Additionally, [`inmemoryPartsFlusher()`](../lib/logstorage/datadb.go#L277) runs 
 2. **Sort by size** (smallest first, ties broken by reverse timestamp) — [L1387](../lib/logstorage/datadb.go#L1387)
 3. **Exhaustive O(N²) search**: Try all sliding windows of size `minSrcParts..maxSrcParts` — [L1401-1421](../lib/logstorage/datadb.go#L1401)
 4. **Select best window**: Choose the window with maximum merge multiplier (ratio of total size to largest part)
-5. **Skip weak merges**: If the best multiplier < `minMergeMultiplier` (1.7), skip the merge to avoid write amplification — [L1427-1430](../lib/logstorage/datadb.go#L1427)
+5. **Skip weak merges**: If the best multiplier < `max(defaultPartsToMerge/2, minMergeMultiplier)`, skip the merge to avoid write amplification — [L1423-1430](../lib/logstorage/datadb.go#L1423)
 
 Key constants:
 - [`defaultPartsToMerge = 15`](../lib/logstorage/datadb.go#L38) — maximum parts in a single merge
 - [`minMergeMultiplier = 1.7`](../lib/logstorage/datadb.go#L46) — minimum ratio to justify a merge
+- Effective merge floor is currently `max(15/2, 1.7) = 7.5` — [L1423-1427](../lib/logstorage/datadb.go#L1423)
 - [`maxBigPartSize = 1e12`](../lib/logstorage/datadb.go#L26) — 1TB upper limit for big parts
 
 ### The Core Merge Function
@@ -886,6 +892,7 @@ The **fast path** (writing full blocks without re-compression) is critical for m
 [`Storage.watchMaxDiskSpaceUsage()`](../lib/logstorage/storage.go#L821) runs every ~10 seconds:
 
 - Drops the **oldest** partitions first when total disk usage exceeds `maxDiskSpaceUsageBytes` or `maxDiskUsagePercent`
+- Keeps at least the newest two per-day partitions attached — [L858-861](../lib/logstorage/storage.go#L858)
 
 ### Free Disk Space Guard
 
@@ -1024,16 +1031,18 @@ File operations (opening/closing parts, flushing to disk) use parallel I/O where
 
 ## Configuration Flags
 
-Key storage-related flags (set by the application layer, passed via `StorageConfig`):
+Key storage-related flags for local `vlstorage` mode (set by the application layer, passed via `StorageConfig`):
 
 | Flag | Config Field | Default | Description |
 |------|-------------|---------|-------------|
 | `-retentionPeriod` | `Retention` | 7d | How long to keep data |
+| `-defaultParallelReaders` | `DefaultParallelReaders` | `2 * available CPUs` | Default parallel readers per query |
 | `-futureRetention` | `FutureRetention` | 2d | Max future timestamp offset |
 | `-maxBackfillAge` | `MaxBackfillAge` | (= retention) | Max age for backfilled logs |
+| `-snapshotsMaxAge` | `SnapshotsMaxAge` | 3d | Auto-delete partition snapshots older than this age |
 | `-inmemoryDataFlushInterval` | `FlushInterval` | 5s | Flush interval for in-memory data |
-| `-storage.maxDiskUsageBytes` | `MaxDiskSpaceUsageBytes` | 0 (no limit) | Max disk usage |
-| `-storage.maxDiskUsagePercent` | `MaxDiskUsagePercent` | 0 (no limit) | Max disk usage percent |
+| `-retention.maxDiskSpaceUsageBytes` | `MaxDiskSpaceUsageBytes` | 0 (no limit) | Max disk usage in bytes |
+| `-retention.maxDiskUsagePercent` | `MaxDiskUsagePercent` | 0 (no limit) | Max disk usage percent |
 | `-storage.minFreeDiskSpaceBytes` | `MinFreeDiskSpaceBytes` | 10MB | Min free disk space before read-only mode |
 | `-logNewStreams` | `LogNewStreams` | false | Log newly created streams (debug) |
 | `-logIngestedRows` | `LogIngestedRows` | false | Log all ingested entries (debug) |
