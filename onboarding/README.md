@@ -7,15 +7,17 @@ Use this file as the entry point and reading plan.
 ## Recommended Order
 
 1. [`onboarding-system-overview.md`](./onboarding-system-overview.md)
-2. [`onboarding-insert-flow.md`](./onboarding-insert-flow.md)
-3. [`onboarding-select-flow.md`](./onboarding-select-flow.md)
-4. [`onboarding-logsql-parser-pipes.md`](./onboarding-logsql-parser-pipes.md)
-5. [`onboarding-storage-engine.md`](./onboarding-storage-engine.md)
-6. [`onboarding-partition-lifecycle.md`](./onboarding-partition-lifecycle.md)
+2. [`onboarding-cluster.md`](./onboarding-cluster.md)
+3. [`onboarding-insert-flow.md`](./onboarding-insert-flow.md)
+4. [`onboarding-select-flow.md`](./onboarding-select-flow.md)
+5. [`onboarding-logsql-parser-pipes.md`](./onboarding-logsql-parser-pipes.md)
+6. [`onboarding-storage-engine.md`](./onboarding-storage-engine.md)
+7. [`onboarding-partition-lifecycle.md`](./onboarding-partition-lifecycle.md)
 
 Why this order:
 
 - Start with topology and ownership boundaries.
+- Then map cluster roles, internal APIs, protocol/version contracts, and endpoint flags.
 - Then learn write path and read path.
 - Then drill into LogsQL parser and pipe runtime mechanics.
 - Then go deep on storage internals.
@@ -27,20 +29,23 @@ If you mostly work on:
 
 - Ingestion protocols/parsing:
   1. [`onboarding-system-overview.md`](./onboarding-system-overview.md)
-  2. [`onboarding-insert-flow.md`](./onboarding-insert-flow.md)
-  3. [`app/vlinsert/main.go`](../app/vlinsert/main.go#L38)
-  4. [`app/vlinsert/insertutil/common_params.go`](../app/vlinsert/insertutil/common_params.go#L50)
+  2. [`onboarding-cluster.md`](./onboarding-cluster.md)
+  3. [`onboarding-insert-flow.md`](./onboarding-insert-flow.md)
+  4. [`app/vlinsert/main.go`](../app/vlinsert/main.go#L38)
+  5. [`app/vlinsert/insertutil/common_params.go`](../app/vlinsert/insertutil/common_params.go#L50)
 - Query API/behavior:
   1. [`onboarding-system-overview.md`](./onboarding-system-overview.md)
-  2. [`onboarding-select-flow.md`](./onboarding-select-flow.md)
-  3. [`onboarding-logsql-parser-pipes.md`](./onboarding-logsql-parser-pipes.md)
-  4. [`app/vlselect/main.go`](../app/vlselect/main.go#L90)
-  5. [`app/vlselect/logsql/logsql.go`](../app/vlselect/logsql/logsql.go#L1149)
+  2. [`onboarding-cluster.md`](./onboarding-cluster.md)
+  3. [`onboarding-select-flow.md`](./onboarding-select-flow.md)
+  4. [`onboarding-logsql-parser-pipes.md`](./onboarding-logsql-parser-pipes.md)
+  5. [`app/vlselect/main.go`](../app/vlselect/main.go#L90)
+  6. [`app/vlselect/logsql/logsql.go`](../app/vlselect/logsql/logsql.go#L1149)
 - Storage and retention:
   1. [`onboarding-system-overview.md`](./onboarding-system-overview.md)
-  2. [`onboarding-storage-engine.md`](./onboarding-storage-engine.md)
-  3. [`onboarding-partition-lifecycle.md`](./onboarding-partition-lifecycle.md)
-  4. [`lib/logstorage/storage.go`](../lib/logstorage/storage.go#L115)
+  2. [`onboarding-cluster.md`](./onboarding-cluster.md)
+  3. [`onboarding-storage-engine.md`](./onboarding-storage-engine.md)
+  4. [`onboarding-partition-lifecycle.md`](./onboarding-partition-lifecycle.md)
+  5. [`lib/logstorage/storage.go`](../lib/logstorage/storage.go#L115)
 
 ## Local Dev Basics
 
@@ -64,7 +69,7 @@ After finishing the onboarding docs, new engineers should focus on the following
 1. LogsQL parser and execution pipeline internals
    Start with [`onboarding-logsql-parser-pipes.md`](./onboarding-logsql-parser-pipes.md), then dive into [`lib/logstorage/parser.go`](../lib/logstorage/parser.go#L1671) and [`lib/logstorage/storage_search.go`](../lib/logstorage/storage_search.go#L216).
 2. Cluster protocol and remote fanout details
-   Read [`app/vlstorage/netinsert/netinsert.go`](../app/vlstorage/netinsert/netinsert.go#L30), [`app/vlstorage/netselect/netselect.go`](../app/vlstorage/netselect/netselect.go#L29), and [`app/vlselect/internalselect/internalselect.go`](../app/vlselect/internalselect/internalselect.go#L79).
+   Read [`onboarding-cluster.md`](./onboarding-cluster.md) first, then [`app/vlstorage/netinsert/netinsert.go`](../app/vlstorage/netinsert/netinsert.go#L30), [`app/vlstorage/netselect/netselect.go`](../app/vlstorage/netselect/netselect.go#L29), and [`app/vlselect/internalselect/internalselect.go`](../app/vlselect/internalselect/internalselect.go#L79).
 3. Multi-tenancy and request scoping
    Study [`lib/logstorage/tenant_id.go`](../lib/logstorage/tenant_id.go#L14), [`app/vlinsert/insertutil/common_params.go`](../app/vlinsert/insertutil/common_params.go#L30), and query context wiring in [`lib/logstorage/storage_search.go`](../lib/logstorage/storage_search.go#L25).
 4. Operational behavior and production guardrails
@@ -81,3 +86,4 @@ After finishing the onboarding docs, new engineers should focus on the following
 3. Find where query concurrency is limited and where timeout errors are returned.
 4. Run `make test` and `make apptest` once locally.
 5. Pick one existing test in `apptest/tests/` and trace the production code it exercises.
+6. Explain endpoint control behavior for `-insert.disable`, `-select.disable`, and `-internaldelete.enable` from code.

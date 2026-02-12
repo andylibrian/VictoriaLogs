@@ -36,7 +36,7 @@ It answers:
 
 In single-node mode, `victoria-logs` hosts ingestion, query, and storage in one process and one HTTP server.
 
-In cluster mode, frontend components (`vlinsert`, `vlselect`) forward to storage nodes via internal APIs (`/internal/insert`, `/internal/select/*`, `/internal/delete/*`) with explicit protocol versions.
+In cluster mode, frontend components (`vlinsert`, `vlselect`) forward to storage nodes via internal APIs (`/internal/insert`, `/internal/select/*`, `/internal/delete/*`) that are mostly versioned (notably, `/internal/select/tenant_ids` is an exception).
 
 The top-level glue code lives in the `app/` tree, while durable data structures and query/storage algorithms live in `lib/logstorage`.
 
@@ -47,7 +47,7 @@ The top-level glue code lives in the `app/` tree, while durable data structures 
 | Component | Responsibility | Key Entry Points |
 |----------|----------------|------------------|
 | `app/victoria-logs` | Single-node binary: wires insert, select, storage in one process | [`main()`](../app/victoria-logs/main.go#L31), [`requestHandler`](../app/victoria-logs/main.go#L76) |
-| `app/vlinsert` | Public ingestion endpoint router for all supported protocols | [`RequestHandler`](../app/vlinsert/main.go#L38), [`insertHandler`](../app/vlinsert/main.go#L62) |
+| `app/vlinsert` | Public HTTP ingestion router (`/insert/*`) and syslog listener bootstrap | [`RequestHandler`](../app/vlinsert/main.go#L38), [`insertHandler`](../app/vlinsert/main.go#L62), [`Init`](../app/vlinsert/main.go#L28) |
 | `app/vlselect` | Public query API, tailing, concurrency/timeout controls, VMUI | [`RequestHandler`](../app/vlselect/main.go#L90), [`selectHandler`](../app/vlselect/main.go#L138), [`processSelectRequest`](../app/vlselect/main.go#L286) |
 | `app/vlstorage` | Storage facade: local disk mode or network fanout mode | [`Init`](../app/vlstorage/main.go#L109), [`RunQuery`](../app/vlstorage/main.go#L554), [`Storage.MustAddRows`](../app/vlstorage/main.go#L543) |
 | `app/vlstorage/netinsert` | Sends batched insert blocks to storage nodes | [`ProtocolVersion`](../app/vlstorage/netinsert/netinsert.go#L33), [`Storage.AddRow`](../app/vlstorage/netinsert/netinsert.go#L375) |
@@ -86,6 +86,7 @@ Frontend nodes:
 
 - `vlinsert` receives `/insert/*` and forwards via `netinsert` to `/internal/insert` (unless disabled by `-insert.disable`)
 - `vlselect` receives `/select/*` and forwards via `netselect` to `/internal/select/*` (unless disabled by `-select.disable`)
+- Syslog ingestion is listener-based (`-syslog.listenAddr.*`) and initialized by [`vlinsert.Init`](../app/vlinsert/main.go#L28), not routed via `/insert/*`.
 
 Storage nodes:
 
@@ -126,11 +127,13 @@ Top-level router in single-node:
 Public ingestion routing:
 
 - [`vlinsert.RequestHandler`](../app/vlinsert/main.go#L38) handles `/insert/*` and `/internal/insert`.
+- Syslog listeners are started separately in [`vlinsert.Init`](../app/vlinsert/main.go#L28) via [`syslog.MustInit`](../app/vlinsert/main.go#L29).
 - Protocol-specific dispatch is in [`insertHandler`](../app/vlinsert/main.go#L62).
 
 Public query routing:
 
 - [`vlselect.RequestHandler`](../app/vlselect/main.go#L90) handles `/select/*`, `/delete/*`, `/internal/select/*`, `/internal/delete/*`.
+- `/internal/delete/*` requires [`-internaldelete.enable`](../app/vlselect/main.go#L36); otherwise requests are rejected by [`vlselect.RequestHandler`](../app/vlselect/main.go#L112).
 - `/select/buildinfo`, `/select/vmui*`, and `/select/logsql/tail` are handled directly in [`selectHandler`](../app/vlselect/main.go#L138).
 - Most `/select/logsql/*` and `/select/tenant_ids` endpoint dispatch is in [`processSelectRequest`](../app/vlselect/main.go#L286).
 
@@ -205,6 +208,7 @@ Any wire format change must bump the corresponding protocol constant and both se
 - Cluster insert retry/reroute:
   - Node-local send path in [`mustSendInsertRequest`](../app/vlstorage/netinsert/netinsert.go#L195).
   - Reroute fallback in [`sendInsertRequestToAnyNode`](../app/vlstorage/netinsert/netinsert.go#L381).
+  - If all storage nodes stay unavailable until shutdown, pending buffered data can be dropped in [`mustSendInsertRequest`](../app/vlstorage/netinsert/netinsert.go#L214).
 
 ### Timeouts and Partial Responses
 
