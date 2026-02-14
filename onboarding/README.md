@@ -15,6 +15,8 @@ If you encounter unfamiliar terms (LSM-tree, bloom filter, mergeset, etc.), see 
 5. [`onboarding-logsql-parser-pipes.md`](./onboarding-logsql-parser-pipes.md)
 6. [`onboarding-storage-engine.md`](./onboarding-storage-engine.md)
 7. [`onboarding-partition-lifecycle.md`](./onboarding-partition-lifecycle.md)
+8. [`onboarding-vlagent.md`](./onboarding-vlagent.md)
+9. [`onboarding-vlogscli.md`](./onboarding-vlogscli.md)
 
 Why this order:
 
@@ -24,6 +26,8 @@ Why this order:
 - Then drill into LogsQL parser and pipe runtime mechanics.
 - Then go deep on storage internals.
 - Finish with operational lifecycle tasks (attach/detach/snapshot/retention/delete tasks).
+- Then learn the log collection agent (vlagent) and how it ships logs to VictoriaLogs.
+- Then learn the interactive CLI (vlogscli) and how it queries VictoriaLogs.
 
 ## Role-Based Shortcuts
 
@@ -48,6 +52,17 @@ If you mostly work on:
   3. [`onboarding-storage-engine.md`](./onboarding-storage-engine.md)
   4. [`onboarding-partition-lifecycle.md`](./onboarding-partition-lifecycle.md)
   5. [`lib/logstorage/storage.go`](../lib/logstorage/storage.go#L115)
+- vlagent / log collection:
+  1. [`onboarding-system-overview.md`](./onboarding-system-overview.md)
+  2. [`onboarding-insert-flow.md`](./onboarding-insert-flow.md)
+  3. [`onboarding-vlagent.md`](./onboarding-vlagent.md)
+  4. [`app/vlagent/main.go`](../app/vlagent/main.go#L34)
+  5. [`app/vlagent/kubernetescollector/collector.go`](../app/vlagent/kubernetescollector/collector.go#L43)
+- vlogscli / query CLI:
+  1. [`onboarding-system-overview.md`](./onboarding-system-overview.md)
+  2. [`onboarding-select-flow.md`](./onboarding-select-flow.md)
+  3. [`onboarding-vlogscli.md`](./onboarding-vlogscli.md)
+  4. [`app/vlogscli/main.go`](../app/vlogscli/main.go#L58)
 
 ## Local Dev Basics
 
@@ -69,8 +84,6 @@ Common commands and where they are defined:
 The following topics are not yet covered and should get their own onboarding guides:
 
 - **vmui frontend** (`app/vmui/`) — React web UI: build system, component structure, how it calls `/select/logsql/*` endpoints, local dev workflow.
-- **vlagent internals** (`app/vlagent/`) — Log collection agent: Kubernetes collector, native insert client, configuration, retry/backpressure behavior.
-- **vlogscli internals** (`app/vlogscli/`) — Interactive CLI: REPL loop, query execution, output formatting, connection handling.
 
 ## What To Learn Next After These Docs
 
