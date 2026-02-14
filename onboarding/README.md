@@ -17,6 +17,7 @@ If you encounter unfamiliar terms (LSM-tree, bloom filter, mergeset, etc.), see 
 7. [`onboarding-partition-lifecycle.md`](./onboarding-partition-lifecycle.md)
 8. [`onboarding-vlagent.md`](./onboarding-vlagent.md)
 9. [`onboarding-vlogscli.md`](./onboarding-vlogscli.md)
+10. [`onboarding-vmui.md`](./onboarding-vmui.md)
 
 Why this order:
 
@@ -28,6 +29,7 @@ Why this order:
 - Finish with operational lifecycle tasks (attach/detach/snapshot/retention/delete tasks).
 - Then learn the log collection agent (vlagent) and how it ships logs to VictoriaLogs.
 - Then learn the interactive CLI (vlogscli) and how it queries VictoriaLogs.
+- Then learn the web UI (vmui) and how it calls VictoriaLogs query endpoints.
 
 ## Role-Based Shortcuts
 
@@ -63,6 +65,12 @@ If you mostly work on:
   2. [`onboarding-select-flow.md`](./onboarding-select-flow.md)
   3. [`onboarding-vlogscli.md`](./onboarding-vlogscli.md)
   4. [`app/vlogscli/main.go`](../app/vlogscli/main.go#L58)
+- vmui / web UI:
+  1. [`onboarding-system-overview.md`](./onboarding-system-overview.md)
+  2. [`onboarding-select-flow.md`](./onboarding-select-flow.md)
+  3. [`onboarding-vmui.md`](./onboarding-vmui.md)
+  4. [`app/vmui/packages/vmui/src/App.tsx`](../app/vmui/packages/vmui/src/App.tsx#L13)
+  5. [`app/vmui/packages/vmui/src/pages/QueryPage/QueryPage.tsx`](../app/vmui/packages/vmui/src/pages/QueryPage/QueryPage.tsx#L34)
 
 ## Local Dev Basics
 
@@ -78,12 +86,6 @@ Common commands and where they are defined:
   - [`make apptest`](../Makefile#L308)
 - Integration test harness overview:
   - [`apptest/README.md`](../apptest/README.md)
-
-## Planned Docs (TODO)
-
-The following topics are not yet covered and should get their own onboarding guides:
-
-- **vmui frontend** (`app/vmui/`) — React web UI: build system, component structure, how it calls `/select/logsql/*` endpoints, local dev workflow.
 
 ## What To Learn Next After These Docs
 
