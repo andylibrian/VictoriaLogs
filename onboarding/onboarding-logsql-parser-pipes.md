@@ -1,6 +1,6 @@
 # VictoriaLogs LogsQL Parser & Pipe Execution - Developer Onboarding Guide
 
-This document provides a comprehensive overview of how LogsQL queries are parsed, rewritten, and executed in VictoriaLogs, from query text at `/select/logsql/*` endpoints to parallel block scanning and pipe processing.
+This document provides a comprehensive overview of how LogsQL queries are parsed, rewritten, and executed in VictoriaLogs, from query text at `/select/logsql/*` endpoints (see [VictoriaLogs Query/Select Flow](./onboarding-select-flow.md)) to parallel block scanning and [pipe](./glossary.md#pipe) processing.
 
 ## Table of Contents
 
@@ -29,7 +29,7 @@ This document provides a comprehensive overview of how LogsQL queries are parsed
 VictoriaLogs parses LogsQL queries in `lib/logstorage/parser.go` and executes them through `app/vlstorage/main.go` (router) and `lib/logstorage/storage_search.go` using:
 
 - A filter tree (`Query.f`)
-- A pipe list (`Query.pipes`)
+- A [pipe](./glossary.md#pipe) list (`Query.pipes`)
 - Query options (`Query.opts`)
 
 The parser first produces a semantic query structure, then applies rewrites (for example, filter merging and pipe optimizations). The executor then:
@@ -39,10 +39,12 @@ The parser first produces a semantic query structure, then applies rewrites (for
 3. Executes parallel part/block scanning
 4. Streams matching blocks through the pipe processor chain
 
+Query execution stages exchange columnar [`DataBlock`](./glossary.md#datablock) payloads between search workers and runtime processors.
+
 ### Where This Runs
 
 - Public API parsing starts from select handlers in [`app/vlselect/logsql/logsql.go`](../app/vlselect/logsql/logsql.go#L1149)
-- Local execution runs in [`lib/logstorage/storage_search.go`](../lib/logstorage/storage_search.go#L208)
+- Local execution runs in [`lib/logstorage/storage_search.go`](../lib/logstorage/storage_search.go#L208) (storage internals are covered in [VictoriaLogs Storage Engine & On-Disk Format](./onboarding-storage-engine.md))
 - Distributed execution additionally uses [`lib/logstorage/net_query_runner.go`](../lib/logstorage/net_query_runner.go#L31)
 
 ---
@@ -388,6 +390,15 @@ The key insight is the **two-level execution model**:
 
 - Planning level: parse, optimize, and materialize subqueries
 - Runtime level: scan blocks in parallel and stream through a cancellable pipe chain
+
+---
+
+## See Also
+
+- [VictoriaLogs Query/Select Flow](./onboarding-select-flow.md)
+- [VictoriaLogs Storage Engine & On-Disk Format](./onboarding-storage-engine.md)
+- [VictoriaLogs Cluster Architecture](./onboarding-cluster.md)
+- [Glossary](./glossary.md)
 
 ---
 

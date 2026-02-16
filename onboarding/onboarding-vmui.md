@@ -1,6 +1,6 @@
 # VictoriaLogs vmui Frontend Internals - Developer Onboarding Guide
 
-This document provides a comprehensive overview of vmui, VictoriaLogs' built-in web UI. It covers the build system, Go embedding, component architecture, state management, API integration, chart visualization, and local development workflow.
+This document provides a comprehensive overview of [vmui](./glossary.md#vmui), VictoriaLogs' built-in web UI. It covers the build system, Go embedding, component architecture, state management, API integration, chart visualization, and local development workflow.
 
 ## Table of Contents
 
@@ -22,7 +22,7 @@ This document provides a comprehensive overview of vmui, VictoriaLogs' built-in 
 
 ## Overview
 
-**vmui** is a Preact+TypeScript single-page application that provides a browser-based query interface for VictoriaLogs. It is built with Vite, embedded into the Go binary via `//go:embed`, and served at `/select/vmui/`.
+**[vmui](./glossary.md#vmui)** is a Preact+TypeScript single-page application that provides a browser-based query interface for VictoriaLogs. It is built with Vite, embedded into the Go binary via `//go:embed`, and served at `/select/vmui/`. The UI executes the same `/select/logsql/*` API paths documented in [VictoriaLogs Query/Select Flow](./onboarding-select-flow.md), with query text interpreted by the parser pipeline described in [VictoriaLogs LogsQL Parser & Pipe Execution](./onboarding-logsql-parser-pipes.md).
 
 ### Key characteristics
 
@@ -79,7 +79,7 @@ handleRunQuery()                         [QueryPage.tsx:118](../app/vmui/package
         │     ├── buildBody()            — URLSearchParams: query, limit, start, end (ISO)
         │     ├── buildOptions()         — POST, headers: {AccountID, ProjectID, Accept: stream+json}
         │     ├── fetch(url, {body})     — POST /select/logsql/query
-        │     ├── response.text()        — read full NDJSON response
+        │     ├── response.text()        — read full [NDJSON](./glossary.md#ndjson) response
         │     ├── text.split("\n")       — split into lines
         │     ├── JSON.parse(line)       — parse each line [useFetchLogs.ts:184](../app/vmui/packages/vmui/src/pages/QueryPage/hooks/useFetchLogs.ts#L184)
         │     └── setLogs(data)          — update state → re-render QueryPageBody
@@ -612,6 +612,15 @@ make vmui-lint
 make vmui-typecheck
 make vmui-test
 ```
+
+---
+
+## See Also
+
+- [VictoriaLogs Query/Select Flow](./onboarding-select-flow.md)
+- [VictoriaLogs LogsQL Parser & Pipe Execution](./onboarding-logsql-parser-pipes.md)
+- [VictoriaLogs vlogscli Internals](./onboarding-vlogscli.md)
+- [Glossary](./glossary.md)
 
 ---
 

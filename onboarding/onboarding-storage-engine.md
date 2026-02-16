@@ -1,6 +1,6 @@
 # VictoriaLogs Storage Engine & On-Disk Format - Developer Onboarding Guide
 
-This document provides a comprehensive overview of VictoriaLogs' storage engine architecture, from the top-level `Storage` object down to individual bytes on disk. It covers partitioning, the part-based LSM-tree design, block encoding, column compression, bloom filters, the index database, and background merge/compaction.
+This document provides a comprehensive overview of VictoriaLogs' storage engine architecture, from the top-level `Storage` object down to individual bytes on disk. It covers [partition](./glossary.md#partition) management, the part-based [LSM-tree](./glossary.md#lsm-tree) design, block encoding, column compression, [bloom filter](./glossary.md#bloom-filter) usage, the index database, and background merge/compaction.
 
 ## Table of Contents
 
@@ -32,26 +32,26 @@ This document provides a comprehensive overview of VictoriaLogs' storage engine 
 
 ## Overview
 
-VictoriaLogs stores log data in a **part-based LSM-tree** (Log-Structured Merge-tree) design. Data flows through several layers before reaching persistent storage:
+VictoriaLogs stores log data in a **part-based [LSM-tree](./glossary.md#lsm-tree)** (Log-Structured Merge-tree) design. Data flows through several layers before reaching persistent storage:
 
-1. **Incoming rows** arrive via `Storage.MustAddRows()` and are routed to the correct per-day **partition**
+1. **Incoming rows** arrive via `Storage.MustAddRows()` and are routed to the correct per-day **[partition](./glossary.md#partition)**
 2. Within a partition, rows enter a **sharded in-memory buffer** (`rowsBuffer`) for amortized batching
 3. Buffered rows are periodically converted to searchable **in-memory parts**
 4. In-memory parts are **flushed to disk** as small file-backed parts
 5. Background **merge workers** continuously compact small parts into larger ones
 
-This guide is intentionally scoped to the local storage engine (`lib/logstorage`) used by `vlstorage` when local storage is enabled. For how data reaches `Storage.MustAddRows()` — HTTP endpoints, common parameters, batching, the storage router, and distributed mode — see the **[Data Ingestion Flow Guide](./onboarding-insert-flow.md)**.
+This guide is intentionally scoped to the local storage engine (`lib/logstorage`) used by `vlstorage` when local storage is enabled. For how data reaches `Storage.MustAddRows()` — HTTP endpoints, common parameters, batching, the storage router, and distributed mode — see the **[Data Ingestion Flow Guide](./onboarding-insert-flow.md)**. For operational actions such as attach/detach, snapshots, and retention handling, see [VictoriaLogs Partition Lifecycle](./onboarding-partition-lifecycle.md).
 
 Each partition contains two subsystems:
-- **datadb** — stores the actual log data in parts (columnar blocks with bloom filters)
-- **indexdb** — stores stream metadata as an inverted index (backed by VictoriaMetrics' `mergeset` library)
+- **[datadb](./glossary.md#datadb)** — stores the actual log data in [parts](./glossary.md#part) ([columnar storage](./glossary.md#columnar-storage) blocks with [bloom filters](./glossary.md#bloom-filter))
+- **[indexdb](./glossary.md#indexdb)** — stores stream metadata as an inverted index (backed by VictoriaMetrics' [`mergeset`](./glossary.md#mergeset) library)
 
 ### What Makes This Design Efficient?
 
-- **Columnar storage**: Each field is stored as a separate column within a block, enabling type-specific compression and selective column reads during queries
-- **Bloom filters**: Per-column bloom filters allow skipping blocks that definitely don't contain queried tokens
-- **Dictionary encoding**: Columns with few unique values (e.g., log levels) are encoded as single bytes, dramatically speeding up filtering
-- **Day-based partitioning**: Entire partitions can be dropped for retention without rewriting data
+- **[Columnar storage](./glossary.md#columnar-storage)**: Each field is stored as a separate column within a block, enabling type-specific compression and selective column reads during queries
+- **[Bloom filters](./glossary.md#bloom-filter)**: Per-column bloom filters allow skipping blocks that definitely don't contain queried tokens
+- **[Dictionary encoding](./glossary.md#dictionary-encoding)**: Columns with few unique values (e.g., log levels) are encoded as single bytes, dramatically speeding up filtering
+- **Day-based partitioning**: Entire [partitions](./glossary.md#partition) can be dropped for retention without rewriting data
 - **Append-only with background merging**: Write path is sequential (no random I/O), while background merging reduces read amplification
 
 ---
@@ -1046,6 +1046,16 @@ Key storage-related flags for local `vlstorage` mode (set by the application lay
 | `-storage.minFreeDiskSpaceBytes` | `MinFreeDiskSpaceBytes` | 10MB | Min free disk space before read-only mode |
 | `-logNewStreams` | `LogNewStreams` | false | Log newly created streams (debug) |
 | `-logIngestedRows` | `LogIngestedRows` | false | Log all ingested entries (debug) |
+
+---
+
+## See Also
+
+- [VictoriaLogs System Overview](./onboarding-system-overview.md)
+- [VictoriaLogs Data Ingestion Flow](./onboarding-insert-flow.md)
+- [VictoriaLogs Query/Select Flow](./onboarding-select-flow.md)
+- [VictoriaLogs Partition Lifecycle](./onboarding-partition-lifecycle.md)
+- [Glossary](./glossary.md)
 
 ---
 

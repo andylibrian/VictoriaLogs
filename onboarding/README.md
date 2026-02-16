@@ -6,6 +6,25 @@ Use this file as the entry point and reading plan.
 
 If you encounter unfamiliar terms (LSM-tree, bloom filter, mergeset, etc.), see the [Glossary](./glossary.md).
 
+## Official Product Docs (`docs/`)
+
+Before diving into internals, treat `../docs/victorialogs/` as the official VictoriaLogs documentation source with valuable product behavior details.
+This is the source for published docs at docs.victoriametrics.com and should be the primary reference for user-facing APIs, flags, and examples.
+
+How `docs/` is organized:
+
+- `../docs/victorialogs/_index.md` renders `../docs/victorialogs/README.md` (top-level docs landing content).
+- `../docs/victorialogs/data-ingestion/` contains ingestion docs (`_index.md`, `README.md`, and collector-specific pages).
+- `../docs/victorialogs/querying/` contains querying docs (`_index.md`, `README.md`, `vlogscli` docs, query API behavior).
+- `../docs/victorialogs/integrations/` contains integration guides.
+- `../docs/Makefile` contains docs workflows (preview/debug image, version marker updates, flags regeneration).
+
+Relationship to onboarding docs:
+
+- `onboarding/` explains implementation internals and code navigation for contributors.
+- `docs/victorialogs/` documents product-facing behavior and operational guidance.
+- When changing behavior, update both when needed: official docs for users, onboarding docs for contributors.
+
 ## Recommended Order
 
 1. [`onboarding-system-overview.md`](./onboarding-system-overview.md)

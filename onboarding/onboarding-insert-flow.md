@@ -1,6 +1,6 @@
 # VictoriaLogs Data Ingestion Flow - Developer Onboarding Guide
 
-This document provides a comprehensive overview of how log data flows through VictoriaLogs from HTTP ingestion endpoints to persistent storage on disk.
+This document provides a comprehensive overview of how log data flows through VictoriaLogs from HTTP ingestion endpoints to persistent storage on disk in day-based [partitions](./glossary.md#partition). For on-disk format and compaction internals, see [VictoriaLogs Storage Engine & On-Disk Format](./onboarding-storage-engine.md).
 
 ## Table of Contents
 
@@ -30,7 +30,7 @@ VictoriaLogs ingests log data through multiple HTTP endpoints (e.g., `/insert/na
 
 ### What is "Native Insert"?
 
-"Native" refers to VictoriaLogs' own internal binary protocol — as opposed to standard text/JSON formats from other ecosystems. When a client sends data to `/insert/native`, it sends pre-serialized `InsertRow` objects in VictoriaLogs' binary encoding. The server decodes these rows and applies limited common ingestion options (for example, tenant override from headers, ignore/extra/debug handling). It does not perform JSON parsing or timestamp-format detection.
+"Native" refers to VictoriaLogs' own internal binary protocol — as opposed to standard text/JSON formats from other ecosystems. When a client sends data to `/insert/native`, it sends pre-serialized `InsertRow` objects in VictoriaLogs' binary encoding. The server decodes these rows and applies limited common ingestion options (for example, [tenant](./glossary.md#tenant--tenantid) override from headers, ignore/extra/debug handling). It does not perform JSON parsing or timestamp-format detection.
 
 ### How Does It Differ from Other Formats?
 
@@ -41,7 +41,7 @@ The other ingestion endpoints accept **industry-standard formats** that require 
 | `/insert/native` | VictoriaLogs binary (`InsertRow` objects) | Binary decode + limited common-params processing (e.g., tenant override, ignore/extra/debug); no JSON parsing |
 | `/insert/jsonline` | Newline-delimited JSON (`{"msg":"foo","ts":"..."}`) | JSON parsing per line, field extraction, timestamp detection |
 | `/insert/elasticsearch/_bulk` | Elasticsearch bulk format (alternating command + data JSON lines) | JSON parsing, Elasticsearch timestamp format handling (ISO8601, Unix ms/s) |
-| `/insert/loki/api/v1/push` | Loki protobuf or JSON (Grafana's push format) | Protobuf/JSON decoding, stream label extraction |
+| `/insert/loki/api/v1/push` | Loki protobuf or JSON (Grafana's push format) | Protobuf/JSON decoding, [stream](./glossary.md#stream--streamid) label extraction |
 | `/insert/opentelemetry/v1/logs` | OTLP protobuf (OpenTelemetry standard) | Protobuf decoding, resource/scope attribute extraction |
 | `/insert/datadog/api/v2/logs` | Datadog JSON array | JSON parsing, nested Lambda format detection |
 | Syslog (TCP/UDP socket) | RFC 3164/5424 syslog | Text parsing, priority/facility extraction, timezone handling |
@@ -49,13 +49,13 @@ The other ingestion endpoints accept **industry-standard formats** that require 
 
 All formats eventually converge on the same storage path. Most text protocols go through field/timestamp extraction and then `AddRow()`. Native/internal protocols decode pre-marshaled `InsertRow` objects and use `AddInsertRow()` instead.
 
-**Who uses native insert?** Primarily `vlagent` (VictoriaLogs' own log collection agent). Cluster communication uses `/internal/insert`, which shares the same binary row format but has a different trust/parameter model.
+**Who uses native insert?** Primarily [`vlagent`](./glossary.md#vlagent) (VictoriaLogs' own log collection agent). Cluster communication uses `/internal/insert`, which shares the same binary row format but has a different trust/parameter model.
 
 ### Deployment Modes
 
 The system supports two deployment modes:
 - **Local Mode**: Single node storing data on local disk
-- **Distributed Mode**: Multiple nodes with data distributed across a cluster
+- **Distributed Mode**: Multiple nodes with data distributed across a [cluster](./onboarding-cluster.md)
 
 ---
 
@@ -187,10 +187,10 @@ type CommonParams struct {
 The struct shown above is a focused subset for ingestion flow explanation. The actual `CommonParams` in code also includes `PreserveJSONKeys`, `IsTimeFieldSet`, `DebugRequestURI`, and `DebugRemoteAddr`.
 
 **HTTP Parameters Mapping**:
-- Headers `AccountID` / `ProjectID` → `TenantID`
+- Headers `AccountID` / `ProjectID` → [`TenantID`](./glossary.md#tenant--tenantid)
 - Query arg `_time_field` or Header `VL-Time-Field` → `TimeFields`
 - Query arg `_msg_field` or Header `VL-Msg-Field` → `MsgFields`
-- Query arg `_stream_fields` or Header `VL-Stream-Fields` → `StreamFields`
+- Query arg `_stream_fields` or Header `VL-Stream-Fields` → [`StreamFields`](./glossary.md#stream--streamid)
 - Query arg `ignore_fields` or Header `VL-Ignore-Fields` → `IgnoreFields`
 - Query arg `decolorize_fields` or Header `VL-Decolorize-Fields` → `DecolorizeFields`
 - Query arg `preserve_json_keys` or Header `VL-Preserve-JSON-Keys` → `PreserveJSONKeys`
@@ -218,7 +218,7 @@ These two types serve different layers:
 | | `logMessageProcessor` | `*logstorage.LogRows` |
 |---|---|---|
 | **Layer** | Ingestion orchestration (`app/vlinsert/`) | Storage data structure (`lib/logstorage/`) |
-| **Responsibility** | Mutex locking, flush scheduling, metrics, debug mode, field-count limits | Holding raw row data (fields, timestamps, stream IDs) in memory with arena allocation |
+| **Responsibility** | Mutex locking, flush scheduling, metrics, debug mode, field-count limits | Holding raw row data (fields, timestamps, [stream](./glossary.md#stream--streamid) IDs) in memory with [arena allocation](./glossary.md#arena-allocation) |
 | **Analogy** | A batching writer that decides *when* to flush | The batch buffer itself that holds *what* to flush |
 | **Lifecycle** | Created per HTTP request (or per stream connection), closed via `MustClose()` | Obtained from a `sync.Pool` via `GetLogRows()`, returned via `PutLogRows()` |
 | **Concurrency** | Thread-safe (mutex-protected) | NOT thread-safe — relies on the processor's mutex |
@@ -1316,6 +1316,16 @@ The key insight is the **dual-path architecture**:
 - Complex path: Distributed nodes with adaptive stream routing and network transport
 
 Both paths converge at the `LogRowsStorage` interface, making the system modular and testable.
+
+---
+
+## See Also
+
+- [VictoriaLogs System Overview](./onboarding-system-overview.md)
+- [VictoriaLogs Query/Select Flow](./onboarding-select-flow.md)
+- [VictoriaLogs Storage Engine & On-Disk Format](./onboarding-storage-engine.md)
+- [VictoriaLogs Cluster Architecture](./onboarding-cluster.md)
+- [Glossary](./glossary.md)
 
 ---
 

@@ -1,6 +1,6 @@
 # VictoriaLogs vlagent Internals - Developer Onboarding Guide
 
-This document provides a comprehensive overview of vlagent, VictoriaLogs' log collection agent. It covers the Kubernetes collector, the native insert client (remote write), configuration, retry/backpressure behavior, and the checkpoint system.
+This document provides a comprehensive overview of [vlagent](./glossary.md#vlagent), VictoriaLogs' log collection agent. It covers the Kubernetes collector, the native insert client (remote write), configuration, retry/backpressure behavior, and the checkpoint system.
 
 ## Table of Contents
 
@@ -22,13 +22,13 @@ This document provides a comprehensive overview of vlagent, VictoriaLogs' log co
 
 ## Overview
 
-**vlagent** is VictoriaLogs' own log collection agent. It runs as a DaemonSet on each Kubernetes node, discovers pods via the Kubernetes API, tails their container log files, enriches each line with Kubernetes metadata, and ships the results to one or more VictoriaLogs instances over the native binary protocol (`/insert/native`).
+**[vlagent](./glossary.md#vlagent)** is VictoriaLogs' own log collection agent. It runs as a DaemonSet on each Kubernetes node, discovers pods via the Kubernetes API, tails their container log files, enriches each line with Kubernetes metadata, and ships the results to one or more VictoriaLogs instances over the native binary protocol (`/insert/native`).
 
 ### Key characteristics
 
 - **Node-scoped**: Each vlagent instance collects logs only from pods on its own node.
-- **Checkpoint-based**: Persists file read offsets to resume after restarts and reduce duplication/loss risk.
-- **Persistent queue**: Buffers data on disk when the remote VictoriaLogs is unreachable.
+- **Checkpoint-based**: Persists file read offsets to resume after restarts and reduce duplication/loss risk (see [checkpoint](./glossary.md#checkpoint)).
+- **[Persistent queue](./glossary.md#persistent-queue)**: Buffers data on disk when the remote VictoriaLogs is unreachable.
 - **Replication**: Supports multiple `-remoteWrite.url` destinations for data replication.
 - **Default port**: 9429 (configurable via `-httpListenAddr`).
 
@@ -77,7 +77,7 @@ logFile.readLines(stopCh, proc)          [logfile.go:90](../app/vlagent/kubernet
     ↓
 logFileProcessor.tryAddLine(line)        [processor.go:100](../app/vlagent/kubernetescollector/processor.go#L100)
     ↓
-parseCRILine(line) / parseCRILineJSON    [processor.go:426](../app/vlagent/kubernetescollector/processor.go#L426)
+parseCRILine(line) / parseCRILineJSON    [processor.go:426](../app/vlagent/kubernetescollector/processor.go#L426)  ([CRI](./glossary.md#cri))
     ↓
 parseLogRowContent (JSON / klog)         [processor.go:226](../app/vlagent/kubernetescollector/processor.go#L226)
     ↓
@@ -811,6 +811,15 @@ The `insertutil.LogRowsStorage` interface ([`common_params.go:174`](../app/vlins
 -kubernetesCollector.includeNodeLabels bool (default: false)
 -kubernetesCollector.includeNodeAnnotations bool (default: false)
 ```
+
+---
+
+## See Also
+
+- [VictoriaLogs Data Ingestion Flow](./onboarding-insert-flow.md)
+- [VictoriaLogs Cluster Architecture](./onboarding-cluster.md)
+- [VictoriaLogs Query/Select Flow](./onboarding-select-flow.md)
+- [Glossary](./glossary.md)
 
 ---
 

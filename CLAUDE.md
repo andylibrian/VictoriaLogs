@@ -8,6 +8,34 @@ VictoriaLogs is an open-source, resource-efficient database for logs by Victoria
 
 Go module: `github.com/VictoriaMetrics/VictoriaLogs`
 
+## Official Documentation Source (`docs/`)
+
+`docs/victorialogs/` is the official product documentation source for VictoriaLogs and contains valuable user-facing information
+(features, APIs, flags, examples, operations, and integrations). This content is published to docs.victoriametrics.com.
+
+Structure overview:
+
+- `docs/victorialogs/_index.md` is the section entry page and renders `docs/victorialogs/README.md`.
+- `docs/victorialogs/data-ingestion/` contains ingestion docs (`_index.md` + `README.md` + collector-specific pages).
+- `docs/victorialogs/querying/` contains querying docs (`_index.md` + `README.md` + `vlogscli` docs).
+- `docs/victorialogs/integrations/` contains integration guides (e.g. Grafana, Perses).
+- Generated flags references live in:
+  - `docs/victorialogs/victoria_logs_common_flags.md`
+  - `docs/victorialogs/victoria_logs_enterprise_flags.md`
+  - `docs/victorialogs/vlagent_common_flags.md`
+  - `docs/victorialogs/vlagent_enterprise_flags.md`
+  - `docs/victorialogs/querying/vlogscli_common_flags.md`
+
+Docs tooling:
+
+- `docs/Makefile` contains targets for docs image/debug workflow and docs updates (`docs-debug`, `docs-update-version`, `docs-update-flags`, etc.).
+- Root `Makefile` includes `docs/Makefile`, so docs targets are available from repo root.
+
+Important distinction:
+
+- `docs/victorialogs/` is official external product documentation.
+- `onboarding/` is internal engineering guidance for contributors and should complement, not replace, official docs.
+
 ## Build Commands
 
 ```bash

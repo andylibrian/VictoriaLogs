@@ -1,6 +1,6 @@
 # VictoriaLogs Cluster Architecture - Developer Onboarding Guide
 
-This document provides a comprehensive overview of how VictoriaLogs operates in cluster mode, covering the three core components (vlinsert, vlselect, vlstorage), their communication protocols, data sharding, query fan-out, high availability, and security.
+This document provides a comprehensive overview of how VictoriaLogs operates in cluster mode, covering the three core components (vlinsert, vlselect, vlstorage), their communication protocols, data sharding, query fan-out, high availability, and security. For single-node request handling paths, see [VictoriaLogs Data Ingestion Flow](./onboarding-insert-flow.md) and [VictoriaLogs Query/Select Flow](./onboarding-select-flow.md).
 
 ## Table of Contents
 
@@ -37,7 +37,7 @@ This document provides a comprehensive overview of how VictoriaLogs operates in 
 
 ## Overview
 
-VictoriaLogs cluster mode distributes log storage and querying across multiple nodes. All three roles (vlinsert, vlselect, vlstorage) share the **same executable** — their behavior is determined by the presence or absence of the `-storageNode` command-line flag.
+VictoriaLogs cluster mode distributes log storage and querying across multiple nodes using [stream](./glossary.md#stream--streamid)-aware routing and [tenant](./glossary.md#tenant--tenantid)-scoped queries. All three roles (vlinsert, vlselect, vlstorage) share the **same executable** — their behavior is determined by the presence or absence of the `-storageNode` command-line flag.
 
 ### Component Roles at a Glance
 
@@ -54,8 +54,8 @@ When `-storageNode` is set, the process runs **both** vlinsert and vlselect simu
 Every vlstorage node is a fully functional single-node VictoriaLogs instance. It accepts logs and queries directly on its own port. In cluster mode, vlinsert and vlselect communicate with vlstorage via internal HTTP endpoints (`/internal/insert` and `/internal/select/*`), but vlstorage continues to serve its own `/insert/*` and `/select/*` endpoints independently.
 
 **Public vs Internal Select Endpoints**:
-- `/select/*` is the external query API for users and tools (JSON/NDJSON responses, user-facing query args). See [`app/vlselect/main.go`](../app/vlselect/main.go#L90) and [`app/vlselect/logsql/logsql.go`](../app/vlselect/logsql/logsql.go#L1149).
-- `/internal/select/*` is the cluster-internal API used by `vlselect` to query `vlstorage` (versioned form args, binary responses, optional zstd compression). See [`app/vlstorage/netselect/netselect.go`](../app/vlstorage/netselect/netselect.go#L29) and [`app/vlselect/internalselect/internalselect.go`](../app/vlselect/internalselect/internalselect.go#L431).
+- `/select/*` is the external query API for users and tools (JSON/[NDJSON](./glossary.md#ndjson) responses, user-facing query args). See [`app/vlselect/main.go`](../app/vlselect/main.go#L90) and [`app/vlselect/logsql/logsql.go`](../app/vlselect/logsql/logsql.go#L1149).
+- `/internal/select/*` is the cluster-internal API used by `vlselect` to query `vlstorage` (versioned form args, binary responses, optional [zstd](./glossary.md#zstd) compression). See [`app/vlstorage/netselect/netselect.go`](../app/vlstorage/netselect/netselect.go#L29) and [`app/vlselect/internalselect/internalselect.go`](../app/vlselect/internalselect/internalselect.go#L431).
 
 ### Minimal Cluster Setup
 
@@ -334,7 +334,7 @@ The `/internal/insert` endpoint is the receiving side on each vlstorage node. It
 
 **Processing Steps**:
 1. Verify the protocol version matches `netinsert.ProtocolVersion` (`"v1"`)
-2. Parse common params (tenant ID is ignored — tenancy is embedded in the serialized row)
+2. Parse common params ([tenant](./glossary.md#tenant--tenantid) ID is ignored — tenancy is embedded in the serialized row)
 3. Decompress the request body (zstd by default)
 4. Parse rows via `InsertRow.UnmarshalInplace()` in a loop
 5. Add each row via `lmp.AddInsertRow(r)` → `logRowsStorage.MustAddRows()` → `localStorage.MustAddRows()`
@@ -565,7 +565,7 @@ func RunQuery(qctx *logstorage.QueryContext, writeBlock logstorage.WriteDataBloc
 
 **File**: [`app/vlstorage/netinsert/netinsert.go`](../app/vlstorage/netinsert/netinsert.go#L399)
 
-vlinsert distributes logs among vlstorage nodes using a two-phase sharding strategy based on stream hash and row count.
+vlinsert distributes logs among vlstorage nodes using a two-phase sharding strategy based on [stream](./glossary.md#stream--streamid) hash and row count.
 
 **Key Types**:
 - [`streamRowsTracker`](../app/vlstorage/netinsert/netinsert.go#L399) - Tracks per-stream row counts for sharding decisions
@@ -732,7 +732,7 @@ func isUnavailableBackendError(err error) bool {
 | **Max Block Size** | 2 MB (`maxInsertBlockSize`) |
 | **Flush Interval** | 1 second (background flusher) |
 
-Each `InsertRow` is a self-describing binary record containing tenant ID, stream tags, timestamp, and fields. The receiver deserializes rows via `InsertRow.UnmarshalInplace()`.
+Each `InsertRow` is a self-describing binary record containing [tenant](./glossary.md#tenant--tenantid) ID, [stream](./glossary.md#stream--streamid) tags, timestamp, and fields. The receiver deserializes rows via `InsertRow.UnmarshalInplace()`.
 
 ### Select Query Protocol
 
@@ -997,6 +997,16 @@ Versioned internal endpoints verify protocol compatibility between sender and re
 -storageNode.tlsServerName array           TLS server name override
 -storageNode.tlsInsecureSkipVerify array   Skip TLS verification (not recommended for production)
 ```
+
+---
+
+## See Also
+
+- [VictoriaLogs System Overview](./onboarding-system-overview.md)
+- [VictoriaLogs Data Ingestion Flow](./onboarding-insert-flow.md)
+- [VictoriaLogs Query/Select Flow](./onboarding-select-flow.md)
+- [VictoriaLogs LogsQL Parser & Pipe Execution](./onboarding-logsql-parser-pipes.md)
+- [Glossary](./glossary.md)
 
 ---
 

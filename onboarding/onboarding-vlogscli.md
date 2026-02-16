@@ -1,6 +1,6 @@
 # VictoriaLogs vlogscli Internals - Developer Onboarding Guide
 
-This document provides a comprehensive overview of vlogscli, VictoriaLogs' interactive command-line query tool. It covers the REPL loop, query execution, output formatting, live tailing, paging with `less`, and connection handling.
+This document provides a comprehensive overview of [vlogscli](./glossary.md#vlogscli), VictoriaLogs' interactive command-line query tool. It covers the REPL loop, query execution, output formatting, live tailing, paging with `less`, and connection handling.
 
 ## Table of Contents
 
@@ -22,7 +22,7 @@ This document provides a comprehensive overview of vlogscli, VictoriaLogs' inter
 
 ## Overview
 
-**vlogscli** is a small (3-file, ~900 lines) interactive CLI for querying VictoriaLogs. It provides a readline-based REPL that sends LogsQL queries to a VictoriaLogs server over HTTP, formats the streaming NDJSON response into human-readable output, and pipes results through `less` for paging.
+**[vlogscli](./glossary.md#vlogscli)** is a small (3-file, ~900 lines) interactive CLI for querying VictoriaLogs. It provides a readline-based REPL that sends LogsQL queries to VictoriaLogs `/select/logsql/*` endpoints (see [VictoriaLogs Query/Select Flow](./onboarding-select-flow.md)), formats the streaming [NDJSON](./glossary.md#ndjson) response into human-readable output, and pipes results through `less` for paging.
 
 ### Key characteristics
 
@@ -30,7 +30,7 @@ This document provides a comprehensive overview of vlogscli, VictoriaLogs' inter
 - **Streaming**: Processes and displays results as they arrive — no buffering of the entire response.
 - **4 output modes**: Multiline JSON (default), singleline JSON, logfmt, and compact.
 - **Paging**: Automatically pipes output through `less` when running in a terminal.
-- **Live tailing**: `\tail <query>` streams live results via the `/select/logsql/tail` endpoint.
+- **Live tailing**: `\tail <query>` streams live results via the `/select/logsql/tail` endpoint from the [Query/Select flow](./onboarding-select-flow.md#live-tailing).
 - **Non-interactive mode**: Supports piped input (`echo "query;" | vlogscli`) for scripting.
 
 ### File structure
@@ -65,7 +65,7 @@ POST http://victorialogs:9428/select/logsql/query
     Content-Type: application/x-www-form-urlencoded
     Body: query=<canonical query>
     ↓
-HTTP response (streaming NDJSON)
+HTTP response (streaming [NDJSON](./glossary.md#ndjson))
     ↓
 newJSONPrettifier(resp.Body, outputMode) [json_prettifier.go:56](../app/vlogscli/json_prettifier.go#L56)
     ↓
@@ -586,6 +586,15 @@ When not a terminal, `readWithLess()` writes directly to stdout without `less`.
 -historyFile string
     Path to query history file (default: vlogscli-history)
 ```
+
+---
+
+## See Also
+
+- [VictoriaLogs Query/Select Flow](./onboarding-select-flow.md)
+- [VictoriaLogs LogsQL Parser & Pipe Execution](./onboarding-logsql-parser-pipes.md)
+- [VictoriaLogs vmui Frontend Internals](./onboarding-vmui.md)
+- [Glossary](./glossary.md)
 
 ---
 

@@ -1,6 +1,6 @@
 # VictoriaLogs Partition Lifecycle - Developer Onboarding Guide
 
-This document covers the operational lifecycle of partitions in VictoriaLogs: creation, attach/detach, snapshots, backup/restore, delete tasks, and automatic retention. It focuses on the runtime management APIs and background workers rather than the internal storage format (see [onboarding-storage-engine.md](./onboarding-storage-engine.md) for that).
+This document covers the operational lifecycle of [partitions](./glossary.md#partition) in VictoriaLogs: creation, attach/detach, snapshots, backup/restore, delete tasks, and automatic retention. It focuses on the runtime management APIs and background workers rather than the internal storage format (see [onboarding-storage-engine.md](./onboarding-storage-engine.md) for that).
 
 ## Table of Contents
 
@@ -43,14 +43,14 @@ This document covers the operational lifecycle of partitions in VictoriaLogs: cr
 
 ## Overview
 
-VictoriaLogs organizes log data into **per-day partitions**. Each partition is a self-contained directory that holds one calendar day's worth of logs. This design enables:
+VictoriaLogs organizes log data into **per-day [partitions](./glossary.md#partition)**. Each partition is a self-contained directory that holds one calendar day's worth of logs. This design enables:
 
 - **Cheap directory-level retention**: Drop an entire day by deleting its directory (no data rewrite)
 - **Live attach/detach**: Add or remove partitions without restarting the server
 - **Instant snapshots**: Create snapshots via filesystem hard links
 - **Cross-storage migration**: Move partitions between NVMe and HDD storage tiers
 
-All partition management operations are exposed through `/internal/partition/*` HTTP endpoints and can be protected by the `-partitionManageAuthKey` flag.
+All partition management operations are exposed through `/internal/partition/*` HTTP endpoints and can be protected by the `-partitionManageAuthKey` flag. These operations are available on storage nodes in local mode; for distributed routing context see [VictoriaLogs Cluster Architecture](./onboarding-cluster.md).
 
 ---
 
@@ -89,7 +89,7 @@ Each partition directory contains two subdirectories:
 
 **Key File**: [`lib/logstorage/storage.go`](../lib/logstorage/storage.go#L538)
 
-Every partition is accessed through a `partitionWrapper` that provides safe concurrent access via reference counting:
+Every partition is accessed through a `partitionWrapper` that provides safe concurrent access via [reference counting](./glossary.md#reference-counting):
 
 ```go
 type partitionWrapper struct {
@@ -638,6 +638,16 @@ When a partition is deleted by retention, its day is added to `deletedPartitions
 ### 6. Jittered Background Workers
 
 All background watchers use `timeutil.AddJitterToDuration()` to add randomness to their polling intervals. This prevents all workers from waking up simultaneously and causing load spikes.
+
+---
+
+## See Also
+
+- [VictoriaLogs Storage Engine & On-Disk Format](./onboarding-storage-engine.md)
+- [VictoriaLogs Data Ingestion Flow](./onboarding-insert-flow.md)
+- [VictoriaLogs Query/Select Flow](./onboarding-select-flow.md)
+- [VictoriaLogs Cluster Architecture](./onboarding-cluster.md)
+- [Glossary](./glossary.md)
 
 ---
 

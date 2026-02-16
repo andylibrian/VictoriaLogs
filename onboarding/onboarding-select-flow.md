@@ -1,6 +1,6 @@
 # VictoriaLogs Query/Select Flow - Developer Onboarding Guide
 
-This document provides a comprehensive overview of how log queries flow through VictoriaLogs from HTTP select endpoints through query parsing, execution, and result delivery back to the client.
+This document provides a comprehensive overview of how log queries flow through VictoriaLogs from HTTP select endpoints through query parsing, [pipe](./glossary.md#pipe) execution, and result delivery back to the client. For parser internals, see [VictoriaLogs LogsQL Parser & Pipe Execution](./onboarding-logsql-parser-pipes.md).
 
 ## Table of Contents
 
@@ -32,14 +32,14 @@ This document provides a comprehensive overview of how log queries flow through 
 VictoriaLogs exposes multiple HTTP endpoints under `/select/logsql/*` for querying log data. Most of these endpoints accept a LogsQL `query` string, parse it into an internal query representation, execute it against either local or distributed storage, and return JSON results.
 
 Important exceptions:
-- `/select/tenant_ids` does not accept a LogsQL query. It scans tenant IDs over a time range.
+- `/select/tenant_ids` does not accept a LogsQL query. It scans [tenant](./glossary.md#tenant--tenantid) IDs over a time range.
 - `/select/logsql/query_time_range` parses query time bounds but does not execute a storage scan.
 
 ### Query Endpoints at a Glance
 
 | Endpoint | Purpose | Response Format |
 |----------|---------|----------------|
-| `/select/logsql/query` | Full log query with streaming results | `application/stream+json` (NDJSON) |
+| `/select/logsql/query` | Full log query with streaming results | `application/stream+json` ([NDJSON](./glossary.md#ndjson)) |
 | `/select/logsql/hits` | Count log hits over time buckets | `application/json` |
 | `/select/logsql/stats_query` | Aggregate statistics (instant) | `application/json` (Prometheus-style) |
 | `/select/logsql/stats_query_range` | Aggregate statistics over time | `application/json` (Prometheus-style) |
@@ -50,7 +50,7 @@ Important exceptions:
 | `/select/logsql/stream_ids` | List stream IDs | `application/json` |
 | `/select/logsql/stream_field_names` | List stream field names | `application/json` |
 | `/select/logsql/stream_field_values` | List values for a stream field | `application/json` |
-| `/select/logsql/tail` | Live tailing (long-lived NDJSON stream) | `application/x-ndjson` |
+| `/select/logsql/tail` | Live tailing (long-lived [NDJSON](./glossary.md#ndjson) stream) | `application/x-ndjson` |
 | `/select/logsql/query_time_range` | Return the effective time range for a query | `application/json` |
 | `/select/tenant_ids` | List tenant IDs (requires empty `AccountID` header) | `application/json` |
 
@@ -58,11 +58,11 @@ Important exceptions:
 
 The system supports two deployment modes — the same dual-path architecture used for ingestion:
 - **Local Mode**: Single node querying data from local disk
-- **Distributed Mode**: Frontend (vlselect) fans out queries to storage nodes (vlstorage) via `/internal/select/*`
+- **Distributed Mode**: Frontend (vlselect) fans out queries to storage nodes (vlstorage) via `/internal/select/*` in [cluster mode](./onboarding-cluster.md)
 
 ### Stream Endpoint Prerequisite
 
-`/select/logsql/streams`, `/select/logsql/stream_ids`, `/select/logsql/stream_field_names`, and `/select/logsql/stream_field_values` are most useful when stream-level fields are configured at ingestion via `_stream_fields`. Otherwise `_stream` defaults to `{}`, which limits stream-level query value and can hurt selectivity.
+`/select/logsql/streams`, `/select/logsql/stream_ids`, `/select/logsql/stream_field_names`, and `/select/logsql/stream_field_values` are most useful when [stream](./glossary.md#stream--streamid)-level fields are configured at ingestion via `_stream_fields`. Otherwise `_stream` defaults to `{}`, which limits stream-level query value and can hurt selectivity.
 
 ---
 
@@ -470,7 +470,7 @@ The core of VictoriaLogs' query engine. When running in local mode, queries exec
 **Key Types**:
 - [`QueryContext`](../lib/logstorage/storage_search.go#L25) - Holds query, tenant IDs, context, stats
 - [`WriteDataBlockFunc`](../lib/logstorage/storage_search.go#L176) - Callback for result blocks
-- [`DataBlock`](../lib/logstorage/storage_search.go#L1093) - Columnar block of result rows
+- [`DataBlock`](../lib/logstorage/storage_search.go#L1093) - Columnar block of result rows (see [DataBlock](./glossary.md#datablock))
 - [`BlockColumn`](../lib/logstorage/storage_search.go#L1084) - A single named column with string values
 
 **Key Functions**:
@@ -1275,6 +1275,16 @@ The key architectural insight is the **callback pipeline**: `HTTP handler → pa
 │  Update per-query stats metrics                                 │
 └─────────────────────────────────────────────────────────────────┘
 ```
+
+---
+
+## See Also
+
+- [VictoriaLogs System Overview](./onboarding-system-overview.md)
+- [VictoriaLogs LogsQL Parser & Pipe Execution](./onboarding-logsql-parser-pipes.md)
+- [VictoriaLogs Storage Engine & On-Disk Format](./onboarding-storage-engine.md)
+- [VictoriaLogs Cluster Architecture](./onboarding-cluster.md)
+- [Glossary](./glossary.md)
 
 ---
 
