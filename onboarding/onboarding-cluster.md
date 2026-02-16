@@ -53,6 +53,10 @@ When `-storageNode` is set, the process runs **both** vlinsert and vlselect simu
 
 Every vlstorage node is a fully functional single-node VictoriaLogs instance. It accepts logs and queries directly on its own port. In cluster mode, vlinsert and vlselect communicate with vlstorage via internal HTTP endpoints (`/internal/insert` and `/internal/select/*`), but vlstorage continues to serve its own `/insert/*` and `/select/*` endpoints independently.
 
+**Public vs Internal Select Endpoints**:
+- `/select/*` is the external query API for users and tools (JSON/NDJSON responses, user-facing query args). See [`app/vlselect/main.go`](../app/vlselect/main.go#L90) and [`app/vlselect/logsql/logsql.go`](../app/vlselect/logsql/logsql.go#L1149).
+- `/internal/select/*` is the cluster-internal API used by `vlselect` to query `vlstorage` (versioned form args, binary responses, optional zstd compression). See [`app/vlstorage/netselect/netselect.go`](../app/vlstorage/netselect/netselect.go#L29) and [`app/vlselect/internalselect/internalselect.go`](../app/vlselect/internalselect/internalselect.go#L431).
+
 ### Minimal Cluster Setup
 
 ```
@@ -360,6 +364,8 @@ func parseData(irp insertutil.InsertRowProcessor, data []byte) error {
 
 The `netselect.Storage` handles distributed querying by fanning out queries to all vlstorage nodes in parallel and merging results.
 
+This section describes the **internal** distributed query transport (`vlselect` → `/internal/select/*` on `vlstorage`). Public endpoint routing, timeouts, and user argument parsing for `/select/*` are handled in [`app/vlselect/main.go`](../app/vlselect/main.go#L138) and [`app/vlselect/logsql/logsql.go`](../app/vlselect/logsql/logsql.go#L1362).
+
 **Key Types**:
 - [`Storage`](../app/vlstorage/netselect/netselect.go#L82) - Holds storage nodes and compression config
 - [`storageNode`](../app/vlstorage/netselect/netselect.go#L88) - Represents a single vlstorage node with HTTP client
@@ -468,6 +474,11 @@ After receiving results from all storage nodes, the frontend executes `pipesLoca
 **File**: [`app/vlselect/internalselect/internalselect.go`](../app/vlselect/internalselect/internalselect.go#L31)
 
 The `/internal/select/*` endpoints run on each vlstorage node and handle queries from vlselect frontend nodes.
+
+Unlike `/select/*`, these endpoints are not client-facing:
+- They expect internal transport parameters such as `tenant_ids`, `timestamp`, `hidden_fields_filters`, and `version` via form values.
+- They return compact binary payloads (`application/octet-stream`) for most select operations.
+- They enforce protocol version compatibility between cluster components.
 
 **Key Functions**:
 - [`RequestHandler(ctx, w, r)`](../app/vlselect/internalselect/internalselect.go#L31) - Concurrency-limited dispatcher
@@ -727,6 +738,8 @@ Each `InsertRow` is a self-describing binary record containing tenant ID, stream
 
 **Direction**: vlselect → vlstorage
 
+This is the wire protocol for `/internal/select/query`. It is different from the public `/select/logsql/query` API, which returns NDJSON to external clients via [`logsql.ProcessQueryRequest`](../app/vlselect/logsql/logsql.go#L1149).
+
 | Aspect | Details |
 |--------|---------|
 | **Endpoint** | `POST /internal/select/query` |
@@ -808,6 +821,8 @@ Exception: `/internal/select/tenant_ids` currently doesn't use protocol versioni
 ### Endpoint Isolation
 
 In a production cluster, it is recommended to disable endpoints that should not be exposed on each component:
+
+Route external query traffic only to `/select/*` via your auth proxy / load balancer. Do not expose `/internal/select/*` to untrusted clients; these endpoints are intended only for cluster inter-node communication.
 
 ```bash
 # vlinsert node: disable select endpoints to prevent query traffic
