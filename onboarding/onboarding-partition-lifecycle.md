@@ -291,7 +291,7 @@ mustCreateSnapshot()                        [partition.go:222]
 **Why hard links?** Snapshots use [`fs.MustHardLinkFiles()`](../lib/logstorage/datadb.go#L1003) instead of copying data. This makes snapshots:
 - **Near-instant**: No data copying, just filesystem metadata operations
 - **Space-efficient**: Hard-linked files share the same disk blocks
-- **Safe with merging**: When background merges replace parts, the snapshot's hard links still point to the original data (copy-on-write semantics at the filesystem level)
+- **Safe with merging**: When [background merges](./onboarding-storage-engine.md#merge--compaction) replace parts, the snapshot's hard links still point to the original data (copy-on-write semantics at the filesystem level)
 
 ### Listing Snapshots
 
@@ -352,7 +352,7 @@ VictoriaLogs does **not** have a built-in restore API. Restore is performed usin
    GET /internal/partition/snapshot/delete?path=/data/partitions/20260101/snapshots/20260101120000-0000001
 ```
 
-**Why use snapshots instead of copying directly?** Without a snapshot, background merges could modify or delete part files mid-copy, resulting in a corrupted backup. Snapshots provide a consistent, point-in-time view via hard links.
+**Why use snapshots instead of copying directly?** Without a snapshot, [background merges](./onboarding-storage-engine.md#merge--compaction) could modify or delete part files mid-copy, resulting in a corrupted backup. Snapshots provide a consistent, point-in-time view via hard links.
 
 ### Restore Procedure
 
@@ -540,9 +540,21 @@ When free disk space drops below `-storage.minFreeDiskSpaceBytes` (default 10MB)
 
 **HTTP**: `GET /internal/force_merge?partition_prefix=...` (protected by `-forceMergeAuthKey`)
 
-**Handler**: [`processForceMerge()`](../app/vlstorage/main.go#L293) — runs the merge **in a background goroutine** — [L305-312](../app/vlstorage/main.go#L305)
+**Handler**: [`processForceMerge()`](../app/vlstorage/main.go#L293) — runs the merge **in a background goroutine** and returns `200 OK` immediately — [L305-312](../app/vlstorage/main.go#L305). Progress is logged: `"started/finished force merge for partition YYYYMMDD"`.
 
-**Storage function**: [`Storage.MustForceMerge(partitionPrefix)`](../lib/logstorage/storage.go#L1113) iterates matching partitions and calls [`pt.mustForceMerge()`](../lib/logstorage/partition.go#L271) on each one sequentially.
+**Storage function**: [`Storage.MustForceMerge(partitionPrefix)`](../lib/logstorage/storage.go#L1113) iterates matching partitions and calls [`pt.mustForceMerge()`](../lib/logstorage/partition.go#L271) on each one **sequentially** (to limit system load) — [L1112](../lib/logstorage/storage.go#L1112).
+
+**What it does** ([`ddb.mustForceMergeAllParts()`](../lib/logstorage/datadb.go#L1480)):
+
+1. **Flush in-memory parts to disk** — [L1482](../lib/logstorage/datadb.go#L1482)
+2. **Collect all small and big file parts** — [L1488-1489](../lib/logstorage/datadb.go#L1488)
+3. **Merge everything** using the same selection algorithm as [background merge](./onboarding-storage-engine.md#merge--compaction), but with no size cap (`maxOutBytes = MaxUint64`) and no multiplier threshold — the loop continues until all parts are fully reduced — [L1497-1507](../lib/logstorage/datadb.go#L1497)
+4. **Even a single part is merged** — this applies any pending [delete task](#delete-task-processing) drop filter, physically removing deleted rows from the output part — [L1492-1493](../lib/logstorage/datadb.go#L1492)
+
+**When to use it**:
+
+- **After a delete task completes**: deleted rows are filtered out during merge; without a subsequent force merge they may remain in un-merged parts and continue consuming disk space (they are not returned in queries either way, but they do occupy space).
+- **To reduce read amplification**: if a partition has accumulated many small parts (because background merge's multiplier threshold was never met), force merge compacts them unconditionally into as few parts as possible, improving query scan performance on that partition.
 
 ### Force Flush
 
@@ -618,7 +630,7 @@ Every partition access (queries, ingestion, snapshots) goes through `incRef()`/`
 
 ### 2. Hard-Link Snapshots
 
-Snapshots use filesystem hard links rather than data copies. This makes them near-instant and space-efficient. Since parts are immutable once written (only replaced via merge), hard links remain valid even as background merging creates new parts. In-memory data is flushed to disk before taking a snapshot to ensure completeness.
+Snapshots use filesystem hard links rather than data copies. This makes them near-instant and space-efficient. Since parts are immutable once written (only replaced via merge), hard links remain valid even as [background merging](./onboarding-storage-engine.md#merge--compaction) creates new parts. In-memory data is flushed to disk before taking a snapshot to ensure completeness.
 
 ### 3. Persisted Delete Tasks
 
