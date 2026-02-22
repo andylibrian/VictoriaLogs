@@ -1,3 +1,23 @@
+// Package logstorage provides the core storage engine for VictoriaLogs.
+//
+// ============== Block Overview ==============
+//
+// A block is the fundamental in-memory unit used while writing and merging data.
+// Each block contains rows for a single stream, represented in a column-oriented form:
+//   - timestamps: one timestamp per row
+//   - columns: variable-value fields (one value per row)
+//   - constColumns: fields with the same value across all rows in the block
+//
+// WHY THIS SHAPE?
+//   - Columnar layout improves compression and query performance.
+//   - constColumns avoid repeating the same value N times.
+//   - Per-column bloom filters are built from encoded values during write.
+//
+// DATA FLOW:
+//  1. Rows are converted to block via MustInitFromRows / InitFromBlockData.
+//  2. Block is validated and encoded via mustWriteTo.
+//  3. Encoded payload is persisted into values/bloom/timestamps streams.
+//  4. During reads/merges, block can be reconstructed and appended back to row form.
 package logstorage
 
 import (
@@ -11,7 +31,7 @@ import (
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/slicesutil"
 )
 
-// block represents a block of log entries.
+// block is an in-memory columnar representation of log entries.
 type block struct {
 	// timestamps contains timestamps for log entries.
 	timestamps []int64
@@ -128,7 +148,8 @@ func (c *column) resizeValues(valuesLen int) []string {
 	return c.values
 }
 
-// mustWriteTo writes c to sw and updates ch accordingly.
+// mustWriteTo encodes column values, writes encoded values/bloom data to disk streams,
+// and updates ch with the corresponding offsets, sizes, and encoding metadata.
 //
 // ch is valid until c is changed.
 func (c *column) mustWriteTo(ch *columnHeader, sw *streamWriters) {
@@ -194,7 +215,8 @@ func (b *block) assertValid() {
 	}
 }
 
-// MustInitFromRows initializes b from the given timestamps and rows.
+// MustInitFromRows initializes b from rows that are already sorted by timestamp.
+// It performs deterministic column ordering so the resulting block layout is stable.
 //
 // It is expected that timestamps are sorted.
 //
@@ -207,7 +229,14 @@ func (b *block) MustInitFromRows(timestamps []int64, rows [][]Field) {
 	b.sortColumnsByName()
 }
 
-// mustInitFromRows initializes b from the given timestamps and rows.
+// mustInitFromRows materializes row data into column buffers.
+//
+// It has two paths:
+//   - Fast path: all rows share the same ordered field set.
+//   - Slow path: rows contain differing field sets; missing values are left empty.
+//
+// If too many unique field names appear (maxColumnsPerBlock), trailing rows are
+// dropped from this block and a warning is emitted.
 //
 // b is valid until rows are changed.
 func (b *block) mustInitFromRows(timestamps []int64, rows [][]Field) {
@@ -482,7 +511,10 @@ func (b *block) mustWriteTo(sid *streamID, bh *blockHeader, sw *streamWriters) {
 	putColumnsHeader(csh)
 }
 
-// appendRowsTo appends log entries from b to dst.
+// appendRowsTo converts the block back to row-oriented representation and appends it to dst.
+//
+// Empty values in variable columns are skipped, which matches the data model where
+// empty field values are treated as non-existing.
 func (b *block) appendRowsTo(dst *rows) {
 	// copy timestamps
 	dst.timestamps = append(dst.timestamps, b.timestamps...)
@@ -521,6 +553,8 @@ func (b *block) appendRowsTo(dst *rows) {
 	dst.fieldsBuf = fieldsBuf
 }
 
+// areSameFieldsInRows reports whether all rows have identical field names in the same order.
+// This check enables the fast-path block construction.
 func areSameFieldsInRows(rows [][]Field) bool {
 	if len(rows) < 2 {
 		return true
@@ -674,7 +708,8 @@ func putConstColumnsSorter(ccs *constColumnsSorter) {
 
 var constColumnsSorterPool sync.Pool
 
-// mustWriteTimestampsTo writes timestamps to sw and updates th accordingly
+// mustWriteTimestampsTo encodes timestamps, persists the encoded block, and fills th.
+// The resulting timestamp block is later addressed via th.blockOffset/th.blockSize.
 func mustWriteTimestampsTo(th *timestampsHeader, timestamps []int64, sw *streamWriters) {
 	th.reset()
 

@@ -35,6 +35,7 @@ func (fi *filterIn) matchRow(fields []Field) bool {
 
 func (fi *filterIn) applyToBlockResult(br *blockResult, bm *bitmap) {
 	if fi.values.isEmpty() {
+		// `in()` with no values is always false.
 		bm.resetBits()
 		return
 	}
@@ -49,6 +50,7 @@ func (fi *filterIn) applyToBlockResult(br *blockResult, bm *bitmap) {
 		return
 	}
 	if c.isTime {
+		// Time column stores string representation in blockResult.
 		fi.matchColumnByStringValues(br, bm, c)
 		return
 	}
@@ -64,6 +66,7 @@ func (fi *filterIn) applyToBlockResult(br *blockResult, bm *bitmap) {
 			if _, ok := stringValues[v]; ok {
 				c = 1
 			}
+			// Precompute per-dictionary-entry match flags.
 			bb.B = append(bb.B, c)
 		}
 		valuesEncoded := c.getValuesEncoded(br)
@@ -113,6 +116,7 @@ func (fi *filterIn) matchColumnByStringValues(br *blockResult, bm *bitmap, c *bl
 
 func matchColumnByBinValues(br *blockResult, bm *bitmap, c *blockResultColumn, binValues map[string]struct{}) {
 	if len(binValues) == 0 {
+		// No parsable typed values means no row can match.
 		bm.resetBits()
 		return
 	}
@@ -128,6 +132,7 @@ func (fi *filterIn) applyToBlockSearch(bs *blockSearch, bm *bitmap) {
 	fieldName := fi.fieldName
 
 	if fi.values.isEmpty() {
+		// `in()` with no values is always false.
 		bm.resetBits()
 		return
 	}
@@ -155,6 +160,7 @@ func (fi *filterIn) applyToBlockSearch(bs *blockSearch, bm *bitmap) {
 
 	commonTokens, tokenSets := fi.values.getTokensHashesAny()
 
+	// Route matching strategy by physical column encoding.
 	switch ch.valueType {
 	case valueTypeString:
 		stringValues := fi.values.getStringValues()
@@ -193,10 +199,12 @@ func (fi *filterIn) applyToBlockSearch(bs *blockSearch, bm *bitmap) {
 
 func matchAnyValue(bs *blockSearch, ch *columnHeader, bm *bitmap, binValues map[string]struct{}, commonTokens []uint64, tokenSets [][]uint64) {
 	if len(binValues) == 0 {
+		// No candidate values for this type (for example, parse failures).
 		bm.resetBits()
 		return
 	}
 	if !matchBloomFilterAnyTokenSet(bs, ch, commonTokens, tokenSets) {
+		// Bloom filter proved that no candidate value can exist in this block.
 		bm.resetBits()
 		return
 	}
@@ -208,6 +216,7 @@ func matchAnyValue(bs *blockSearch, ch *columnHeader, bm *bitmap, binValues map[
 
 func matchBloomFilterAnyTokenSet(bs *blockSearch, ch *columnHeader, commonTokens []uint64, tokenSets [][]uint64) bool {
 	if !matchBloomFilterAllTokens(bs, ch, commonTokens) {
+		// Common tokens are required by every set, so this block is impossible.
 		return false
 	}
 	if len(tokenSets) > maxTokenSetsToInit || uint64(len(tokenSets)) > 10*bs.bsw.bh.rowsCount {
@@ -218,6 +227,7 @@ func matchBloomFilterAnyTokenSet(bs *blockSearch, ch *columnHeader, commonTokens
 	bf := bs.getBloomFilterForColumn(ch)
 	for _, tokens := range tokenSets {
 		if bf.containsAll(tokens) {
+			// Any candidate token set is enough for `in(...)`.
 			return true
 		}
 	}
@@ -234,6 +244,7 @@ func matchValuesDictByAnyValue(bs *blockSearch, ch *columnHeader, bm *bitmap, va
 		if _, ok := values[v]; ok {
 			c = 1
 		}
+		// Build lookup table indexed by dictionary id.
 		bb.B = append(bb.B, c)
 	}
 	matchEncodedValuesDict(bs, ch, bm, bb.B)

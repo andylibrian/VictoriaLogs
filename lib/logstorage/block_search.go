@@ -15,6 +15,8 @@ import (
 // the overhead for passing the blockSearchWork to worker goroutines.
 const blockSearchWorksPerBatch = 64
 
+// blockSearchWork describes one block-level filtering task produced by
+// partition search code and consumed by block search workers.
 type blockSearchWork struct {
 	// p is the part where the block belongs to.
 	p *part
@@ -69,6 +71,7 @@ func (bswb *blockSearchWorkBatch) appendBlockSearchWork(p *part, pso *partitionS
 		pso: pso,
 	})
 	bsw := &bsws[len(bsws)-1]
+	// Copy block header data, since caller-owned headers may be reused.
 	bsw.bh.copyFrom(bh)
 
 	bswb.bsws = bsws
@@ -156,18 +159,21 @@ func (bs *blockSearch) reset() {
 	bs.br.reset()
 
 	if bs.timestampsCache != nil {
+		// Return timestamp buffers to shared pool to cap per-query heap growth.
 		encoding.PutInt64s(bs.timestampsCache)
 		bs.timestampsCache = nil
 	}
 
 	bloomFilterCache := bs.bloomFilterCache
 	for k, bf := range bloomFilterCache {
+		// Cache owns bloom filters, so every cached item must be returned.
 		putBloomFilter(bf)
 		delete(bloomFilterCache, k)
 	}
 
 	valuesCache := bs.valuesCache
 	for k, values := range valuesCache {
+		// Keep pooled value buckets reusable across blocks.
 		putStringBucket(values)
 		delete(valuesCache, k)
 	}
@@ -216,6 +222,7 @@ func (bs *blockSearch) search(qs *QueryStats, bsw *blockSearchWork, bm *bitmap) 
 
 	// search rows matching the given filter
 	bm.init(int(bsw.bh.rowsCount))
+	// Start from "all rows match" and let filters clear non-matching bits.
 	bm.setBits()
 	bs.bsw.pso.filter.applyToBlockSearch(bs, bm)
 
@@ -245,6 +252,7 @@ func (bs *blockSearch) getConstColumnValue(name string) string {
 	}
 
 	if bs.partFormatVersion() < 1 {
+		// Legacy format stores const columns inline in columnsHeader.
 		csh := bs.getColumnsHeader()
 		for _, cc := range csh.constColumns {
 			if cc.Name == name {
@@ -261,6 +269,7 @@ func (bs *blockSearch) getConstColumnValue(name string) string {
 
 	for i := range bs.ccsCache {
 		if bs.ccsCache[i].Name == name {
+			// Reuse already decoded const column for this block.
 			return bs.ccsCache[i].Value
 		}
 	}
@@ -278,6 +287,7 @@ func (bs *blockSearch) getConstColumnValue(name string) string {
 		b = b[cr.offset:]
 		bs.ccsCache = slicesutil.SetLength(bs.ccsCache, len(bs.ccsCache)+1)
 		cc := &bs.ccsCache[len(bs.ccsCache)-1]
+		// Decode only the requested const column instead of the full header set.
 		if _, err := cc.unmarshalInplace(b, false); err != nil {
 			logger.Panicf("FATAL: %s: cannot unmarshal header for const column %q: %s", bs.bsw.p.path, name, err)
 		}
@@ -294,6 +304,7 @@ func (bs *blockSearch) getColumnHeader(name string) *columnHeader {
 	}
 
 	if bs.partFormatVersion() < 1 {
+		// Legacy format keeps all headers in a single decoded structure.
 		csh := bs.getColumnsHeader()
 		chs := csh.columnHeaders
 		for i := range chs {
@@ -312,6 +323,7 @@ func (bs *blockSearch) getColumnHeader(name string) *columnHeader {
 
 	for i := range bs.chsCache {
 		if bs.chsCache[i].name == name {
+			// Header for this column has already been decoded for this block.
 			return &bs.chsCache[i]
 		}
 	}
@@ -329,6 +341,7 @@ func (bs *blockSearch) getColumnHeader(name string) *columnHeader {
 		b = b[cr.offset:]
 		bs.chsCache = slicesutil.SetLength(bs.chsCache, len(bs.chsCache)+1)
 		ch := &bs.chsCache[len(bs.chsCache)-1]
+		// Decode only the needed header, which avoids touching unrelated columns.
 		if _, err := ch.unmarshalInplace(b, partFormatLatestVersion); err != nil {
 			logger.Panicf("FATAL: %s: cannot unmarshal header for column %q: %s", bs.bsw.p.path, name, err)
 		}
@@ -357,6 +370,7 @@ func (bs *blockSearch) getColumnsHeaderIndex() *columnsHeaderIndex {
 	}
 
 	if bs.cshIndexCache == nil {
+		// Read and decode once per searched block.
 		bs.cshIndexBlockCache = readColumnsHeaderIndexBlock(bs.cshIndexBlockCache[:0], bs.bsw.p, &bs.bsw.bh, bs.qs)
 
 		bs.cshIndexCache = getColumnsHeaderIndex()
@@ -377,6 +391,7 @@ func (bs *blockSearch) getColumnsHeader() *columnsHeader {
 			logger.Panicf("FATAL: %s: cannot unmarshal columns header: %s", bs.bsw.p.path, err)
 		}
 		if partFormatVersion >= 1 {
+			// Newer formats store column names in shared dictionaries.
 			cshIndex := bs.getColumnsHeaderIndex()
 			if err := csh.setColumnNames(cshIndex, bs.bsw.p.columnNames); err != nil {
 				logger.Panicf("FATAL: %s: %s", bs.bsw.p.path, err)
@@ -390,6 +405,7 @@ func (bs *blockSearch) getColumnsHeader() *columnsHeader {
 
 func (bs *blockSearch) getColumnsHeaderBlock() []byte {
 	if !bs.cshBlockInitialized {
+		// Keep raw header bytes cached for repeated random-offset lookups.
 		bs.cshBlockCache = readColumnsHeaderBlock(bs.cshBlockCache[:0], bs.bsw.p, &bs.bsw.bh, bs.qs)
 		bs.cshBlockInitialized = true
 	}
@@ -403,6 +419,7 @@ func readColumnsHeaderIndexBlock(dst []byte, p *part, bh *blockHeader, qs *Query
 	}
 
 	dstLen := len(dst)
+	// Append data to dst, because callers may keep prefix data in the same buf.
 	dst = bytesutil.ResizeNoCopyMayOverallocate(dst, int(n)+dstLen)
 	p.columnsHeaderIndexFile.MustReadAt(dst[dstLen:], int64(bh.columnsHeaderIndexOffset))
 
@@ -417,6 +434,7 @@ func readColumnsHeaderBlock(dst []byte, p *part, bh *blockHeader, qs *QueryStats
 		logger.Panicf("FATAL: %s: columns header size cannot exceed %d bytes; got %d bytes", p.path, maxColumnsHeaderSize, n)
 	}
 	dstLen := len(dst)
+	// Append data to dst for consistency with other read helpers in this file.
 	dst = bytesutil.ResizeNoCopyMayOverallocate(dst, int(n)+dstLen)
 	p.columnsHeaderFile.MustReadAt(dst[dstLen:], int64(bh.columnsHeaderOffset))
 
@@ -431,6 +449,7 @@ func readColumnsHeaderBlock(dst []byte, p *part, bh *blockHeader, qs *QueryStats
 func (bs *blockSearch) getBloomFilterForColumn(ch *columnHeader) *bloomFilter {
 	bf := bs.bloomFilterCache[ch.name]
 	if bf != nil {
+		// Bloom filter was already loaded for this block+column.
 		return bf
 	}
 
@@ -454,6 +473,7 @@ func (bs *blockSearch) getBloomFilterForColumn(ch *columnHeader) *bloomFilter {
 	longTermBufPool.Put(bb)
 
 	if bs.bloomFilterCache == nil {
+		// Lazily allocate map to avoid overhead for queries that never use bloom.
 		bs.bloomFilterCache = make(map[string]*bloomFilter)
 	}
 	bs.bloomFilterCache[ch.name] = bf
@@ -466,6 +486,7 @@ func (bs *blockSearch) getBloomFilterForColumn(ch *columnHeader) *bloomFilter {
 func (bs *blockSearch) getValuesForColumn(ch *columnHeader) []string {
 	values := bs.valuesCache[ch.name]
 	if values != nil {
+		// Values already decoded for this block+column.
 		return values.a
 	}
 
@@ -484,6 +505,7 @@ func (bs *blockSearch) getValuesForColumn(ch *columnHeader) []string {
 
 	values = getStringBucket()
 	var err error
+	// rowsCount is required for integrity checks while decoding values block.
 	values.a, err = bs.sbu.unmarshal(values.a[:0], bb.B, bs.bsw.bh.rowsCount)
 	longTermBufPool.Put(bb)
 	if err != nil {
@@ -494,6 +516,7 @@ func (bs *blockSearch) getValuesForColumn(ch *columnHeader) []string {
 	bs.qs.BytesProcessedUncompressedValues += getStringsLen(values.a)
 
 	if bs.valuesCache == nil {
+		// Lazily allocate map, since some filters can finish without decoding values.
 		bs.valuesCache = make(map[string]*stringBucket)
 	}
 	bs.valuesCache[ch.name] = values
@@ -511,6 +534,7 @@ func getStringsLen(a []string) uint64 {
 func (bs *blockSearch) subTimeOffsetToTimestamps(timeOffset int64) {
 	bs.bsw.bh.timestampsHeader.subTimeOffset(timeOffset)
 	if bs.timestampsCache != nil {
+		// Keep decoded timestamps in sync with adjusted header metadata.
 		subTimeOffset(bs.timestampsCache.A, timeOffset)
 	}
 }
@@ -527,6 +551,7 @@ func subTimeOffset(timestamps []int64, timeOffset int64) {
 func (bs *blockSearch) getTimestamps() []int64 {
 	timestamps := bs.timestampsCache
 	if timestamps != nil {
+		// Return already decoded block timestamps.
 		return timestamps.A
 	}
 
@@ -547,6 +572,7 @@ func (bs *blockSearch) getTimestamps() []int64 {
 	rowsCount := int(bs.bsw.bh.rowsCount)
 	timestamps = encoding.GetInt64s(rowsCount)
 	var err error
+	// Decode according to block-level timestamp encoding selected at write time.
 	timestamps.A, err = encoding.UnmarshalTimestamps(timestamps.A[:0], bb.B, th.marshalType, th.minTimestamp, rowsCount)
 	longTermBufPool.Put(bb)
 	if err != nil {
@@ -571,6 +597,7 @@ func (ih *indexBlockHeader) mustReadBlockHeaders(dst []blockHeader, p *part, qs 
 
 	bb := longTermBufPool.Get()
 	var err error
+	// Index blocks are zstd-compressed to reduce disk reads.
 	bb.B, err = encoding.DecompressZSTD(bb.B, bbCompressed.B)
 	longTermBufPool.Put(bbCompressed)
 	if err != nil {
@@ -600,6 +627,7 @@ func (bs *blockSearch) getStreamStr() string {
 	if streamStr != "" {
 		// Store the found streamStr in seenStreams.
 		if len(bs.seenStreams) > 20_000 {
+			// Hard cap map size to prevent unbounded memory growth on high-cardinality queries.
 			bs.seenStreams = nil
 		}
 		if bs.seenStreams == nil {

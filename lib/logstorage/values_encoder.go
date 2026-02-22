@@ -1,3 +1,26 @@
+// Package logstorage provides the core storage engine for VictoriaLogs.
+//
+// ============== Values Encoding Overview ==============
+//
+// This file contains:
+//   - Column value encoding/decoding logic (`valuesEncoder`, `valuesDecoder`)
+//   - Type detection heuristics (`valueType*`)
+//   - Parsing helpers used by filters and value-type inference
+//   - Dictionary encoding support (`valuesDict`)
+//
+// ENCODING STRATEGY:
+// For each column, encoder tries specialized representations in this order:
+//  1. Dictionary (small cardinality, fastest query path)
+//  2. Unsigned integers
+//  3. Signed integers
+//  4. Float64
+//  5. IPv4
+//  6. Strict ISO8601 timestamp
+//  7. Plain string fallback
+//
+// The chosen value type is stored in columnHeader and drives both:
+//   - how payload bytes are interpreted
+//   - how min/max and bloom filters are used during query pruning
 package logstorage
 
 import (
@@ -16,7 +39,9 @@ import (
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/timeutil"
 )
 
-// valueType is the type of values stored in every column block.
+// ==================== Value Types ====================
+//
+// valueType identifies the binary representation used for values in a column block.
 type valueType byte
 
 const (
@@ -103,7 +128,11 @@ func (ve *valuesEncoder) reset() {
 	ve.values = ve.values[:0]
 }
 
-// encode encodes values to ve.values and returns the encoded value type with min/max encoded values.
+// ==================== Encoder/Decoder ====================
+
+// encode encodes values into ve.values and returns:
+//   - selected valueType
+//   - min/max encoded values (for applicable types)
 //
 // ve.values and dict is valid until values are changed.
 func (ve *valuesEncoder) encode(values []string, dict *valuesDict) (valueType, uint64, uint64) {
@@ -176,7 +205,8 @@ func (vd *valuesDecoder) reset() {
 	vd.buf = vd.buf[:0]
 }
 
-// decodeInplace decodes values encoded with the given vt and the given dictValues inplace.
+// decodeInplace decodes values encoded with vt using dictValues when needed.
+// Decoded strings may point into vd internal buffers.
 //
 // the decoded values remain valid until vd.reset() is called.
 func (vd *valuesDecoder) decodeInplace(values []string, vt valueType, dictValues []string) error {
@@ -332,6 +362,8 @@ func tryTimestampISO8601Encoding(dstBuf []byte, dstValues, srcValues []string) (
 	return dstBuf, dstValues, valueTypeTimestampISO8601, uint64(minValue), uint64(maxValue)
 }
 
+// ==================== Timestamp Parsing ====================
+
 // TryParseTimestampRFC3339Nano parses s as RFC3339 with optional nanoseconds part and timezone offset and returns unix timestamp in nanoseconds.
 //
 // If s doesn't contain timezone offset, then the local timezone is used.
@@ -428,7 +460,10 @@ func tryParseHHMM(s string) (int64, bool) {
 	return int64(hours)*nsecsPerHour + int64(minutes)*nsecsPerMinute, true
 }
 
-// tryParseTimestampISO8601 parses 'YYYY-MM-DDThh:mm:ss.mssZ' and returns unix timestamp in nanoseconds.
+// tryParseTimestampISO8601 parses strict `YYYY-MM-DDThh:mm:ss.mmmZ`.
+//
+// The parser is intentionally strict and timezone-limited to preserve string round-trip
+// behavior for encoded values.
 //
 // The returned timestamp can be negative if s is smaller than 1970 year.
 func tryParseTimestampISO8601(s string) (int64, bool) {
@@ -471,7 +506,8 @@ func tryParseTimestampISO8601(s string) (int64, bool) {
 	return nsecs, true
 }
 
-// tryParseTimestampSecs parses YYYY-MM-DDTHH:mm:ss into unix timestamp in seconds.
+// tryParseTimestampSecs parses `YYYY-MM-DDTHH:mm:ss` (or space instead of `T`)
+// into unix timestamp seconds.
 func tryParseTimestampSecs(s string) (int64, bool, string) {
 	// Parse year
 	if s[len("YYYY")] != '-' {
@@ -555,7 +591,10 @@ func tryParseTimestampSecs(s string) (int64, bool, string) {
 	return secs, true, s
 }
 
-// tryParseUint64 parses s as uint64 value.
+// ==================== Numeric Parsing ====================
+
+// tryParseUint64 parses s as uint64.
+// Underscores are allowed as visual separators.
 func tryParseUint64(s string) (uint64, bool) {
 	if len(s) == 0 || len(s) > len("18_446_744_073_709_551_615") {
 		return 0, false
@@ -624,7 +663,7 @@ func tryParseDateUint64(s string) (uint64, bool) {
 	return n, true
 }
 
-// tryParseInt64 parses s as int64 value.
+// tryParseInt64 parses s as int64 and handles the `-2^63` edge case.
 func tryParseInt64(s string) (int64, bool) {
 	if len(s) == 0 {
 		return 0, false
@@ -853,6 +892,8 @@ func tryParseFloat64Internal(s string, isExact bool) (float64, bool) {
 	return f, true
 }
 
+// ==================== Domain-Specific Parsing ====================
+
 // tryParseBytes parses user-readable bytes representation in s.
 //
 // Supported suffixes:
@@ -992,7 +1033,7 @@ func tryParseIPv4Mask(s string) (uint64, bool) {
 	return 1 << (32 - uint8(n)), true
 }
 
-// tryParseDuration parses the given duration in nanoseconds and returns the result.
+// tryParseDuration parses a user duration string and returns nanoseconds.
 func tryParseDuration(s string) (int64, bool) {
 	if len(s) == 0 {
 		return 0, false
@@ -1246,6 +1287,8 @@ func tryDictEncoding(dstBuf []byte, dstValues, srcValues []string, dict *valuesD
 	return dstBuf, dstValues, valueTypeDict
 }
 
+// ==================== Dictionary Encoding ====================
+
 type valuesDict struct {
 	values []string
 }
@@ -1271,6 +1314,10 @@ func (vd *valuesDict) copyFromNoArena(src *valuesDict) {
 	vd.values = append(vd.values[:0], src.values...)
 }
 
+// getOrAdd returns dictionary ID for k, adding it if limits allow.
+// It rejects additions when either:
+//   - entry count reaches maxDictLen
+//   - cumulative dictionary bytes exceed maxDictSizeBytes
 func (vd *valuesDict) getOrAdd(k string) (byte, bool) {
 	if len(k) > maxDictSizeBytes {
 		return 0, false

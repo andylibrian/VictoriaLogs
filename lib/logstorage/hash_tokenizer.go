@@ -16,7 +16,8 @@ func tokenizeHashes(dst []uint64, a []string) []uint64 {
 	t := getHashTokenizer()
 	for i, s := range a {
 		if i > 0 && s == a[i-1] {
-			// This string has been already tokenized
+			// Input arrays are often sorted and may contain duplicates.
+			// Skip adjacent duplicates to avoid repeated tokenization work.
 			continue
 		}
 		dst = t.tokenizeString(dst, s)
@@ -28,6 +29,11 @@ func tokenizeHashes(dst []uint64, a []string) []uint64 {
 
 const hashTokenizerBucketsCount = 1024
 
+// hashTokenizer tokenizes strings and deduplicates token hashes within the
+// current batch without allocating per-token maps.
+//
+// It uses fixed-size buckets plus overflow slices for collisions, while bm
+// tracks touched buckets so sparse resets can avoid full scans.
 type hashTokenizer struct {
 	buckets [hashTokenizerBucketsCount]hashTokenizerBucket
 	bm      bitmap
@@ -46,17 +52,20 @@ func (b *hashTokenizerBucket) reset() {
 
 func newHashTokenizer() *hashTokenizer {
 	var t hashTokenizer
+	// Bitmap indices are bucket indices, so both must have the same size.
 	t.bm.init(len(t.buckets))
 	return &t
 }
 
 func (t *hashTokenizer) reset() {
 	if t.bm.onesCount() <= len(t.buckets)/4 {
+		// Sparse case: reset only buckets that were actually used.
 		t.bm.forEachSetBit(func(idx int) bool {
 			t.buckets[idx].reset()
 			return false
 		})
 	} else {
+		// Dense case: a full scan is cheaper than iterating bitmap words.
 		buckets := t.buckets[:]
 		for i := range buckets {
 			buckets[i].reset()
@@ -103,6 +112,8 @@ func (t *hashTokenizer) tokenizeString(dst []uint64, s string) []uint64 {
 		// Register the token.
 		token := s[start:end]
 		if h, ok := t.addToken(token); ok {
+			// addToken returns ok=false for duplicates within the current
+			// tokenizer session, so dst contains unique token hashes.
 			dst = append(dst, h)
 		}
 	}
@@ -136,6 +147,7 @@ func (t *hashTokenizer) tokenizeStringUnicode(dst []uint64, s string) []uint64 {
 		token := s[:n]
 		s = s[n:]
 		if h, ok := t.addToken(token); ok {
+			// Keep output semantics identical to the ASCII path.
 			dst = append(dst, h)
 		}
 	}
@@ -148,19 +160,23 @@ func (t *hashTokenizer) addToken(token string) (uint64, bool) {
 
 	b := &t.buckets[idx]
 	if !t.bm.isSetBit(idx) {
+		// First hash in this bucket - store directly in inline slot.
 		b.v = h
 		t.bm.setBit(idx)
 		return h, true
 	}
 
 	if b.v == h {
+		// Duplicate hash in the inline slot.
 		return h, false
 	}
 	for _, v := range b.overflow {
 		if v == h {
+			// Duplicate hash in the collision list.
 			return h, false
 		}
 	}
+	// New hash colliding with existing bucket head.
 	b.overflow = append(b.overflow, h)
 	return h, true
 }
@@ -174,6 +190,7 @@ func getHashTokenizer() *hashTokenizer {
 }
 
 func putHashTokenizer(t *hashTokenizer) {
+	// Reset dedup state before pooling to avoid cross-query contamination.
 	t.reset()
 	hashTokenizerPool.Put(t)
 }

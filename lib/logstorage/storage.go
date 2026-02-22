@@ -224,6 +224,7 @@ func (s *Storage) PartitionAttach(name string) error {
 	defer s.partitionsLock.Unlock()
 
 	if slices.Contains(s.deletedPartitions, day) {
+		// Keep retention-deleted days permanently blocked from re-attach.
 		return fmt.Errorf("cannot attach the partition %q, since it is automatically deleted because of retention; see https://docs.victoriametrics.com/victorialogs/#retention", name)
 	}
 
@@ -245,6 +246,7 @@ func (s *Storage) PartitionAttach(name string) error {
 	ptw := newPartitionWrapper(pt, day)
 
 	s.partitions = append(s.partitions, ptw)
+	// Keep invariant: s.partitions is ordered by day.
 	sortPartitions(s.partitions)
 
 	logger.Infof("successfully attached partition %q from %q", name, partitionPath)
@@ -270,6 +272,7 @@ func (s *Storage) PartitionDetach(name string) error {
 			// Found the partition to detach. Detach it.
 			s.partitions = append(s.partitions[:i], s.partitions[i+1:]...)
 			if ptw == s.ptwHot {
+				// Force re-selection of hot partition on next write.
 				s.ptwHot = nil
 			}
 			return ptw
@@ -282,6 +285,7 @@ func (s *Storage) PartitionDetach(name string) error {
 	}
 
 	partitionPath := ptw.pt.path
+	// Drop storage-owned ref. Remaining readers/writers keep their refs.
 	ptw.decRef()
 
 	logger.Infof("waiting until the partition %q isn't accessed", name)
@@ -450,6 +454,7 @@ func (s *Storage) DeleteRunTask(_ context.Context, taskID string, timestamp int6
 
 	// Register the task and persist it to the file.
 	s.deleteTasks = append(s.deleteTasks, dt)
+	// Persist immediately, so task survives crashes/restarts.
 	s.mustSaveDeleteTasksLocked()
 
 	return nil
@@ -500,6 +505,7 @@ func (s *Storage) DeleteStopTask(ctx context.Context, taskID string) error {
 	case <-doneCh:
 		return nil
 	case <-ctx.Done():
+		// Caller can bound wait time for task cancellation.
 		return ctx.Err()
 	}
 }
@@ -570,6 +576,7 @@ func (ptw *partitionWrapper) incRef() {
 func (ptw *partitionWrapper) decRef() {
 	n := ptw.refCount.Add(-1)
 	if n > 0 {
+		// Other goroutines still hold this partition.
 		return
 	}
 
@@ -596,6 +603,7 @@ func (ptw *partitionWrapper) canAddAllRows(lr *LogRows) bool {
 	maxTimestamp := minTimestamp + nsecsPerDay - 1
 	for _, ts := range lr.timestamps {
 		if ts < minTimestamp || ts > maxTimestamp {
+			// Any out-of-range row forces slow-path split in Storage.MustAddRows().
 			return false
 		}
 	}
@@ -618,11 +626,13 @@ func mustCreateStorage(path string) {
 func MustOpenStorage(path string, cfg *StorageConfig) *Storage {
 	flushInterval := cfg.FlushInterval
 	if flushInterval < time.Second {
+		// Clamp to avoid too-frequent flush cycles.
 		flushInterval = time.Second
 	}
 
 	retention := cfg.Retention
 	if retention < 24*time.Hour {
+		// Retention is partition/day-based, so less than one day is not supported.
 		retention = 24 * time.Hour
 	}
 
@@ -633,6 +643,7 @@ func MustOpenStorage(path string, cfg *StorageConfig) *Storage {
 
 	maxBackfillAge := cfg.MaxBackfillAge
 	if maxBackfillAge <= 0 || maxBackfillAge > retention {
+		// Keep backfill window bounded and consistent with retention.
 		maxBackfillAge = retention
 	}
 
@@ -709,6 +720,7 @@ func MustOpenStorage(path string, cfg *StorageConfig) *Storage {
 			pt := mustOpenPartition(s, partitionPath)
 			ptws[idx] = newPartitionWrapper(pt, day)
 
+			// Release worker slot after partition is opened.
 			<-concurrencyLimiterCh
 		})
 	}
@@ -737,6 +749,7 @@ func MustOpenStorage(path string, cfg *StorageConfig) *Storage {
 	ptws = ptws[:j]
 
 	s.partitions = ptws
+	// Start background maintenance loops after partition set is finalized.
 	s.runRetentionWatcher()
 	s.runMaxDiskSpaceUsageWatcher()
 	s.runDeleteTasksWatcher()
@@ -851,6 +864,7 @@ func (s *Storage) watchMaxDiskSpaceUsage() {
 			ptw := ptws[i]
 			var ps PartitionStats
 			ptw.pt.updateStats(&ps)
+			// Accumulate size from newest to oldest and drop oldest overflow.
 			n += ps.IndexdbSizeBytes + ps.CompressedSmallPartSize + ps.CompressedBigPartSize
 			if n <= limitBytes {
 				continue
@@ -1147,6 +1161,7 @@ func (s *Storage) MustAddRows(lr *LogRows) {
 
 	if ptwHot != nil {
 		if ptwHot.canAddAllRows(lr) {
+			// Common case for near-real-time ingestion: all rows belong to same day.
 			ptwHot.pt.mustAddRows(lr)
 			ptwHot.decRef()
 			return
@@ -1196,6 +1211,7 @@ func (s *Storage) MustAddRows(lr *LogRows) {
 
 		lrPart := m[day]
 		if lrPart == nil {
+			// Build per-day batches, because each partition is day-scoped.
 			lrPart = GetLogRows(nil, nil, nil, nil, "")
 			m[day] = lrPart
 		}
@@ -1280,12 +1296,14 @@ func (s *Storage) getPartitionForWriting(day int64) *partitionWrapper {
 		if n == len(ptws) {
 			ptws = append(ptws, ptw)
 		} else {
+			// Insert into sorted slice at position n.
 			ptws = append(ptws[:n+1], ptws[n:]...)
 			ptws[n] = ptw
 		}
 		s.partitions = ptws
 	}
 
+	// Remember hot partition to accelerate the next ingestion call.
 	s.ptwHot = ptw
 	ptw.incRef()
 
@@ -1344,6 +1362,7 @@ func (s *Storage) getPartitions() []*partitionWrapper {
 	s.partitionsLock.Lock()
 	ptws := append([]*partitionWrapper{}, s.partitions...)
 	for _, ptw := range ptws {
+		// Caller receives borrowed partitions and must return them via putPartitions().
 		ptw.incRef()
 	}
 	s.partitionsLock.Unlock()
@@ -1353,6 +1372,7 @@ func (s *Storage) getPartitions() []*partitionWrapper {
 
 func (s *Storage) putPartitions(ptws []*partitionWrapper) {
 	for _, ptw := range ptws {
+		// Release refs acquired by getPartitions().
 		ptw.decRef()
 	}
 }

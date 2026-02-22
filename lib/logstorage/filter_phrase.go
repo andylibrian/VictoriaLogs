@@ -26,6 +26,8 @@ type filterPhrase struct {
 	fieldName string
 	phrase    string
 
+	// Lazy token initialization keeps parser construction cheap for queries
+	// that can be resolved via const/missing-column fast paths.
 	tokensOnce   sync.Once
 	tokens       []string
 	tokensHashes []uint64
@@ -50,6 +52,8 @@ func (fp *filterPhrase) getTokensHashes() []uint64 {
 }
 
 func (fp *filterPhrase) initTokens() {
+	// Tokenization must mirror ingestion-time token rules, since bloom filters
+	// are built from the same tokenizer pipeline.
 	fp.tokens = tokenizeStrings(nil, []string{fp.phrase})
 	fp.tokensHashes = appendTokensHashes(nil, fp.tokens)
 }
@@ -89,6 +93,7 @@ func (fp *filterPhrase) applyToBlockSearch(bs *blockSearch, bm *bitmap) {
 
 	tokens := fp.getTokensHashes()
 
+	// Route matching strategy by physical column encoding.
 	switch ch.valueType {
 	case valueTypeString:
 		matchStringByPhrase(bs, ch, bm, phrase, tokens)
@@ -125,12 +130,14 @@ func matchTimestampISO8601ByPhrase(bs *blockSearch, ch *columnHeader, bm *bitmap
 
 	// Slow path - the phrase contains incomplete timestamp. Search over string representation of the timestamp.
 	if !matchBloomFilterAllTokens(bs, ch, tokens) {
+		// Required tokens are definitely absent in this block.
 		bm.resetBits()
 		return
 	}
 
 	bb := bbPool.Get()
 	visitValues(bs, ch, bm, func(v string) bool {
+		// Stored value is binary timestamp, so convert before phrase scan.
 		s := toTimestampISO8601String(bs, bb, v)
 		return matchPhrase(s, phrase)
 	})
@@ -149,12 +156,14 @@ func matchIPv4ByPhrase(bs *blockSearch, ch *columnHeader, bm *bitmap, phrase str
 	// We cannot compare binary representation of ip address and need converting
 	// the ip to string before searching for prefix there.
 	if !matchBloomFilterAllTokens(bs, ch, tokens) {
+		// Required tokens are definitely absent in this block.
 		bm.resetBits()
 		return
 	}
 
 	bb := bbPool.Get()
 	visitValues(bs, ch, bm, func(v string) bool {
+		// Stored value is binary IPv4, so convert before phrase scan.
 		s := toIPv4String(bs, bb, v)
 		return matchPhrase(s, phrase)
 	})
@@ -178,6 +187,7 @@ func matchFloat64ByPhrase(bs *blockSearch, ch *columnHeader, bm *bitmap, phrase 
 		return
 	}
 	if !matchBloomFilterAllTokens(bs, ch, tokens) {
+		// Required tokens are definitely absent in this block.
 		bm.resetBits()
 		return
 	}
@@ -197,6 +207,7 @@ func matchValuesDictByPhrase(bs *blockSearch, ch *columnHeader, bm *bitmap, phra
 		if matchPhrase(v, phrase) {
 			c = 1
 		}
+		// Build lookup table indexed by dictionary id.
 		bb.B = append(bb.B, c)
 	}
 	matchEncodedValuesDict(bs, ch, bm, bb.B)
@@ -205,6 +216,7 @@ func matchValuesDictByPhrase(bs *blockSearch, ch *columnHeader, bm *bitmap, phra
 
 func matchStringByPhrase(bs *blockSearch, ch *columnHeader, bm *bitmap, phrase string, tokens []uint64) {
 	if !matchBloomFilterAllTokens(bs, ch, tokens) {
+		// Required tokens are definitely absent in this block.
 		bm.resetBits()
 		return
 	}
@@ -289,6 +301,7 @@ func matchEncodedValuesDict(bs *blockSearch, ch *columnHeader, bm *bitmap, encod
 		if int(idx) >= len(encodedValues) {
 			logger.Panicf("FATAL: %s: too big index for dict value; got %d; must be smaller than %d", bs.partPath(), idx, len(encodedValues))
 		}
+		// encodedValues[idx] is 1 if dictionary entry matches the phrase.
 		return encodedValues[idx] == 1
 	})
 }
@@ -300,12 +313,14 @@ func visitValues(bs *blockSearch, ch *columnHeader, bm *bitmap, f func(value str
 	}
 	values := bs.getValuesForColumn(ch)
 	bm.forEachSetBit(func(idx int) bool {
+		// Evaluate only candidate rows still set in bm.
 		return f(values[idx])
 	})
 }
 
 func matchBloomFilterAllTokens(bs *blockSearch, ch *columnHeader, tokens []uint64) bool {
 	if len(tokens) == 0 {
+		// Empty phrase/token set cannot be rejected by bloom filter.
 		return true
 	}
 	bf := bs.getBloomFilterForColumn(ch)

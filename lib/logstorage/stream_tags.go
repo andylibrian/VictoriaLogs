@@ -12,6 +12,9 @@ import (
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logger"
 )
 
+// StreamTags and streamTag helpers provide canonical stream identity encoding
+// used for stream registration, hashing and indexdb key layout.
+
 // GetStreamTags returns a StreamTags from pool.
 func GetStreamTags() *StreamTags {
 	v := streamTagsPool.Get()
@@ -43,6 +46,7 @@ func (st *StreamTags) Reset() {
 	st.buf = st.buf[:0]
 
 	tags := st.tags
+	// Clear references to avoid keeping prior large backing arrays alive.
 	clear(tags)
 	st.tags = tags[:0]
 }
@@ -74,10 +78,12 @@ func (st *StreamTags) marshalString(dst []byte) []byte {
 // Add adds (name:value) tag to st.
 func (st *StreamTags) Add(name, value string) {
 	if len(value) == 0 {
+		// Empty tag values are ignored by stream identity logic.
 		return
 	}
 
 	if len(name) == 0 {
+		// Empty name maps to _msg for compatibility with query syntax.
 		name = "_msg"
 	}
 
@@ -93,6 +99,7 @@ func (st *StreamTags) Add(name, value string) {
 
 	st.buf = buf
 
+	// Name/Value slices point into st.buf; they stay valid until next Reset().
 	st.tags = append(st.tags, streamTag{
 		Name:  bName,
 		Value: bValue,
@@ -101,6 +108,7 @@ func (st *StreamTags) Add(name, value string) {
 
 // MarshalCanonical marshal st in a canonical way
 func (st *StreamTags) MarshalCanonical(dst []byte) []byte {
+	// Canonical order guarantees stable byte representation for stream hashing.
 	sort.Sort(st)
 
 	tags := st.tags
@@ -139,10 +147,12 @@ func (st *StreamTags) UnmarshalCanonical(src []byte) ([]byte, error) {
 
 		sName := bytesutil.ToUnsafeString(name)
 		sValue := bytesutil.ToUnsafeString(value)
+		// Add copies into st.buf, so resulting tags don't alias src.
 		st.Add(sName, sValue)
 	}
 
 	if !sort.IsSorted(st) {
+		// Canonical payloads must already be sorted.
 		return srcOrig, fmt.Errorf("stream tags must be sorted in alphabetical order; got unsorted: %s", st)
 	}
 
@@ -213,10 +223,12 @@ func (tag *streamTag) less(t *streamTag) bool {
 	if string(tag.Name) != string(t.Name) {
 		return string(tag.Name) < string(t.Name)
 	}
+	// Sort by value when names are equal to keep deterministic canonical order.
 	return string(tag.Value) < string(t.Value)
 }
 
 func (tag *streamTag) indexdbMarshal(dst []byte) []byte {
+	// Tag name and value are escaped independently to preserve separators.
 	dst = marshalTagValue(dst, tag.Name)
 	dst = marshalTagValue(dst, tag.Value)
 	return dst
@@ -266,6 +278,7 @@ func marshalTagValue(dst, src []byte) []byte {
 		}
 	}
 
+	// Terminator marks the end of encoded value.
 	dst = append(dst, tagSeparatorChar)
 	return dst
 }

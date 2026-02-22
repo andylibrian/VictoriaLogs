@@ -93,6 +93,7 @@ func mustOpenInmemoryPart(pt *partition, mp *inmemoryPart) *part {
 	p.messageBloomValues.bloom = &mp.messageBloomValues.bloom
 	p.messageBloomValues.values = &mp.messageBloomValues.values
 
+	// In-memory parts always keep field bloom/values in a single shard.
 	p.bloomValuesShards = []bloomValuesReaderAt{
 		{
 			bloom:  &mp.fieldBloomValues.bloom,
@@ -119,11 +120,13 @@ func mustOpenFilePart(pt *partition, path string) *part {
 
 	// Read columnNames
 	if p.ph.FormatVersion >= 1 {
+		// v1+ stores column name dictionary separately.
 		columnNamesReader := filestream.MustOpen(columnNamesPath, true)
 		p.columnNames, p.columnNameIDs = mustReadColumnNames(columnNamesReader)
 		columnNamesReader.MustClose()
 	}
 	if p.ph.FormatVersion >= 3 {
+		// v3+ stores explicit column->shard mapping.
 		columnIdxsReader := filestream.MustOpen(columnIdxsPath, true)
 		p.columnIdxs = mustReadColumnIdxs(columnIdxsReader, p.columnNames, p.ph.BloomValuesShardsCount)
 		columnIdxsReader.MustClose()
@@ -152,12 +155,14 @@ func mustOpenFilePart(pt *partition, path string) *part {
 	p.messageBloomValues.values = fs.MustOpenReaderAt(messageValuesPath)
 
 	if p.ph.FormatVersion < 1 {
+		// Legacy format uses single shared bloom/values files.
 		bloomPath := filepath.Join(path, oldBloomFilename)
 		p.oldBloomValues.bloom = fs.MustOpenReaderAt(bloomPath)
 
 		valuesPath := filepath.Join(path, oldValuesFilename)
 		p.oldBloomValues.values = fs.MustOpenReaderAt(valuesPath)
 	} else {
+		// v1+ stores field bloom/values in one or more shards.
 		p.bloomValuesShards = make([]bloomValuesReaderAt, p.ph.BloomValuesShardsCount)
 		for i := range p.bloomValuesShards {
 			shard := &p.bloomValuesShards[i]
@@ -189,6 +194,7 @@ func mustClosePart(p *part) {
 	if p.ph.FormatVersion < 1 {
 		cs = p.oldBloomValues.appendClosers(cs)
 	} else {
+		// Close every shard reader pair.
 		for i := range p.bloomValuesShards {
 			cs = p.bloomValuesShards[i].appendClosers(cs)
 		}
@@ -201,22 +207,26 @@ func mustClosePart(p *part) {
 
 func (p *part) getBloomValuesFileForColumnName(name string) *bloomValuesReaderAt {
 	if name == "" {
+		// Empty name maps to _msg column.
 		return &p.messageBloomValues
 	}
 
 	if p.ph.FormatVersion < 1 {
+		// Legacy format stores all non-_msg columns in shared files.
 		return &p.oldBloomValues
 	}
 	if p.ph.FormatVersion < 3 {
 		n := len(p.bloomValuesShards)
 		shardIdx := uint64(0)
 		if n > 1 {
+			// v1-v2 derive shard from column name hash.
 			h := xxhash.Sum64(bytesutil.ToUnsafeBytes(name))
 			shardIdx = h % uint64(n)
 		}
 		return &p.bloomValuesShards[shardIdx]
 	}
 
+	// v3+ uses persisted column->shard mapping generated during write.
 	shardIdx, ok := p.columnIdxs[name]
 	if !ok {
 		logger.Panicf("BUG: unknown shard index for column %q; columnIdxs=%v", name, p.columnIdxs)

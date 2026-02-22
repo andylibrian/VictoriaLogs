@@ -71,6 +71,8 @@ func (mp *inmemoryPart) reset() {
 func (mp *inmemoryPart) mustInitFromRows(lr *logRows) {
 	mp.reset()
 
+	// Sort by stream/timestamp and normalize field order to guarantee stable
+	// on-disk encoding and deterministic block boundaries.
 	sort.Sort(lr)
 	lr.sortFieldsInRows()
 
@@ -89,6 +91,7 @@ func (mp *inmemoryPart) mustInitFromRows(lr *logRows) {
 		}
 
 		if uncompressedBlockSizeBytes >= maxUncompressedBlockSize || !streamID.equal(sidPrev) {
+			// Flush current block either on size boundary or stream switch.
 			bsw.MustWriteRows(sidPrev, trs.timestamps, trs.rows)
 			trs.reset()
 			sidPrev = streamID
@@ -122,6 +125,7 @@ func (mp *inmemoryPart) MustStoreToDisk(path string) {
 
 	var psw filestream.ParallelStreamWriter
 
+	// Persist independent files in parallel to reduce wall-clock flush latency.
 	psw.Add(columnNamesPath, &mp.columnNames)
 	psw.Add(columnIdxsPath, &mp.columnIdxs)
 	psw.Add(metaindexPath, &mp.metaindex)
@@ -141,6 +145,7 @@ func (mp *inmemoryPart) MustStoreToDisk(path string) {
 
 	psw.Run()
 
+	// Metadata is written after data files, so it references fully materialized files.
 	mp.ph.mustWriteMetadata(path)
 
 	// Sync the path contents and the path parent dir in order to guarantee
@@ -160,6 +165,7 @@ func (trs *tmpRows) reset() {
 
 	rows := trs.rows
 	for i := range rows {
+		// Break references to field slices before putting back to the pool.
 		rows[i] = nil
 	}
 	trs.rows = rows[:0]

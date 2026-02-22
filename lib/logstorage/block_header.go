@@ -1,3 +1,16 @@
+// Package logstorage provides the core storage engine for VictoriaLogs.
+//
+// ============== Block Header Overview ==============
+//
+// This file defines metadata structures used to locate and interpret block payloads
+// on disk. The core pieces are:
+//   - blockHeader: per-block offsets/sizes and coarse stats
+//   - columnsHeader: per-column metadata for a block
+//   - columnsHeaderIndex: indirection from column-name IDs to offsets
+//   - timestampsHeader: location and encoding details for timestamps
+//
+// These structs are part of the storage format contract. Marshal/unmarshal logic
+// must preserve compatibility across part format versions.
 package logstorage
 
 import (
@@ -11,9 +24,9 @@ import (
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/slicesutil"
 )
 
-// blockHeader contains information about a single block.
+// blockHeader contains top-level metadata for a single block.
 //
-// blockHeader is stored in the indexFilename file.
+// It is stored in `indexFilename` and points to timestamps/columns metadata blocks.
 type blockHeader struct {
 	// streamID is a stream id for entries in the block
 	streamID streamID
@@ -40,7 +53,7 @@ type blockHeader struct {
 	columnsHeaderSize uint64
 }
 
-// reset resets bh, so it can be reused.
+// reset clears all blockHeader fields for object reuse.
 func (bh *blockHeader) reset() {
 	bh.streamID.reset()
 	bh.uncompressedSizeBytes = 0
@@ -65,7 +78,7 @@ func (bh *blockHeader) copyFrom(src *blockHeader) {
 	bh.columnsHeaderSize = src.columnsHeaderSize
 }
 
-// marshal appends the marshaled bh to dst and returns the result.
+// marshal appends a compact binary representation of bh to dst.
 func (bh *blockHeader) marshal(dst []byte) []byte {
 	dst = bh.streamID.marshal(dst)
 	dst = encoding.MarshalVarUint64(dst, bh.uncompressedSizeBytes)
@@ -79,7 +92,8 @@ func (bh *blockHeader) marshal(dst []byte) []byte {
 	return dst
 }
 
-// unmarshal unmarshals bh from src and returns the remaining tail.
+// unmarshal reads bh from src according to partFormatVersion and returns remaining tail.
+// For format versions < 1, some nested structures include legacy fields.
 func (bh *blockHeader) unmarshal(src []byte, partFormatVersion uint) ([]byte, error) {
 	bh.reset()
 
@@ -173,7 +187,7 @@ func putBlockHeader(bh *blockHeader) {
 
 var blockHeaderPool sync.Pool
 
-// unmarshalBlockHeaders appends unmarshaled from src blockHeader entries to dst and returns the result.
+// unmarshalBlockHeaders appends block headers decoded from src to dst and validates ordering invariants.
 func unmarshalBlockHeaders(dst []blockHeader, src []byte, partFormatVersion uint) ([]blockHeader, error) {
 	dstLen := len(dst)
 	for len(src) > 0 {
@@ -221,7 +235,7 @@ func resetBlockHeaders(bhs []blockHeader) []blockHeader {
 	return bhs[:0]
 }
 
-// columnHeaderRef references column header in the marshaled columnsHeader.
+// columnHeaderRef points to a marshaled column header within a columnsHeader blob.
 type columnHeaderRef struct {
 	// columnNameID is the ID of the column name. The column name can be obtained from part.columnNames.
 	columnNameID uint64
@@ -230,7 +244,8 @@ type columnHeaderRef struct {
 	offset uint64
 }
 
-// columnsHeaderIndex contains offsets for marshaled column headers.
+// columnsHeaderIndex contains offset tables for marshaled column and const-column headers.
+// Offsets are relative to the start of the associated marshaled columnsHeader blob.
 type columnsHeaderIndex struct {
 	// columnHeadersRefs contains references to columnHeaders.
 	columnHeadersRefs []columnHeaderRef
@@ -278,7 +293,7 @@ func (cshIndex *columnsHeaderIndex) marshal(dst []byte) []byte {
 	return dst
 }
 
-// unmarshalInplace unmarshals cshIndex from src.
+// unmarshalInplace unmarshals cshIndex from src without copying payload bytes.
 //
 // cshIndex is valid until src is changed.
 func (cshIndex *columnsHeaderIndex) unmarshalInplace(src []byte) error {
@@ -361,9 +376,9 @@ func putColumnsHeader(csh *columnsHeader) {
 
 var columnsHeaderPool sync.Pool
 
-// columnsHeader contains information about columns in a single block.
+// columnsHeader contains metadata for all columns in a single block.
 //
-// columnsHeader is stored in the columnsHeaderFilename file.
+// It is stored in `columnsHeaderFilename` and paired with columnsHeaderIndex metadata.
 type columnsHeader struct {
 	// columnHeaders contains the information about every column seen in the block.
 	columnHeaders []columnHeader
@@ -483,7 +498,7 @@ func (csh *columnsHeader) marshal(dst []byte, cshIndex *columnsHeaderIndex, g *c
 	return dst
 }
 
-// unmarshalInplace unmarshals csh from src.
+// unmarshalInplace unmarshals csh from src, enforcing hard limits on column counts.
 //
 // csh is valid until src is changed.
 func (csh *columnsHeader) unmarshalInplace(src []byte, partFormatVersion uint) error {
@@ -557,15 +572,15 @@ func getNamesFromColumnHeaders(chs []columnHeader) []string {
 	return a
 }
 
-// columnHeaders contains information for values, which belong to a single label in a single block.
+// columnHeader stores per-column metadata required for filtering and payload reads.
 //
-// The main column with an empty name is stored in messageValuesFilename,
-// while the rest of columns are stored in smallValuesFilename or bigValuesFilename depending
-// on the block size (see maxSmallValuesBlockSize).
-// This allows minimizing disk read IO when filtering by non-message columns.
+// VALUES/BLOOM STORAGE:
+//   - The main message column (name == "") uses messageValues/messageBloom files.
+//   - Other columns use sharded values/bloom files.
 //
-// Every block column contains also a bloom filter for all the tokens stored in the column.
-// This bloom filter is used for fast determining whether the given block may contain the given tokens.
+// FILTERING SUPPORT:
+//   - minValue/maxValue store encoded ranges for numeric/time-like value types.
+//   - bloom filters store token hashes for fast negative checks.
 //
 // Tokens in bloom filter depend on valueType:
 //
@@ -614,7 +629,7 @@ type columnHeader struct {
 	bloomFilterSize uint64
 }
 
-// reset resets ch
+// reset clears ch for reuse.
 func (ch *columnHeader) reset() {
 	ch.name = ""
 	ch.valueType = 0
@@ -630,7 +645,8 @@ func (ch *columnHeader) reset() {
 	ch.bloomFilterSize = 0
 }
 
-// marshal appends marshaled ch to dst and returns the result.
+// marshal appends binary-encoded column metadata to dst.
+// The encoding format depends on valueType.
 func (ch *columnHeader) marshal(dst []byte) []byte {
 	// check minValue/maxValue
 	switch ch.valueType {
@@ -729,7 +745,8 @@ func (ch *columnHeader) marshalBloomFilters(dst []byte) []byte {
 	return dst
 }
 
-// unmarshalInplace unmarshals ch from src and returns the tail left after unmarshaling.
+// unmarshalInplace unmarshals ch from src and returns remaining tail.
+// For part format versions < 1, the column name is embedded in this payload.
 //
 // ch is valid until src is changed.
 func (ch *columnHeader) unmarshalInplace(src []byte, partFormatVersion uint) ([]byte, error) {
@@ -951,7 +968,7 @@ func (ch *columnHeader) unmarshalBloomFilters(src []byte) ([]byte, error) {
 	return src, nil
 }
 
-// timestampsHeader contains the information about timestamps block.
+// timestampsHeader contains location and encoding info for a block's timestamps payload.
 type timestampsHeader struct {
 	// blockOffset is an offset of timestamps block inside timestampsFilename file
 	blockOffset uint64
@@ -969,7 +986,7 @@ type timestampsHeader struct {
 	marshalType encoding.MarshalType
 }
 
-// reset resets th, so it can be reused
+// reset clears th for reuse.
 func (th *timestampsHeader) reset() {
 	th.blockOffset = 0
 	th.blockSize = 0
@@ -993,7 +1010,7 @@ func (th *timestampsHeader) subTimeOffset(timeOffset int64) {
 	}
 }
 
-// marshal appends marshaled th to dst and returns the result.
+// marshal appends fixed-width binary encoding of th to dst.
 func (th *timestampsHeader) marshal(dst []byte) []byte {
 	dst = encoding.MarshalUint64(dst, th.blockOffset)
 	dst = encoding.MarshalUint64(dst, th.blockSize)
@@ -1003,7 +1020,8 @@ func (th *timestampsHeader) marshal(dst []byte) []byte {
 	return dst
 }
 
-// unmarshal unmarshals th from src and returns the tail left after the unmarshaling.
+// unmarshal decodes th from src and returns remaining tail.
+// timestampsHeader is fixed-width and currently occupies 33 bytes.
 func (th *timestampsHeader) unmarshal(src []byte) ([]byte, error) {
 	th.reset()
 

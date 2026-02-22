@@ -9,6 +9,9 @@ import (
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logger"
 )
 
+// indexBlockHeader and helpers encode/decode the metaindex layer that points to
+// compressed index blocks inside `index.bin`.
+
 // indexBlockHeader contains index information about multiple blocks.
 //
 // It allows locating the block by streamID and/or by time range.
@@ -45,6 +48,7 @@ func (ih *indexBlockHeader) mustWriteIndexBlock(data []byte, sidFirst streamID, 
 	ih.maxTimestamp = maxTimestamp
 
 	bb := longTermBufPool.Get()
+	// Index blocks are compressed on disk to reduce IO footprint during search.
 	bb.B = encoding.CompressZSTDLevel(bb.B[:0], data, 1)
 	ih.indexBlockOffset = sw.indexWriter.bytesWritten
 	ih.indexBlockSize = uint64(len(bb.B))
@@ -61,6 +65,7 @@ func (ih *indexBlockHeader) mustReadNextIndexBlock(dst []byte, sr *streamReaders
 		logger.Panicf("FATAL: %s: indexBlockHeader.indexBlockSize=%d cannot exceed %d bytes", indexReader.Path(), indexBlockSize, maxIndexBlockSize)
 	}
 	if ih.indexBlockOffset != indexReader.bytesRead {
+		// Stream reader must consume index blocks strictly in offset order.
 		logger.Panicf("FATAL: %s: indexBlockHeader.indexBlockOffset=%d must equal to %d", indexReader.Path(), ih.indexBlockOffset, indexReader.bytesRead)
 	}
 	bbCompressed := longTermBufPool.Get()
@@ -113,9 +118,11 @@ func (ih *indexBlockHeader) unmarshal(src []byte) ([]byte, error) {
 // mustWriteIndexBlockHeaders writes metaindexData to w.
 func mustWriteIndexBlockHeaders(w *writerWithStats, metaindexData []byte) {
 	bb := longTermBufPool.Get()
+	// Metaindex is read as a whole during part open, so compressing it reduces startup IO.
 	bb.B = encoding.CompressZSTDLevel(bb.B[:0], metaindexData, 1)
 	w.MustWrite(bb.B)
 	if len(bb.B) < 1024*1024 {
+		// Avoid keeping very large buffers in the shared pool.
 		longTermBufPool.Put(bb)
 	}
 }
@@ -134,6 +141,7 @@ func mustReadIndexBlockHeaders(dst []indexBlockHeader, r *readerWithStats) []ind
 	}
 	dst, err = unmarshalIndexBlockHeaders(dst, bb.B)
 	if len(bb.B) < 1024*1024 {
+		// Keep pool friendly for typical block sizes.
 		longTermBufPool.Put(bb)
 	}
 	if err != nil {
@@ -148,6 +156,7 @@ func unmarshalIndexBlockHeaders(dst []indexBlockHeader, src []byte) ([]indexBloc
 	dstOrig := dst
 	for len(src) > 0 {
 		if len(dst) < cap(dst) {
+			// Reuse preallocated entries when caller provided capacity.
 			dst = dst[:len(dst)+1]
 		} else {
 			dst = append(dst, indexBlockHeader{})
@@ -168,6 +177,7 @@ func unmarshalIndexBlockHeaders(dst []indexBlockHeader, src []byte) ([]indexBloc
 func validateIndexBlockHeaders(ihs []indexBlockHeader) error {
 	for i := 1; i < len(ihs); i++ {
 		if ihs[i].streamID.less(&ihs[i-1].streamID) {
+			// Metaindex must stay sorted by streamID for binary-search style scans.
 			return fmt.Errorf("unexpected indexBlockHeader with smaller streamID=%s after bigger streamID=%s", &ihs[i].streamID, &ihs[i-1].streamID)
 		}
 	}

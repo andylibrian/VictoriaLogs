@@ -1,5 +1,17 @@
 package logstorage
 
+// ==================== Format And Limits ====================
+//
+// This file contains core limits that shape:
+//   - On-disk format behavior
+//   - Block construction during ingestion
+//   - Query-time memory/CPU trade-offs
+//
+// IMPORTANT:
+// Changing many of these values affects format expectations or performance
+// characteristics. Review related marshal/unmarshal paths and compatibility notes
+// before editing.
+
 // maxParallelReaders is the maximum parallel readers to use when executing a query.
 //
 // bigger number of parallel readers may help increasing query performance on high-latency storage such as S3 and NFS.
@@ -14,6 +26,8 @@ const partFormatLatestVersion = 3
 //
 // The partHeader.FormatVersion and partFormatLatestVersion must be updated when this number changes.
 const bloomValuesMaxShardsCount = 128
+
+// ==================== Block Construction Limits ====================
 
 // maxUncompressedIndexBlockSize contains the maximum length of uncompressed block with blockHeader entries aka index block.
 //
@@ -45,6 +59,10 @@ const maxFieldNameSize = 128
 // So it is better to store bigger values in regular columns in order to speed up search speed.
 const maxConstColumnValueSize = 256
 
+// ==================== Encoded Block Size Guards ====================
+//
+// These protect against pathological payload sizes and corruption.
+
 // maxIndexBlockSize is the maximum size of the block with blockHeader entries (aka indexBlock)
 const maxIndexBlockSize = 8 * 1024 * 1024
 
@@ -62,6 +80,8 @@ const maxColumnsHeaderSize = 8 * 1024 * 1024
 
 // maxColumnsHeaderIndexSize is the maximum size of columnsHeaderIndex block
 const maxColumnsHeaderIndexSize = 8 * 1024 * 1024
+
+// ==================== Dictionary Encoding Limits ====================
 
 // maxDictSizeBytes is the maximum length of all the keys in the valuesDict.
 //

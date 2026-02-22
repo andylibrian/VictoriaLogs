@@ -12,6 +12,13 @@ import (
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/slicesutil"
 )
 
+// Bloom filter sizing constants used by logstorage.
+//
+// They balance false-positive probability and per-block memory footprint.
+// The filter remains exact for "definitely missing" checks and may return
+// false positives for "possibly present" checks, which are then verified
+// against actual encoded values.
+
 // bloomFilterHashesCount is the number of different hashes to use for bloom filter.
 const bloomFilterHashesCount = 6
 
@@ -36,11 +43,16 @@ func bloomFilterMarshalHashes(dst []byte, hashes []uint64) []byte {
 	return dst
 }
 
+// bloomFilter stores a bitset represented as 64-bit words.
+//
+// Each indexed bit corresponds to one of the derived token hashes.
 type bloomFilter struct {
 	bits []uint64
 }
 
 func (bf *bloomFilter) reset() {
+	// Clear bits before reusing the slice, since the pool can hand bf to
+	// unrelated queries and stale set bits would produce false positives.
 	clear(bf.bits)
 	bf.bits = bf.bits[:0]
 }
@@ -72,6 +84,7 @@ func (bf *bloomFilter) unmarshal(src []byte) error {
 
 // mustInitTokens initializes bf with the given tokens
 func (bf *bloomFilter) mustInitTokens(tokens []string) {
+	// Allocate just enough words to keep bloomFilterBitsPerItem per token.
 	bitsCount := len(tokens) * bloomFilterBitsPerItem
 	wordsCount := (bitsCount + 63) / 64
 	bits := slicesutil.SetLength(bf.bits, wordsCount)
@@ -81,6 +94,8 @@ func (bf *bloomFilter) mustInitTokens(tokens []string) {
 
 // mustInitHashes initializes bf with the given hashes
 func (bf *bloomFilter) mustInitHashes(hashes []uint64) {
+	// The same sizing rule as mustInitTokens(), but caller already provides
+	// precomputed token hashes.
 	bitsCount := len(hashes) * bloomFilterBitsPerItem
 	wordsCount := (bitsCount + 63) / 64
 	bits := slicesutil.SetLength(bf.bits, wordsCount)
@@ -92,15 +107,18 @@ func (bf *bloomFilter) mustInitHashes(hashes []uint64) {
 func bloomFilterAddTokens(bits []uint64, tokens []string) {
 	hashesCount := len(tokens) * bloomFilterHashesCount
 	a := encoding.GetUint64s(hashesCount)
+	// Expand each logical token into bloomFilterHashesCount probe hashes.
 	a.A = appendTokensHashes(a.A[:0], tokens)
 	initBloomFilter(bits, a.A)
 	encoding.PutUint64s(a)
 }
 
-// bloomFilterAddHashes adds the given haehs to the bloom filter bits
+// bloomFilterAddHashes adds the given hashes to the bloom filter bits.
 func bloomFilterAddHashes(bits, hashes []uint64) {
 	hashesCount := len(hashes) * bloomFilterHashesCount
 	a := encoding.GetUint64s(hashesCount)
+	// Re-hash every incoming hash in the same way as appendTokensHashes(),
+	// so caller and filter generation use identical probe positions.
 	a.A = appendHashesHashes(a.A[:0], hashes)
 	initBloomFilter(bits, a.A)
 	encoding.PutUint64s(a)
@@ -115,6 +133,7 @@ func initBloomFilter(bits, hashes []uint64) {
 		mask := uint64(1) << j
 		w := bits[i]
 		if (w & mask) == 0 {
+			// Avoid rewriting already-set bits to keep writes minimal.
 			bits[i] = w | mask
 		}
 	}
@@ -133,6 +152,8 @@ func appendTokensHashes(dst []uint64, tokens []string) []uint64 {
 	var buf [8]byte
 	hp := (*uint64)(unsafe.Pointer(&buf[0]))
 	for _, token := range tokens {
+		// Seed with token hash and derive k probes by hashing incremented seeds.
+		// This avoids re-allocations and keeps probe generation deterministic.
 		*hp = xxhash.Sum64(bytesutil.ToUnsafeBytes(token))
 		for i := 0; i < bloomFilterHashesCount; i++ {
 			h := xxhash.Sum64(buf[:])
@@ -159,6 +180,8 @@ func appendHashesHashes(dst, hashes []uint64) []uint64 {
 	var buf [8]byte
 	hp := (*uint64)(unsafe.Pointer(&buf[0]))
 	for _, h := range hashes {
+		// Use the provided hash as the seed and derive k probes exactly like
+		// appendTokensHashes(), so both code paths stay compatible.
 		*hp = h
 		for i := 0; i < bloomFilterHashesCount; i++ {
 			h := xxhash.Sum64(buf[:])
@@ -173,6 +196,8 @@ func appendHashesHashes(dst, hashes []uint64) []uint64 {
 func (bf *bloomFilter) containsAll(hashes []uint64) bool {
 	bits := bf.bits
 	if len(bits) == 0 {
+		// Empty bloom filter means "cannot rule out", which keeps compatibility
+		// with empty/legacy blocks.
 		return true
 	}
 	maxBits := uint64(len(bits)) * 64

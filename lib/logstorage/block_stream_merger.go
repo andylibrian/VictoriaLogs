@@ -13,6 +13,9 @@ import (
 	"github.com/VictoriaMetrics/VictoriaLogs/lib/prefixfilter"
 )
 
+// block stream merge combines multiple sorted block readers into one sorted
+// output stream while optionally dropping rows by filter.
+
 // mustMergeBlockStreams merges bsrs to bsw and updates ph accordingly.
 //
 // if dropFilter is non-nil, then rows matching dropFilter are dropped during the merge.
@@ -26,14 +29,18 @@ func mustMergeBlockStreams(ph *partHeader, idb *indexdb, bsw *blockStreamWriter,
 		if needStop(stopCh) {
 			break
 		}
+		// readersHeap[0] always contains the smallest next block by (streamID, minTimestamp).
 		bsr := bsm.readersHeap[0]
 		bsm.mustWriteBlock(&bsr.blockData)
 		if bsr.NextBlock() {
+			// Reader still has data, so restore heap ordering from root.
 			heap.Fix(&bsm.readersHeap, 0)
 		} else {
+			// Reader is exhausted.
 			heap.Pop(&bsm.readersHeap)
 		}
 	}
+	// Flush pending rows/buffered block after input exhaustion or stop.
 	bsm.mustFlushRows()
 	putBlockStreamMerger(bsm)
 
@@ -130,6 +137,7 @@ func (bsm *blockStreamMerger) resetRows() {
 		putValuesDecoder(bsm.vd)
 		bsm.vd = nil
 	}
+	// Drop unpacked state for the current in-progress output block.
 	bsm.bd.reset()
 	bsm.a.reset()
 
@@ -166,6 +174,7 @@ func (bsm *blockStreamMerger) mustInit(idb *indexdb, bsw *blockStreamWriter, bsr
 
 	bsm.dropFilter = dropFilter
 	if dropFilter != nil {
+		// Precompute fields needed by dropFilter to avoid loading unnecessary fields.
 		dropFilter.filter.updateNeededFields(&bsm.dropFilterFields)
 	}
 
@@ -175,6 +184,7 @@ func (bsm *blockStreamMerger) mustInit(idb *indexdb, bsw *blockStreamWriter, bsr
 			rsh = append(rsh, bsr)
 		}
 	}
+	// Heap invariant: minimal block is at index 0.
 	bsm.readersHeap = rsh
 	heap.Init(&bsm.readersHeap)
 }
@@ -207,6 +217,7 @@ func (bsm *blockStreamMerger) mustWriteBlock(bd *blockData) {
 // checkNextBlock checks whether the bd can be written next after the current data.
 func (bsm *blockStreamMerger) checkNextBlock(bd *blockData) {
 	if len(bsm.rows.timestamps) > 0 && bsm.bd.rowsCount > 0 {
+		// Merger keeps either compressed buffered block (bd) or unpacked rows, never both.
 		logger.Panicf("BUG: bsm.bd must be empty when bsm.rows isn't empty! got %d log entries in bsm.bd", bsm.bd.rowsCount)
 	}
 	if bd.streamID.less(&bsm.streamID) {
@@ -271,6 +282,7 @@ func (bsm *blockStreamMerger) mustWriteBlockData(bd *blockData) {
 		return
 	}
 
+	// Keep compact block in-memory for possible merge with the next block.
 	bsm.bd.copyFrom(&bsm.a, bd)
 }
 
@@ -290,6 +302,7 @@ func (bsm *blockStreamMerger) mustMergeRows(bd *blockData) {
 	// Merge unmarshaled log entries
 	timestamps := bsm.rows.timestamps
 	rows := bsm.rows.rows
+	// rows[:rowsLen] are existing rows, rows[rowsLen:] are rows from current bd.
 	bsm.rowsTmp.mergeRows(timestamps[:rowsLen], timestamps[rowsLen:], rows[:rowsLen], rows[rowsLen:])
 	bsm.rows, bsm.rowsTmp = bsm.rowsTmp, bsm.rows
 	bsm.rowsTmp.reset()
@@ -314,14 +327,17 @@ func (bsm *blockStreamMerger) mustUnmarshalRows(bd *blockData) {
 
 	td := &bd.timestampsData
 	if bsm.needDropRows(&bd.streamID, td.minTimestamp, td.maxTimestamp) {
+		// Stream/stream_id strings are needed only when filter may evaluate row content.
 		stream, streamID := bsm.getStreamAndStreamID()
 		bsm.rows.skipRowsByDropFilter(bsm.dropFilter, &bsm.dropFilterFields, rowsLen, stream, streamID)
 	}
 
+	// Track merged size and flush once the block approaches target size.
 	bsm.uncompressedRowsSizeBytes += uncompressedRowsSizeBytes(bsm.rows.rows[rowsLen:])
 }
 
 func (bsm *blockStreamMerger) needDropRows(sid *streamID, minTimestamp, maxTimestamp int64) bool {
+	// Quick precheck at streamID/time range level before unpacking rows.
 	return bsm.dropFilter != nil && bsm.dropFilter.matchStreamID(sid) && bsm.dropFilter.matchTimeRange(minTimestamp, maxTimestamp)
 }
 
@@ -329,6 +345,7 @@ func (bsm *blockStreamMerger) setStreamID(sid streamID) {
 	bsm.streamID = sid
 
 	if bsm.needDropRows(&bsm.streamID, math.MinInt64, math.MaxInt64) {
+		// Precompute expensive string fields once per stream.
 		bsm.streamBuf = bsm.idb.appendStreamString(bsm.streamBuf[:0], &bsm.streamID)
 		bsm.streamIDBuf = sid.marshalString(bsm.streamIDBuf[:0])
 	}
@@ -340,10 +357,13 @@ func (bsm *blockStreamMerger) getStreamAndStreamID() (string, string) {
 
 func (bsm *blockStreamMerger) mustFlushRows() {
 	if len(bsm.rows.timestamps) == 0 {
+		// No unpacked rows - flush buffered compressed block (or empty blockData).
 		bsm.bsw.MustWriteBlockData(&bsm.bd)
 	} else if bsm.rows.hasNonEmptyRows() {
+		// Re-encode merged rows for the current stream.
 		bsm.bsw.MustWriteRows(&bsm.streamID, bsm.rows.timestamps, bsm.rows.rows)
 	}
+	// Drop per-block merge state after flush.
 	bsm.resetRows()
 }
 
@@ -373,8 +393,10 @@ func (h *blockStreamReadersHeap) Less(i, j int) bool {
 	a := &x[i].blockData
 	b := &x[j].blockData
 	if !a.streamID.equal(&b.streamID) {
+		// Primary order by streamID.
 		return a.streamID.less(&b.streamID)
 	}
+	// Secondary order by min timestamp inside stream.
 	return a.timestampsData.minTimestamp < b.timestampsData.minTimestamp
 }
 
@@ -391,6 +413,7 @@ func (h *blockStreamReadersHeap) Push(v any) {
 func (h *blockStreamReadersHeap) Pop() any {
 	x := *h
 	bsr := x[len(x)-1]
+	// Break reference so exhausted readers are collectible earlier.
 	x[len(x)-1] = nil
 	*h = x[:len(x)-1]
 	return bsr

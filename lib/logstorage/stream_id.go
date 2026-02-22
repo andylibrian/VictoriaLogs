@@ -5,6 +5,9 @@ import (
 	"fmt"
 )
 
+// streamID encoding is stable and sortable, so it can be used both in on-disk
+// block ordering and in string form for filters/debug output.
+
 // streamID is an internal id of log stream.
 //
 // Blocks are ordered by streamID inside parts.
@@ -34,12 +37,14 @@ func (sid *streamID) marshalString(dst []byte) []byte {
 }
 
 func (sid *streamID) tryUnmarshalFromString(s string) bool {
+	// _stream_id string representation is hex-encoded binary streamID.
 	data, err := hex.DecodeString(s)
 	if err != nil {
 		return false
 	}
 	tail, err := sid.unmarshal(data)
 	if err != nil || len(tail) > 0 {
+		// Must consume the whole decoded payload.
 		return false
 	}
 	return true
@@ -53,6 +58,7 @@ func (sid *streamID) String() string {
 // less returns true if a is less than sid.
 func (sid *streamID) less(a *streamID) bool {
 	if !sid.tenantID.Equal(&a.tenantID) {
+		// Tenant is the primary sort key to keep tenant data physically clustered.
 		return sid.tenantID.less(&a.tenantID)
 	}
 	return sid.id.less(&a.id)
@@ -85,5 +91,6 @@ func (sid *streamID) unmarshal(src []byte) ([]byte, error) {
 	if err != nil {
 		return srcOrig, err
 	}
+	// Return remaining bytes so callers can chain decoding.
 	return tail, nil
 }
