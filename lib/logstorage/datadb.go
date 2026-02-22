@@ -1,3 +1,69 @@
+// Package logstorage provides the core storage engine for VictoriaLogs.
+//
+// ============== Datadb Overview ==============
+//
+// datadb is the data storage layer for VictoriaLogs, responsible for:
+//   - Storing log entries in compressed blocks
+//   - Managing the lifecycle of storage parts (in-memory, small, big)
+//   - Performing background merges to optimize storage efficiency
+//   - Handling data snapshots for backups
+//
+// ============== Storage Architecture ==============
+//
+// datadb uses a Log-Structured Merge-tree (LSM) inspired architecture with three tiers:
+//
+// 1. IN-MEMORY PARTS (fastest, most volatile)
+//   - Newly ingested data is first stored in memory
+//   - Periodically flushed to disk based on time or size thresholds
+//   - Fast to write, but data could be lost on power failure before flush
+//
+// 2. SMALL PARTS (on disk, cached)
+//   - Flushed in-memory parts become small parts
+//   - Kept small to fit in OS page cache for fast reads
+//   - Merged together when multiple small parts accumulate
+//
+// 3. BIG PARTS (on disk, large)
+//   - Small parts that grow beyond the small threshold become big parts
+//   - Optimized for sequential reads of large time ranges
+//   - May be cached differently by the OS
+//
+// ============== Merge Process ==============
+//
+// Background merges are crucial for storage efficiency:
+//
+// WHY MERGE?
+//   - Reduce number of files (fewer seeks during queries)
+//   - Improve compression (more data = better compression ratios)
+//   - Remove deleted rows (garbage collection)
+//   - Reorganize data for better query patterns
+//
+// MERGE STRATEGY:
+//   - Parts are selected for merge based on size similarity
+//   - The merge multiplier (minMergeMultiplier = 1.7) ensures output part
+//     is at least 1.7x the size of the largest input, minimizing write amplification
+//   - Multiple concurrent mergers run based on CPU count
+//
+// ============== Data Flow ==============
+//
+// Ingestion:
+//  1. Log entries arrive via mustAddRows()
+//  2. Data is buffered in rowsBuffer (sharded by CPU)
+//  3. When buffer is full, data is converted to in-memory part
+//  4. In-memory parts are eventually flushed to disk
+//
+// Merge:
+//  1. Background workers detect merge opportunities
+//  2. Parts are selected based on optimal merge algorithm
+//  3. Selected parts are read, merged, and rewritten
+//  4. Old parts are atomically replaced with merged part
+//
+// ============== Thread Safety ==============
+//
+// datadb uses several synchronization mechanisms:
+//   - partsLock: Protects the part lists (inmemoryParts, smallParts, bigParts)
+//   - refCount on partWrapper: Tracks active readers, enables safe deletion
+//   - stopCh: Signals background workers to stop during shutdown
+//   - wg: WaitGroup to wait for background workers during shutdown
 package logstorage
 
 import (
@@ -19,55 +85,66 @@ import (
 	"github.com/VictoriaMetrics/metrics"
 )
 
-// The maximum size of big part.
+// ==================== Storage Constants ====================
 //
-// This number limits the maximum time required for building big part.
-// This time shouldn't exceed a few days.
+// These constants control the behavior of the storage system.
+
+// maxBigPartSize limits the maximum size of a "big" part (1TB).
+// This prevents parts from growing indefinitely, which would:
+//   - Make compaction slower
+//   - Increase memory usage during merge
+//   - Make recovery from corruption more painful
 const maxBigPartSize = 1e12
 
-// The maximum number of inmemory parts in the partition.
-//
-// The actual number of inmemory parts may exceed this value if in-memory mergers
-// cannot keep up with the rate of creating new in-memory parts.
+// maxInmemoryPartsPerPartition limits how many in-memory parts can exist.
+// Too many in-memory parts indicate the merger can't keep up, potentially
+// leading to memory pressure. This limit acts as a backpressure mechanism.
 const maxInmemoryPartsPerPartition = 20
 
-// Default number of parts to merge at once.
-//
-// This number has been obtained empirically - it gives the lowest possible overhead.
-// See appendPartsToMerge tests for details.
+// defaultPartsToMerge is the optimal number of parts to merge at once.
+// This value was determined empirically to minimize overhead.
+// Too few: high write amplification
+// Too many: slower merges, more memory usage
 const defaultPartsToMerge = 15
 
-// minMergeMultiplier is the minimum multiplier for the size of the output part
-// compared to the size of the maximum input part for the merge.
-//
-// Higher value reduces write amplification (disk write IO induced by the merge),
-// while increases the number of unmerged parts.
-// The 1.7 is good enough for production workloads.
+// minMergeMultiplier ensures the output of a merge is significantly larger
+// than the inputs. This reduces write amplification by ensuring each piece
+// of data isn't rewritten too many times during its lifetime.
+// Value 1.7 means: output_size >= 1.7 * max(input_sizes)
 const minMergeMultiplier = 1.7
 
-// datadb represents a database with log data
+// ==================== Datadb Structure ====================
+
+// datadb represents the data storage database for a partition.
+// It manages the lifecycle of log data from ingestion to persistence.
 type datadb struct {
-	// rb is an in-memory buffer for the added rows. It is periodically converted to parts.
-	//
-	// This buffer amortizes the overhead needed for converting the ingested logs into searchable parts.
+	// rb is an in-memory buffer for incoming log rows.
+	// It's sharded by CPU to minimize lock contention.
+	// Rows accumulate here until converted to in-memory parts.
 	rb rowsBuffer
 
-	// mergeIdx is used for generating unique directory names for parts
+	// mergeIdx generates unique directory names for merged parts.
+	// Incremented atomically for each new part.
 	mergeIdx atomic.Uint64
 
-	inmemoryMergesTotal    atomic.Uint64
-	inmemoryActiveMerges   atomic.Int64
-	inmemoryMergeRowsTotal atomic.Uint64
+	// ==================== Merge Statistics ====================
+	// These counters track merge operations for monitoring.
 
-	smallPartMergesTotal    atomic.Uint64
-	smallPartActiveMerges   atomic.Int64
-	smallPartMergeRowsTotal atomic.Uint64
+	inmemoryMergesTotal    atomic.Uint64 // Total in-memory merges performed
+	inmemoryActiveMerges   atomic.Int64  // Currently active in-memory merges
+	inmemoryMergeRowsTotal atomic.Uint64 // Total rows merged in-memory
 
-	bigPartMergesTotal    atomic.Uint64
-	bigPartActiveMerges   atomic.Int64
-	bigPartMergeRowsTotal atomic.Uint64
+	smallPartMergesTotal    atomic.Uint64 // Total small part merges performed
+	smallPartActiveMerges   atomic.Int64  // Currently active small part merges
+	smallPartMergeRowsTotal atomic.Uint64 // Total rows merged in small parts
 
-	// metrics that need to be updated directly
+	bigPartMergesTotal    atomic.Uint64 // Total big part merges performed
+	bigPartActiveMerges   atomic.Int64  // Currently active big part merges
+	bigPartMergeRowsTotal atomic.Uint64 // Total rows merged in big parts
+
+	// ==================== Merge Metrics ====================
+	// Prometheus metrics for monitoring merge performance.
+
 	inmemoryPartMergeDuration *metrics.Summary
 	inmemoryPartMergeBytes    *metrics.Summary
 	smallPartMergeDuration    *metrics.Summary
@@ -75,79 +152,100 @@ type datadb struct {
 	bigPartMergeDuration      *metrics.Summary
 	bigPartMergeBytes         *metrics.Summary
 
-	// pt is the partition the datadb belongs to
+	// ==================== Core References ====================
+
+	// pt is the parent partition that owns this datadb.
 	pt *partition
 
-	// path is the path to the directory with log data
+	// path is the filesystem path to the datadb directory.
 	path string
 
-	// flushInterval is interval for flushing the inmemory parts to disk
+	// flushInterval is how long in-memory parts can stay in memory
+	// before being flushed to disk. Longer = better batching, more risk.
 	flushInterval time.Duration
 
-	// inmemoryParts contains a list of inmemory parts
+	// ==================== Part Storage ====================
+
+	// inmemoryParts contains parts stored only in RAM.
+	// These are the most recently ingested data, not yet persisted.
 	inmemoryParts []*partWrapper
 
-	// smallParts contains a list of file-based small parts
+	// smallParts contains file-based parts that fit in OS cache.
+	// These have been flushed to disk but are small enough for caching.
 	smallParts []*partWrapper
 
-	// bigParts contains a list of file-based big parts
+	// bigParts contains large file-based parts.
+	// These are optimized for sequential reads of large data ranges.
 	bigParts []*partWrapper
 
-	// partsLock protects parts from concurrent access
+	// partsLock protects all part lists and related state.
+	// Must be held when reading or modifying inmemoryParts, smallParts, bigParts.
 	partsLock sync.Mutex
 
-	// wg is used for determining when background workers stop
-	//
-	// wg.Add() must be called under partsLock after checking whether stopCh isn't closed.
-	// This should prevent from calling wg.Add() after stopCh is closed and wg.Wait() is called.
+	// ==================== Lifecycle Management ====================
+
+	// wg tracks background worker goroutines.
+	// Used during shutdown to wait for workers to finish.
 	wg sync.WaitGroup
 
-	// stopCh is used for notifying background workers to stop
-	//
-	// It must be closed under partsLock in order to prevent from calling wg.Add()
-	// after stopCh is closed.
+	// stopCh signals background workers to stop.
+	// Closed during shutdown; workers should check this periodically.
 	stopCh chan struct{}
 }
 
-// partWrapper is a wrapper for opened part.
+// partWrapper wraps a part with reference counting and lifecycle management.
+// It enables safe concurrent access and deferred deletion.
 type partWrapper struct {
-	// refCount is the number of references to p.
-	//
-	// When the number of references reaches zero, then p is closed.
+	// refCount tracks active references to this part.
+	// When it reaches zero and mustDrop is true, the part is deleted.
+	// Incremented when a query starts using the part.
+	// Decremented when the query finishes.
 	refCount atomic.Int32
 
-	// The flag, which is set when the part must be deleted after refCount reaches zero.
+	// mustDrop indicates the part should be deleted when refCount hits zero.
+	// Set when a part is replaced by a merged part.
 	mustDrop atomic.Bool
 
-	// p is an opened part
+	// p is the actual part data (either in-memory or file-based).
 	p *part
 
-	// mp references inmemory part used for initializing p.
+	// mp holds the in-memory part data if this is an in-memory part.
+	// nil for file-based parts.
 	mp *inmemoryPart
 
-	// isInMerge is set to true if the part takes part in merge.
+	// isInMerge indicates this part is currently being merged.
+	// Prevents the part from being selected for another merge.
 	isInMerge bool
 
-	// The deadline when in-memory part must be flushed to disk.
+	// flushDeadline is when this in-memory part should be flushed to disk.
+	// Helps ensure data durability within the flushInterval.
 	flushDeadline time.Time
 }
 
+// incRef increments the reference count.
+// Called when a query starts using this part.
 func (pw *partWrapper) incRef() {
 	pw.refCount.Add(1)
 }
 
+// decRef decrements the reference count.
+// When count reaches zero, the part may be closed and deleted.
+// Called when a query finishes using this part.
 func (pw *partWrapper) decRef() {
 	n := pw.refCount.Add(-1)
 	if n > 0 {
 		return
 	}
 
+	// Reference count hit zero - clean up if needed
 	deletePath := ""
 	if pw.mp == nil {
+		// File-based part: delete if marked for deletion
 		if pw.mustDrop.Load() {
 			deletePath = pw.p.path
 		}
 	} else {
+		// In-memory part: return to pool
 		putInmemoryPart(pw.mp)
 		pw.mp = nil
 	}
@@ -160,13 +258,28 @@ func (pw *partWrapper) decRef() {
 	}
 }
 
+// ==================== Datadb Lifecycle ====================
+
+// mustCreateDatadb creates a new datadb directory structure on disk.
+// This is called when creating a new partition.
 func mustCreateDatadb(path string) {
 	fs.MustMkdirFailIfExist(path)
 	mustWritePartNames(path, nil)
 	fs.MustSyncPathAndParentDir(path)
 }
 
-// mustOpenDatadb opens datadb at the given path with the given flushInterval for in-memory data.
+// mustOpenDatadb loads an existing datadb from disk and starts background workers.
+//
+// INITIALIZATION STEPS:
+//  1. Read the list of existing parts from parts.json
+//  2. Remove any orphaned directories (left from unclean shutdown)
+//  3. Open each part file and categorize as small or big
+//  4. Initialize metrics and start background workers
+//
+// RECOVERY: The function handles unclean shutdown recovery:
+//   - Missing parts.json and no part dirs: recreated with an empty list
+//   - Missing parts.json with existing part dirs: treated as corruption (panic)
+//   - Extra directories: Removed (they were being created during crash)
 func mustOpenDatadb(pt *partition, path string, flushInterval time.Duration) *datadb {
 	partNames := mustReadPartNames(path)
 	mustRemoveUnusedDirs(path, partNames)
@@ -187,6 +300,7 @@ func mustOpenDatadb(pt *partition, path string, flushInterval time.Duration) *da
 
 		p := mustOpenFilePart(pt, partPath)
 		pw := newPartWrapper(p, nil, time.Time{})
+		// Categorize by size: big parts are larger than what fits in memory
 		if p.ph.CompressedSizeBytes > getMaxInmemoryPartSize() {
 			bigParts = append(bigParts, pw)
 		} else {
@@ -218,6 +332,7 @@ func mustOpenDatadb(pt *partition, path string, flushInterval time.Duration) *da
 	return ddb
 }
 
+// startBackgroundWorkers launches the background goroutines for merges and flushing.
 func (ddb *datadb) startBackgroundWorkers() {
 	// Start file parts mergers, so they could start merging unmerged parts if needed.
 	// There is no need in starting in-memory parts mergers, since there are no in-memory parts yet.
@@ -226,6 +341,11 @@ func (ddb *datadb) startBackgroundWorkers() {
 
 	ddb.startInmemoryPartsFlusher()
 }
+
+// ==================== Concurrency Control ====================
+//
+// These channels limit the number of concurrent merge operations to prevent
+// resource exhaustion. The limit is based on CPU count.
 
 var (
 	inmemoryPartsConcurrencyCh = make(chan struct{}, cgroup.AvailableCPUs())
@@ -274,6 +394,10 @@ func (ddb *datadb) startInmemoryPartsFlusher() {
 	ddb.wg.Go(ddb.inmemoryPartsFlusher)
 }
 
+// ==================== Background Workers ====================
+
+// inmemoryPartsFlusher periodically flushes in-memory parts to disk.
+// This ensures data durability even if the merge process is slow.
 func (ddb *datadb) inmemoryPartsFlusher() {
 	// Do not add jitter to d in order to guarantee the flush interval
 	ticker := time.NewTicker(ddb.flushInterval)
@@ -288,6 +412,8 @@ func (ddb *datadb) inmemoryPartsFlusher() {
 	}
 }
 
+// mustFlushInmemoryPartsToFiles flushes eligible in-memory parts to disk.
+// If isFinal is true, all parts are flushed (used during shutdown/snapshot).
 func (ddb *datadb) mustFlushInmemoryPartsToFiles(isFinal bool) {
 	currentTime := time.Now()
 	var pws []*partWrapper
@@ -304,6 +430,8 @@ func (ddb *datadb) mustFlushInmemoryPartsToFiles(isFinal bool) {
 	ddb.mustMergePartsToFiles(pws)
 }
 
+// mustMergePartsToFiles merges the given in-memory parts to file-based parts.
+// Uses parallel merging for efficiency.
 func (ddb *datadb) mustMergePartsToFiles(pws []*partWrapper) {
 	wg := getWaitGroup()
 	for len(pws) > 0 {
@@ -321,9 +449,8 @@ func (ddb *datadb) mustMergePartsToFiles(pws []*partWrapper) {
 	putWaitGroup(wg)
 }
 
-// getPartsForOptimalMerge returns parts from pws for optimal merge, plus the remaining parts.
-//
-// the pws items are replaced by nil after the call. This is needed for helping Go GC to reclaim the referenced items.
+// getPartsForOptimalMerge selects parts for an optimal merge operation.
+// Returns the parts to merge and the remaining parts.
 func getPartsForOptimalMerge(pws []*partWrapper) ([]*partWrapper, []*partWrapper) {
 	pwsToMerge := appendPartsToMerge(nil, pws, math.MaxUint64)
 	if len(pwsToMerge) == 0 {
@@ -346,6 +473,8 @@ func getPartsForOptimalMerge(pws []*partWrapper) ([]*partWrapper, []*partWrapper
 	return pwsToMerge, pwsRemaining
 }
 
+// ==================== WaitGroup Pool ====================
+
 func getWaitGroup() *sync.WaitGroup {
 	v := wgPool.Get()
 	if v == nil {
@@ -360,6 +489,11 @@ func putWaitGroup(wg *sync.WaitGroup) {
 
 var wgPool sync.Pool
 
+// ==================== Background Mergers ====================
+//
+// These functions run continuously, looking for merge opportunities.
+
+// inmemoryPartsMerger merges in-memory parts together to reduce part count.
 func (ddb *datadb) inmemoryPartsMerger() {
 	for {
 		if needStop(ddb.stopCh) {
@@ -382,6 +516,7 @@ func (ddb *datadb) inmemoryPartsMerger() {
 	}
 }
 
+// smallPartsMerger merges small file-based parts together.
 func (ddb *datadb) smallPartsMerger() {
 	for {
 		if needStop(ddb.stopCh) {
@@ -404,6 +539,7 @@ func (ddb *datadb) smallPartsMerger() {
 	}
 }
 
+// bigPartsMerger merges big file-based parts together.
 func (ddb *datadb) bigPartsMerger() {
 	for {
 		if needStop(ddb.stopCh) {
@@ -426,9 +562,8 @@ func (ddb *datadb) bigPartsMerger() {
 	}
 }
 
-// getPartsToMergeLocked returns optimal parts to merge from pws.
-//
-// The summary size of the returned parts must be smaller than maxOutBytes.
+// getPartsToMergeLocked selects parts for merging based on the optimal merge algorithm.
+// Must be called with partsLock held.
 func getPartsToMergeLocked(pws []*partWrapper, maxOutBytes uint64) []*partWrapper {
 	pwsRemaining := make([]*partWrapper, 0, len(pws))
 	for _, pw := range pws {
@@ -449,6 +584,7 @@ func getPartsToMergeLocked(pws []*partWrapper, maxOutBytes uint64) []*partWrappe
 	return pwsToMerge
 }
 
+// assertIsInMerge verifies that all parts are marked as being in a merge.
 func assertIsInMerge(pws []*partWrapper) {
 	for _, pw := range pws {
 		if !pw.isInMerge {
@@ -457,35 +593,34 @@ func assertIsInMerge(pws []*partWrapper) {
 	}
 }
 
-// mustMergeParts merges pws to a single resulting part.
+// ==================== Core Merge Logic ====================
+
+// mustMergeParts merges multiple parts into a single resulting part.
+// This is the main entry point for all merge operations.
 //
-// if isFinal is set, then the resulting part is guaranteed to be saved to disk.
-// if isFinal is set, then the merge process cannot be interrupted.
+// PARAMETERS:
+//   - pws: Parts to merge (must have isInMerge set to true)
+//   - isFinal: If true, merge cannot be interrupted and must complete
 //
-// The pws may remain unmerged after returning from the function in the following cases:
-// - if ddb.stopCh is closed
-// - if there is no enough disk space
-//
-// All the parts inside pws must have isInMerge field set to true.
-// The isInMerge field inside pws parts is set to false before returning from the function.
+// The merge may not complete if:
+//   - stopCh is closed (shutdown requested)
+//   - Not enough disk space (unless isFinal)
 func (ddb *datadb) mustMergeParts(pws []*partWrapper, isFinal bool) {
 	_ = ddb.mustMergePartsInternal(pws, isFinal, nil, ddb.stopCh)
 }
 
-// mustMergePartsInternal merges pws to a single resulting part.
+// mustMergePartsInternal performs the actual merge operation.
 //
-// if isFinal is set, then the resulting part is guaranteed to be saved to disk.
-// if isFinal is set, then the merge process cannot be interrupted.
-// if dropFilter is non-nil, then rows matching this filter are dropped during the merge.
+// MERGE PROCESS:
+//  1. Determine the destination part type (inmemory, small, or big)
+//  2. Reserve disk space if writing to file
+//  3. Open stream readers for all source parts
+//  4. Create stream writer for destination
+//  5. Merge-sort all data from sources to destination
+//  6. Write metadata and sync to disk
+//  7. Atomically swap old parts with new part
 //
-// The pws may remain unmerged after returning from the function in the following cases:
-// - if stopCh is closed
-// - if there is no enough disk space
-//
-// If pws aren't merged, then false is returned from the function.
-//
-// All the parts inside pws must have isInMerge field set to true.
-// The isInMerge field inside pws parts is set to false before returning from the function.
+// Returns false if merge was interrupted or couldn't complete.
 func (ddb *datadb) mustMergePartsInternal(pws []*partWrapper, isFinal bool, dropFilter *partitionSearchOptions, stopCh <-chan struct{}) bool {
 	if len(pws) == 0 {
 		// Nothing to merge.
@@ -514,6 +649,7 @@ func (ddb *datadb) mustMergePartsInternal(pws []*partWrapper, isFinal bool, drop
 		}
 	}
 
+	// Update merge statistics
 	switch dstPartType {
 	case partInmemory:
 		ddb.inmemoryMergesTotal.Add(1)
@@ -535,8 +671,8 @@ func (ddb *datadb) mustMergePartsInternal(pws []*partWrapper, isFinal bool, drop
 	mergeIdx := ddb.nextMergeIdx()
 	dstPartPath := ddb.getDstPartPath(dstPartType, mergeIdx)
 
+	// Fast path: single in-memory part being flushed to disk
 	if isFinal && len(pws) == 1 && pws[0].mp != nil {
-		// Fast path: flush a single in-memory part to disk.
 		mp := pws[0].mp
 		mp.MustStoreToDisk(dstPartPath)
 		pwNew := ddb.openCreatedPart(&mp.ph, pws, nil, dstPartPath)
@@ -626,6 +762,7 @@ func (ddb *datadb) mustMergePartsInternal(pws []*partWrapper, isFinal bool, drop
 	return true
 }
 
+// updateMergeMetrics records merge performance metrics.
 func (ddb *datadb) updateMergeMetrics(partType partType, srcRowCount uint64, startTime time.Time, dstSize uint64) {
 	switch partType {
 	case partInmemory:
@@ -647,14 +784,16 @@ func (ddb *datadb) nextMergeIdx() uint64 {
 	return ddb.mergeIdx.Add(1)
 }
 
+// partType identifies the storage tier for a part.
 type partType int
 
 var (
-	partInmemory = partType(0)
-	partSmall    = partType(1)
-	partBig      = partType(2)
+	partInmemory = partType(0) // Stored only in RAM
+	partSmall    = partType(1) // File-based, small enough to cache
+	partBig      = partType(2) // File-based, large
 )
 
+// getDstPartType determines where the merged result should be stored.
 func (ddb *datadb) getDstPartType(pws []*partWrapper, isFinal bool) partType {
 	dstPartSize := getCompressedSize(pws)
 	if dstPartSize > ddb.getMaxSmallPartSize() {
@@ -671,6 +810,7 @@ func (ddb *datadb) getDstPartType(pws []*partWrapper, isFinal bool) partType {
 	return partInmemory
 }
 
+// getDstPartPath returns the filesystem path for a new part.
 func (ddb *datadb) getDstPartPath(dstPartType partType, mergeIdx uint64) string {
 	ptPath := ddb.path
 	dstPartPath := ""
@@ -680,6 +820,7 @@ func (ddb *datadb) getDstPartPath(dstPartType partType, mergeIdx uint64) string 
 	return dstPartPath
 }
 
+// openCreatedPart opens a newly created part after merge completion.
 func (ddb *datadb) openCreatedPart(ph *partHeader, pws []*partWrapper, mpNew *inmemoryPart, dstPartPath string) *partWrapper {
 	// Open the created part.
 	if ph.RowsCount == 0 {
@@ -702,15 +843,25 @@ func (ddb *datadb) openCreatedPart(ph *partHeader, pws []*partWrapper, mpNew *in
 	return newPartWrapper(p, mpNew, flushDeadline)
 }
 
+// ==================== Data Ingestion ====================
+
+// mustAddRows adds log rows to the in-memory buffer.
+// This is the main entry point for data ingestion at the datadb level.
 func (ddb *datadb) mustAddRows(lr *LogRows) {
 	ddb.rb.mustAddRows(lr)
 }
+
+// ==================== Rows Buffer ====================
+//
+// rowsBuffer is a sharded in-memory buffer for incoming log rows.
+// Sharding by CPU reduces lock contention during high-throughput ingestion.
 
 type rowsBuffer struct {
 	shards  []rowsBufferShard
 	nextIdx atomic.Uint64
 }
 
+// Len returns the total number of rows across all shards.
 func (rb *rowsBuffer) Len() uint64 {
 	shards := rb.shards
 	n := uint64(0)
@@ -726,6 +877,7 @@ func (rb *rowsBuffer) Len() uint64 {
 	return n
 }
 
+// init creates the sharded buffer with one shard per CPU.
 func (rb *rowsBuffer) init(wg *sync.WaitGroup, flushFunc func(lr *logRows)) {
 	shards := make([]rowsBufferShard, cgroup.AvailableCPUs())
 	for i := range shards {
@@ -736,18 +888,20 @@ func (rb *rowsBuffer) init(wg *sync.WaitGroup, flushFunc func(lr *logRows)) {
 	rb.shards = shards
 }
 
+// rowsBufferShard is a single shard of the rows buffer.
 type rowsBufferShard struct {
-	wg        *sync.WaitGroup // wg is shared with datadb.
+	wg        *sync.WaitGroup // Shared with datadb
 	flushFunc func(lr *logRows)
 
 	mu         sync.Mutex
 	lr         *logRows
 	flushTimer *time.Timer
 
-	// padding for preventing false sharing
+	// padding for preventing false sharing between shards
 	_ [atomicutil.CacheLineSize]byte
 }
 
+// flush forces all shards to flush their data.
 func (rb *rowsBuffer) flush() {
 	shards := rb.shards
 	for i := range shards {
@@ -758,6 +912,7 @@ func (rb *rowsBuffer) flush() {
 	}
 }
 
+// mustAddRows adds rows to a shard using round-robin distribution.
 func (rb *rowsBuffer) mustAddRows(lr *LogRows) {
 	if len(lr.streamIDs) == 0 {
 		return
@@ -769,6 +924,7 @@ func (rb *rowsBuffer) mustAddRows(lr *LogRows) {
 
 	shard.mu.Lock()
 	if shard.flushTimer == nil {
+		// Set up a timer to flush this shard after 1 second
 		shard.wg.Add(1)
 		shard.flushTimer = time.AfterFunc(time.Second, func() {
 			defer shard.wg.Done()
@@ -788,6 +944,8 @@ func (rb *rowsBuffer) mustAddRows(lr *LogRows) {
 	shard.mu.Unlock()
 }
 
+// flushLocked flushes the shard's data to storage.
+// Must be called with mu held.
 func (shard *rowsBufferShard) flushLocked() {
 	if shard.flushTimer != nil {
 		if shard.flushTimer.Stop() {
@@ -803,6 +961,7 @@ func (shard *rowsBufferShard) flushLocked() {
 	}
 }
 
+// mustFlushLogRows converts accumulated log rows into an in-memory part.
 func (ddb *datadb) mustFlushLogRows(lr *logRows) {
 	inmemoryPartsConcurrencyCh <- struct{}{}
 	mp := getInmemoryPart()

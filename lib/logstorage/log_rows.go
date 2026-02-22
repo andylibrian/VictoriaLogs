@@ -1,3 +1,60 @@
+// Package logstorage provides the core storage engine for VictoriaLogs.
+//
+// ============== LogRows Overview ==============
+//
+// LogRows is the primary data structure for buffering log entries during ingestion.
+// It acts as a staging area between receiving log data from clients and writing
+// it to persistent storage (partitions).
+//
+// WHY BUFFER LOGS?
+//  1. Batching: Accumulating multiple log entries allows efficient bulk writes
+//     to storage, reducing per-entry overhead.
+//  2. Arena Allocation: All string data is copied into a single contiguous buffer
+//     (arena), improving cache locality and reducing allocation overhead.
+//  3. Deduplication: Field names and values can be shared between consecutive
+//     log entries, reducing memory usage.
+//  4. Validation: Log entries are validated for size limits before being stored.
+//
+// ============== Two Types of LogRows ==============
+//
+// There are two related but distinct types:
+//
+// LogRows (public):
+//   - Used by ingestion endpoints (vlinsert) to collect log entries
+//   - Contains configuration: stream fields, ignore filters, extra fields
+//   - Maintains streamTagsCanonical for each row (the canonical form of stream labels)
+//   - Obtained via GetLogRows() with configuration parameters
+//
+// logRows (private):
+//   - Internal representation used by datadb for batch processing
+//   - Simpler structure: just streamIDs, timestamps, and field data
+//   - No configuration - just raw data storage
+//   - Used during the flush process when data is written to parts
+//
+// ============== Data Flow ==============
+//
+// Ingestion Path:
+//  1. Ingestion endpoint receives log data
+//  2. GetLogRows() creates a LogRows with appropriate configuration
+//  3. MustAdd() is called for each log entry - fields are validated, stream tags extracted
+//  4. LogRows is passed to Storage.MustAddRows()
+//  5. partition.mustAddRows() registers new streams in indexdb
+//  6. datadb.mustAddRows() converts LogRows to internal logRows
+//  7. logRows is flushed to in-memory parts when full
+//
+// ============== Key Concepts ==============
+//
+// Stream Tags: Labels that identify a log stream (e.g., {app="nginx", host="server1"}).
+// These determine which stream a log entry belongs to and are indexed for fast queries.
+//
+// Stream ID: A 128-bit hash of the canonical stream tags. Used as the primary key
+// for looking up streams in the index.
+//
+// Canonical Form: Stream tags are serialized in a deterministic (sorted) format
+// so that equivalent tag sets always produce the same hash.
+//
+// _msg Field: The primary log message field. Internally stored with empty name ""
+// for efficiency, but displayed as "_msg" in queries.
 package logstorage
 
 import (
@@ -15,67 +72,124 @@ import (
 	"github.com/VictoriaMetrics/VictoriaLogs/lib/prefixfilter"
 )
 
-// LogRows holds a set of rows needed for Storage.MustAddRows
+// LogRows holds a batch of log entries during the ingestion process.
+// It is the public-facing type used by ingestion endpoints.
 //
-// LogRows must be obtained via GetLogRows()
+// USAGE PATTERN:
+//
+//	lr := GetLogRows(streamFields, ignoreFields, decolorizeFields, extraFields, defaultMsgValue)
+//	lr.MustAdd(tenantID, timestamp, fields, streamFieldsLen)  // call for each log entry
+//	storage.MustAddRows(lr)                                     // flush to storage
+//	PutLogRows(lr)                                              // return to pool
+//
+// THREAD SAFETY: LogRows is NOT thread-safe. Each goroutine should obtain
+// its own LogRows from the pool.
+//
+// MEMORY MANAGEMENT: All string data (field names, values, stream tags) is
+// copied into an internal arena buffer. This allows callers to reuse their
+// input buffers immediately after MustAdd() returns.
 type LogRows struct {
-	// a holds all the bytes referred by items in LogRows
+	// a is the arena allocator that holds all string data for this batch.
+	// All field names, values, and stream tags are copied here to ensure
+	// the data remains valid even after caller's buffers are reused.
 	a arena
 
-	// fieldsBuf holds all the fields referred by items in LogRows
+	// fieldsBuf holds all Field structures for all rows.
+	// Each row's fields are a slice into this buffer.
+	// This contiguous allocation improves cache efficiency during processing.
 	fieldsBuf []Field
 
-	// streamIDs holds streamIDs for rows added to LogRows
+	// streamIDs holds the computed stream ID for each row.
+	// The stream ID is a 128-bit hash of the canonical stream tags.
+	// Index: corresponds to rows array index.
 	streamIDs []streamID
 
-	// timestamps holds timestamps for rows added to LogRows
+	// timestamps holds the Unix nanosecond timestamp for each row.
+	// Index: corresponds to rows array index.
 	timestamps []int64
 
-	// rows holds fields for rows added to LogRows.
+	// rows holds the field slices for each log entry.
+	// Each element is a slice into fieldsBuf.
+	// Index: row index for accessing corresponding streamID and timestamp.
 	rows [][]Field
 
-	// streamTagsCanonicals holds streamTagsCanonical entries for rows added to LogRows
+	// streamTagsCanonicals holds the canonical serialized form of stream tags.
+	// This is the sorted, standardized representation like: {app="nginx",host="server1"}
+	// Used for registering new streams in indexdb and for logging/debugging.
 	streamTagsCanonicals []string
 
-	// streamFields contains names for stream fields
+	// ==================== Configuration Fields ====================
+	// These are set by GetLogRows() and control how log entries are processed.
+
+	// streamFields contains field names that should be treated as stream tags.
+	// Stream tags identify the log stream and are indexed for fast filtering.
+	// Example: ["app", "host", "environment"]
 	streamFields []string
 
-	// ignoreFields is a filter for fields, which must be ignored during data ingestion
+	// ignoreFields is a prefix filter for fields to skip during ingestion.
+	// Matching fields are neither stored nor indexed.
+	// Useful for filtering out noisy or sensitive fields.
 	ignoreFields prefixfilter.Filter
 
-	// decolorizeFields is a filter for fields, which must be cleared from ANSI color escape sequences
+	// decolorizeFields is a prefix filter for fields that should have
+	// ANSI color escape sequences stripped. Useful for logs that contain
+	// terminal color codes which break JSON formatting.
 	decolorizeFields prefixfilter.Filter
 
-	// extraFields contains extra fields to add to all the logs at MustAdd().
+	// extraFields are additional fields to add to every log entry.
+	// These override any fields with the same name in the input.
+	// Useful for adding metadata like hostname, ingestion source, etc.
 	extraFields []Field
 
-	// extraStreamFields contains extraFields, which must be treated as stream fields.
+	// extraStreamFields are extra fields that should also be stream tags.
+	// These are added to stream tags AND stored as regular fields.
 	extraStreamFields []Field
 
-	// defaultMsgValue contains default value for missing _msg field
+	// defaultMsgValue is the default value for the _msg field if not provided.
+	// If empty, no default _msg is added.
 	defaultMsgValue string
 }
 
+// logRows is the internal representation used by datadb for batch processing.
+// It's simpler than LogRows because it doesn't need the ingestion configuration -
+// just the raw data ready to be written to parts.
+//
+// This type is used during the flush process when in-memory data is converted
+// to searchable parts. The separation from LogRows allows the ingestion path
+// to continue using LogRows while flush operates on logRows.
 type logRows struct {
-	// a holds all the bytes referred by items in logRows
+	// a holds all string data (arena allocator)
 	a arena
 
-	// fieldsBuf holds all the fields referred by items in logRows
+	// fieldsBuf holds all Field structures
 	fieldsBuf []Field
 
-	// streamIDs holds streamIDs for rows added to logRows
+	// streamIDs holds stream IDs for each row
 	streamIDs []streamID
 
-	// timestamps holds timestamps for rows added to logRows
+	// timestamps holds timestamps for each row
 	timestamps []int64
 
-	// rows holds fields for rows added to logRows.
+	// rows holds field slices for each log entry
 	rows [][]Field
 
-	// sf is a helper for sorting fields in every added row
+	// sf is a helper for sorting fields within each row.
+	// Reused to avoid allocations during sort operations.
 	sf sortedFields
 }
 
+// ==================== logRows Methods ====================
+//
+// logRows is the internal type used by datadb during the flush process.
+
+// reset clears all data in logRows, preparing it for reuse.
+// This is called when returning logRows to the pool.
+//
+// The reset is thorough to allow garbage collection of referenced data:
+// - Arena buffer is cleared
+// - Field values are zeroed (to release string references)
+// - StreamIDs are zeroed (to release tenant ID references)
+// - Slices are truncated but capacity is preserved for reuse
 func (lr *logRows) reset() {
 	lr.a.reset()
 
@@ -99,11 +213,20 @@ func (lr *logRows) reset() {
 	lr.sf = nil
 }
 
-// needFlush returns true if lr contains too much data, so it must be flushed to the storage.
+// needFlush returns true if the logRows buffer is approaching capacity.
+// This triggers a flush to prevent the buffer from growing too large.
+//
+// The threshold is 7/8 of the maximum uncompressed block size, providing
+// headroom for additional entries before hitting the hard limit.
 func (lr *logRows) needFlush() bool {
 	return len(lr.a.b) > (maxUncompressedBlockSize/8)*7
 }
 
+// mustAddRows copies all rows from src (LogRows) into lr (logRows).
+// This is called during the flush process to prepare data for writing to parts.
+//
+// The function iterates through each row in src and adds it to lr,
+// copying field data into lr's arena allocator.
 func (lr *logRows) mustAddRows(src *LogRows) {
 	streamIDs := src.streamIDs
 	timestamps := src.timestamps
@@ -122,6 +245,18 @@ func (lr *logRows) mustAddRows(src *LogRows) {
 	}
 }
 
+// mustAddRow adds a single log entry to logRows.
+//
+// This function:
+//  1. Appends the stream ID and timestamp to their respective slices
+//  2. Grows fieldsBuf to accommodate the new fields
+//  3. Copies each field's name and value into the arena
+//  4. Stores a slice reference to the new fields in rows
+//
+// ARENA ALLOCATION OPTIMIZATION:
+// When consecutive rows have identical field names or values, we reuse
+// the same string from the arena instead of copying duplicates. This
+// significantly reduces memory usage for logs with repetitive field names.
 func (lr *logRows) mustAddRow(streamID streamID, timestamp int64, fields []Field) {
 	lr.streamIDs = append(lr.streamIDs, streamID)
 	lr.timestamps = append(lr.timestamps, timestamp)
@@ -158,12 +293,19 @@ func (lr *logRows) mustAddRow(streamID streamID, timestamp int64, fields []Field
 	}
 }
 
-// Len returns the number of items in lr.
+// ==================== Sorting Interface ====================
+//
+// logRows implements sort.Interface to enable sorting by (streamID, timestamp).
+// This ordering is crucial for efficient storage: rows are grouped by stream
+// and ordered by time within each stream, improving compression and query speed.
+
+// Len returns the number of log entries.
 func (lr *logRows) Len() int {
 	return len(lr.streamIDs)
 }
 
-// Less returns true if (streamID, timestamp) for row i is smaller than the (streamID, timestamp) for row j
+// Less returns true if row i should come before row j.
+// Sort order: streamID first (group by stream), then timestamp (chronological).
 func (lr *logRows) Less(i, j int) bool {
 	a := &lr.streamIDs[i]
 	b := &lr.streamIDs[j]
@@ -173,7 +315,7 @@ func (lr *logRows) Less(i, j int) bool {
 	return lr.timestamps[i] < lr.timestamps[j]
 }
 
-// Swap swaps rows i and j in lr.
+// Swap exchanges rows i and j.
 func (lr *logRows) Swap(i, j int) {
 	a := &lr.streamIDs[i]
 	b := &lr.streamIDs[j]
@@ -186,6 +328,8 @@ func (lr *logRows) Swap(i, j int) {
 	*fieldsA, *fieldsB = *fieldsB, *fieldsA
 }
 
+// sortFieldsInRows sorts the fields within each row by field name.
+// Sorted fields improve compression and enable binary search during queries.
 func (lr *logRows) sortFieldsInRows() {
 	for _, row := range lr.rows {
 		lr.sf = row
@@ -193,6 +337,7 @@ func (lr *logRows) sortFieldsInRows() {
 	}
 }
 
+// sortedFields implements sort.Interface for sorting fields by name.
 type sortedFields []Field
 
 func (sf *sortedFields) Len() int {
@@ -209,6 +354,8 @@ func (sf *sortedFields) Swap(i, j int) {
 	a[i], a[j] = a[j], a[i]
 }
 
+// ==================== Pool Management ====================
+
 func getLogRows() *logRows {
 	v := lrPool.Get()
 	if v == nil {
@@ -224,12 +371,25 @@ func putLogRows(lr *logRows) {
 
 var lrPool sync.Pool
 
-// ForEachRow calls callback for every row stored in the lr.
+// ==================== LogRows Methods ====================
+//
+// LogRows is the public type used during ingestion.
+
+// ForEachRow iterates over all rows in LogRows, calling the callback for each.
+// This is used by the native ingestion protocol to process rows one at a time.
+//
+// The callback receives:
+//   - streamHash: A 64-bit hash derived from the stream ID (used for sharding)
+//   - r: An InsertRow populated with the row's data (borrowed from pool, don't retain)
+//
+// NOTE: The callback should not retain references to r.Fields after returning,
+// as the InsertRow is reused.
 func (lr *LogRows) ForEachRow(callback func(streamHash uint64, r *InsertRow)) {
 	r := GetInsertRow()
 	for i, timestamp := range lr.timestamps {
 		sid := &lr.streamIDs[i]
 
+		// Create a 64-bit hash from the 128-bit stream ID for sharding
 		streamHash := sid.id.lo ^ sid.id.hi
 
 		r.TenantID = sid.tenantID
@@ -245,9 +405,8 @@ func (lr *LogRows) ForEachRow(callback func(streamHash uint64, r *InsertRow)) {
 	PutInsertRow(r)
 }
 
-// Reset resets lr with all its settings.
-//
-// Call ResetKeepSettings() for resetting lr without resetting its settings.
+// Reset clears all data AND configuration in LogRows.
+// Use ResetKeepSettings() if you want to clear data but keep the configuration.
 func (lr *LogRows) Reset() {
 	lr.ResetKeepSettings()
 
@@ -264,12 +423,14 @@ func (lr *LogRows) Reset() {
 	lr.defaultMsgValue = ""
 }
 
-// RowsCount returns current log rows count
+// RowsCount returns the current number of log entries in LogRows.
 func (lr *LogRows) RowsCount() int {
 	return len(lr.rows)
 }
 
-// ResetKeepSettings resets rows stored in lr, while keeping its settings passed to GetLogRows().
+// ResetKeepSettings clears all row data but preserves configuration
+// (streamFields, ignoreFields, decolorizeFields, extraFields, defaultMsgValue).
+// Use this when reusing LogRows with the same configuration for multiple batches.
 func (lr *LogRows) ResetKeepSettings() {
 	lr.a.reset()
 
@@ -294,14 +455,23 @@ func (lr *LogRows) ResetKeepSettings() {
 	lr.rows = lr.rows[:0]
 }
 
-// NeedFlush returns true if lr contains too much data, so it must be flushed to the storage.
+// NeedFlush returns true if LogRows has accumulated enough data to trigger a flush.
+// This is based on:
+//   - Arena size approaching the maximum block size
+//   - Number of rows exceeding a threshold
+//
+// Proactive flushing prevents memory pressure and ensures data is persisted promptly.
 func (lr *LogRows) NeedFlush() bool {
 	return len(lr.a.b) > (maxUncompressedBlockSize/8)*7 || len(lr.rows) > maxUncompressedBlockSize/100
 }
 
-// MustAddInsertRow adds r to lr.
+// MustAddInsertRow adds an InsertRow to LogRows (used by native protocol).
+// It validates the streamTagsCanonical and extracts the stream ID before storing.
+//
+// Invalid rows are skipped with a warning log message (not an error).
+// This fail-soft behavior ensures one bad log entry doesn't block ingestion of others.
 func (lr *LogRows) MustAddInsertRow(r *InsertRow) {
-	// verify r.StreamTagsCanonical
+	// Verify streamTagsCanonical is valid canonical format
 	st := GetStreamTags()
 	streamTagsCanonical := bytesutil.ToUnsafeBytes(r.StreamTagsCanonical)
 	tail, err := st.UnmarshalCanonical(streamTagsCanonical)
@@ -321,7 +491,7 @@ func (lr *LogRows) MustAddInsertRow(r *InsertRow) {
 
 	PutStreamTags(st)
 
-	// Calculate the id for the StreamTags
+	// Calculate 128-bit stream ID from stream tags
 	var sid streamID
 	sid.tenantID = r.TenantID
 	sid.id = hash128(streamTagsCanonical)
@@ -330,29 +500,41 @@ func (lr *LogRows) MustAddInsertRow(r *InsertRow) {
 	lr.mustAddInternal(sid, r.Timestamp, r.Fields, r.StreamTagsCanonical)
 }
 
+// mustAdd is a simpler version of MustAdd that uses default stream fields configuration.
 func (lr *LogRows) mustAdd(tenantID TenantID, timestamp int64, fields []Field) {
 	lr.MustAdd(tenantID, timestamp, fields, -1)
 }
 
-// MustAdd adds a log entry with the given args to lr.
+// MustAdd adds a log entry to LogRows.
 //
-// If streamFieldsLen >= 0, then the given number of initial fields are used as log stream fields
-// instead of the pre-configured stream fields from GetLogRows().
+// PARAMETERS:
+//   - tenantID: The tenant identifier (for multi-tenancy)
+//   - timestamp: Unix nanosecond timestamp of the log entry
+//   - fields: Key-value pairs representing the log data
+//   - streamFieldsLen: If >= 0, use the first N fields as stream tags instead of
+//     pre-configured stream fields. Use -1 for default behavior.
 //
-// It is OK to modify the args after returning from the function, since lr copies all the args to internal data.
+// VALIDATION:
+// The log entry is validated against limits. Invalid entries are logged as warnings
+// and skipped (not added). This prevents one bad entry from breaking ingestion.
+// Limits include:
+//   - Maximum number of fields per entry
+//   - Maximum field name length
+//   - Maximum total entry size
 //
-// Log entries are dropped with the warning message in the following cases:
-// - if there are too many log fields
-// - if there are too long log field names
-// - if the total length of log entries is too long
+// THREAD SAFETY: MustAdd is NOT thread-safe. Each LogRows should be used by one goroutine.
 func (lr *LogRows) MustAdd(tenantID TenantID, timestamp int64, fields []Field, streamFieldsLen int) {
-	// Verify that the log entry doesn't exceed limits.
+	// ==================== Validation ====================
+
+	// Check field count limit
 	if len(fields) > maxColumnsPerBlock {
 		line := MarshalFieldsToJSON(nil, fields)
 		logger.Warnf("ignoring log entry with too big number of fields %d, since it exceeds the limit %d; "+
 			"see https://docs.victoriametrics.com/victorialogs/faq/#how-many-fields-a-single-log-entry-may-contain ; log entry: %s", len(fields), maxColumnsPerBlock, line)
 		return
 	}
+
+	// Check field name length limits
 	for i := range fields {
 		fieldName := fields[i].Name
 		if len(fieldName) > maxFieldNameSize {
@@ -363,6 +545,8 @@ func (lr *LogRows) MustAdd(tenantID TenantID, timestamp int64, fields []Field, s
 			return
 		}
 	}
+
+	// Check total entry size
 	rowLen := EstimatedJSONRowLen(fields)
 	if rowLen > maxUncompressedBlockSize {
 		line := MarshalFieldsToJSON(nil, fields)
@@ -371,10 +555,12 @@ func (lr *LogRows) MustAdd(tenantID TenantID, timestamp int64, fields []Field, s
 		return
 	}
 
-	// Compose StreamTags from fields
+	// ==================== Stream Tags Extraction ====================
+
+	// Build stream tags from the appropriate fields
 	st := GetStreamTags()
 	if streamFieldsLen >= 0 {
-		// Compose StreamTags from fields[:streamFieldsLen] and ignore lr.streamFields with lr.extraStreamFields.
+		// Use the first streamFieldsLen fields as stream tags
 		for _, f := range fields[:streamFieldsLen] {
 			fieldName := getCanonicalFieldName(f.Name)
 			if !lr.ignoreFields.MatchString(fieldName) {
@@ -382,25 +568,26 @@ func (lr *LogRows) MustAdd(tenantID TenantID, timestamp int64, fields []Field, s
 			}
 		}
 	} else {
-		// Compose StreamTags from lr.streamFields and lr.extraStreamFields.
+		// Use pre-configured streamFields
 		for _, f := range fields {
 			fieldName := getCanonicalFieldName(f.Name)
 			if slices.Contains(lr.streamFields, fieldName) {
 				st.Add(fieldName, f.Value)
 			}
 		}
+		// Add extra stream fields (e.g., global labels from config)
 		for _, f := range lr.extraStreamFields {
 			fieldName := getCanonicalFieldName(f.Name)
 			st.Add(fieldName, f.Value)
 		}
 	}
 
-	// Marshal StreamTags
+	// Serialize stream tags to canonical form
 	bb := bbPool.Get()
 	bb.B = st.MarshalCanonical(bb.B)
 	PutStreamTags(st)
 
-	// Calculate the id for the StreamTags
+	// Calculate 128-bit stream ID from canonical stream tags
 	var sid streamID
 	sid.tenantID = tenantID
 	sid.id = hash128(bb.B)
@@ -411,11 +598,20 @@ func (lr *LogRows) MustAdd(tenantID TenantID, timestamp int64, fields []Field, s
 	bbPool.Put(bb)
 }
 
+// mustAddInternal is the internal method that actually stores a row in LogRows.
+// It handles:
+//   - Copying stream tags to arena (with deduplication for consecutive identical tags)
+//   - Adding stream ID and timestamp
+//   - Processing and copying fields (applying ignore/decolorize filters)
+//   - Adding extra fields and default _msg if configured
 func (lr *LogRows) mustAddInternal(sid streamID, timestamp int64, fields []Field, streamTagsCanonical string) {
+	// Store stream tags with deduplication optimization
 	stcs := lr.streamTagsCanonicals
 	if len(stcs) > 0 && string(stcs[len(stcs)-1]) == streamTagsCanonical {
+		// Reuse previous stream tags string (common for consecutive logs from same stream)
 		stcs = append(stcs, stcs[len(stcs)-1])
 	} else {
+		// Copy new stream tags to arena
 		streamTagsCanonicalCopy := lr.a.copyString(streamTagsCanonical)
 		stcs = append(stcs, streamTagsCanonicalCopy)
 	}
@@ -424,29 +620,35 @@ func (lr *LogRows) mustAddInternal(sid streamID, timestamp int64, fields []Field
 	lr.streamIDs = append(lr.streamIDs, sid)
 	lr.timestamps = append(lr.timestamps, timestamp)
 
+	// Process input fields
 	fieldsLen := len(lr.fieldsBuf)
 	hasMsgField := lr.addFieldsInternal(fields, &lr.ignoreFields, &lr.decolorizeFields, true)
+
+	// Add extra fields (these override input fields with same name)
 	if lr.addFieldsInternal(lr.extraFields, nil, nil, false) {
 		hasMsgField = true
 	}
 
-	// Add optional default _msg field
+	// Add default _msg field if not present and configured
 	if !hasMsgField && lr.defaultMsgValue != "" {
 		lr.fieldsBuf = append(lr.fieldsBuf, Field{
 			Value: lr.defaultMsgValue,
 		})
 	}
 
-	// Add log row fields to lr.rows
+	// Record the slice of fields for this row
 	row := lr.fieldsBuf[fieldsLen:]
 	lr.rows = append(lr.rows, row)
 }
 
+// addFieldsInternal adds fields to fieldsBuf, applying filters and arena allocation.
+// Returns true if a _msg field (empty name) was added.
 func (lr *LogRows) addFieldsInternal(fields []Field, ignoreFields, decolorizeFields *prefixfilter.Filter, mustCopyFields bool) bool {
 	if len(fields) == 0 {
 		return false
 	}
 
+	// Look at previous row for potential string reuse
 	var prevRow []Field
 	if len(lr.rows) > 0 {
 		prevRow = lr.rows[len(lr.rows)-1]
@@ -459,14 +661,16 @@ func (lr *LogRows) addFieldsInternal(fields []Field, ignoreFields, decolorizeFie
 
 		fieldName := getCanonicalFieldName(f.Name)
 
+		// Skip ignored fields
 		if ignoreFields.MatchString(fieldName) {
 			continue
 		}
+		// Skip fields with empty values (VictoriaLogs data model treats empty as non-existent)
 		if f.Value == "" {
-			// Skip fields without values
 			continue
 		}
 
+		// Look for matching field in previous row for string reuse
 		var prevField *Field
 		if prevRow != nil && i < len(prevRow) {
 			prevField = &prevRow[i]
@@ -475,10 +679,12 @@ func (lr *LogRows) addFieldsInternal(fields []Field, ignoreFields, decolorizeFie
 		fb = append(fb, Field{})
 		dstField := &fb[len(fb)-1]
 
+		// Track if this is the _msg field (stored with empty name internally)
 		if fieldName == "" {
 			hasMsgField = true
 		}
 
+		// Copy or reuse field name
 		if prevField != nil && prevField.Name == fieldName {
 			dstField.Name = prevField.Name
 		} else {
@@ -487,8 +693,10 @@ func (lr *LogRows) addFieldsInternal(fields []Field, ignoreFields, decolorizeFie
 			} else {
 				dstField.Name = fieldName
 			}
-			prevRow = nil
+			prevRow = nil // Can't reuse anymore
 		}
+
+		// Copy or reuse field value
 		if prevField != nil && prevField.Value == f.Value {
 			dstField.Value = prevField.Value
 		} else {
@@ -498,6 +706,7 @@ func (lr *LogRows) addFieldsInternal(fields []Field, ignoreFields, decolorizeFie
 				dstField.Value = f.Value
 			}
 
+			// Strip ANSI color sequences if configured for this field
 			if decolorizeFields.MatchString(fieldName) && hasColorSequences(dstField.Value) {
 				bLen := len(lr.a.b)
 				lr.a.b = dropColorSequences(lr.a.b, dstField.Value)
@@ -510,6 +719,11 @@ func (lr *LogRows) addFieldsInternal(fields []Field, ignoreFields, decolorizeFie
 	return hasMsgField
 }
 
+// ==================== Field Name Utilities ====================
+
+// getCanonicalFieldName converts "_msg" to "" for internal storage.
+// The _msg field is special - it's stored with an empty name internally
+// but displayed as "_msg" in queries and exports.
 func getCanonicalFieldName(fieldName string) string {
 	if fieldName == "_msg" {
 		return ""
@@ -517,6 +731,8 @@ func getCanonicalFieldName(fieldName string) string {
 	return fieldName
 }
 
+// getCanonicalColumnName converts "" back to "_msg" for display.
+// This is the inverse of getCanonicalFieldName.
 func getCanonicalColumnName(fieldName string) string {
 	if fieldName == "" {
 		return "_msg"
@@ -524,7 +740,8 @@ func getCanonicalColumnName(fieldName string) string {
 	return fieldName
 }
 
-// GetRowString returns string representation of the row with the given idx.
+// GetRowString returns a human-readable JSON representation of a row.
+// Used for logging and debugging.
 func (lr *LogRows) GetRowString(idx int) string {
 	tf := TimeFormatter(lr.timestamps[idx])
 	streamTags := getStreamTagsString(lr.streamTagsCanonicals[idx])
@@ -545,21 +762,18 @@ func (lr *LogRows) GetRowString(idx int) string {
 	return string(line)
 }
 
-// GetLogRows returns LogRows from the pool for the given streamFields.
+// ==================== LogRows Pool ====================
+
+// GetLogRows returns a LogRows from the pool, configured with the given settings.
 //
-// streamFields is a set of fields, which must be associated with the stream.
+// PARAMETERS:
+//   - streamFields: Field names to use as stream tags (identifies the log stream)
+//   - ignoreFields: Field name prefixes to skip during ingestion
+//   - decolorizeFields: Field name prefixes to strip ANSI color codes from
+//   - extraFields: Additional fields to add to every log entry
+//   - defaultMsgValue: Default value for _msg field if not provided
 //
-// ignoreFields is a set of fields, which must be ignored during data ingestion.
-// ignoreFields entries may end with '*'. In this case they match any fields with the prefix until '*'.
-//
-// decolorizeFields is a set of fields, which must be cleared from ANSI color escape sequences.
-// decolorizeFields entries may end with '*'. In this case they match any fields with the prefix until '*'.
-//
-// extraFields is a set of fields, which must be added to all the logs passed to MustAdd().
-//
-// defaultMsgValue is the default value to store in non-existing or empty _msg.
-//
-// Return back it to the pool with PutLogRows() when it is no longer needed.
+// IMPORTANT: Call PutLogRows() when done to return to the pool.
 func GetLogRows(streamFields, ignoreFields, decolorizeFields []string, extraFields []Field, defaultMsgValue string) *LogRows {
 	v := logRowsPool.Get()
 	if v == nil {
@@ -567,25 +781,24 @@ func GetLogRows(streamFields, ignoreFields, decolorizeFields []string, extraFiel
 	}
 	lr := v.(*LogRows)
 
-	// initialize ignoreFields
+	// Initialize ignoreFields filter
 	for _, f := range ignoreFields {
 		f = getCanonicalFieldName(f)
 		lr.ignoreFields.AddAllowFilter(f)
 	}
 	for _, f := range extraFields {
-		// Extra fields must override the existing fields for the sake of consistency and security,
-		// so the client won't be able to override them.
+		// Extra fields override input fields, so ignore input fields with same names
 		fieldName := getCanonicalFieldName(f.Name)
 		lr.ignoreFields.AddAllowFilter(fieldName)
 	}
 
-	// initialize decolorizeFields
+	// Initialize decolorizeFields filter
 	for _, f := range decolorizeFields {
 		f = getCanonicalFieldName(f)
 		lr.decolorizeFields.AddAllowFilter(f)
 	}
 
-	// Initialize streamFields
+	// Initialize streamFields (excluding ignored ones)
 	for _, f := range streamFields {
 		f = getCanonicalFieldName(f)
 		if !lr.ignoreFields.MatchString(f) {
@@ -593,7 +806,7 @@ func GetLogRows(streamFields, ignoreFields, decolorizeFields []string, extraFiel
 		}
 	}
 
-	// Initialize extraStreamFields
+	// Initialize extraStreamFields (extra fields that are also stream tags)
 	for _, f := range extraFields {
 		fieldName := getCanonicalFieldName(f.Name)
 		if slices.Contains(streamFields, fieldName) {
@@ -608,7 +821,7 @@ func GetLogRows(streamFields, ignoreFields, decolorizeFields []string, extraFiel
 	return lr
 }
 
-// PutLogRows returns lr to the pool.
+// PutLogRows returns a LogRows to the pool for reuse.
 func PutLogRows(lr *LogRows) {
 	lr.Reset()
 	logRowsPool.Put(lr)
@@ -616,16 +829,17 @@ func PutLogRows(lr *LogRows) {
 
 var logRowsPool sync.Pool
 
-// EstimatedJSONRowLen returns an approximate length of the log entry with the given fields if represented as JSON.
+// ==================== Utility Functions ====================
+
+// EstimatedJSONRowLen estimates the JSON representation size of a log entry.
+// This is used for validation to reject overly large entries.
 //
-// The calculation logic must stay in sync with block.uncompressedSizeBytes() in block.go.
-// If you change logic here, update block.uncompressedSizeBytes() accordingly and vice versa.
+// The calculation must stay in sync with block.uncompressedSizeBytes().
 func EstimatedJSONRowLen(fields []Field) int {
 	n := len("{}\n")
 	n += len(`"_time":""`) + len(time.RFC3339Nano)
 	for _, f := range fields {
-		// VictoriaLogs data model (https://docs.victoriametrics.com/victorialogs/keyconcepts/#data-model)
-		// treats empty values as non-existing values
+		// VictoriaLogs data model treats empty values as non-existing values
 		if f.Value == "" {
 			continue
 		}
@@ -636,16 +850,17 @@ func EstimatedJSONRowLen(fields []Field) int {
 	return n
 }
 
-// estimatedJSONFieldLen returns an approximate length of the field with the given name and value if represented as JSON.
-//
-// The field name must be in raw form (e.g., "" to "_msg") before passing.
+// estimatedJSONFieldLen estimates the JSON size of a single field.
 func estimatedJSONFieldLen(name, value string) int {
 	return len(`,"":""`) + len(name) + len(value)
 }
 
-// GetInsertRow returns InsertRow from a pool.
+// ==================== InsertRow ====================
 //
-// Pass the returned row to PutInsertRow when it is no longer needed, so it could be reused.
+// InsertRow is used by the native ingestion protocol.
+// It represents a single log entry with pre-computed stream tags.
+
+// GetInsertRow returns an InsertRow from the pool.
 func GetInsertRow() *InsertRow {
 	v := insertRowsPool.Get()
 	if v == nil {
@@ -654,7 +869,7 @@ func GetInsertRow() *InsertRow {
 	return v.(*InsertRow)
 }
 
-// PutInsertRow returns r to the pool, so it could be reused via GetInsertRow.
+// PutInsertRow returns an InsertRow to the pool.
 func PutInsertRow(r *InsertRow) {
 	r.Reset()
 	insertRowsPool.Put(r)
@@ -662,15 +877,16 @@ func PutInsertRow(r *InsertRow) {
 
 var insertRowsPool sync.Pool
 
-// InsertRow represents a row to insert into VictoriaLogs via native protocol.
+// InsertRow represents a log entry for the native ingestion protocol.
+// Unlike the regular MustAdd path, this has pre-computed streamTagsCanonical.
 type InsertRow struct {
-	TenantID            TenantID
-	StreamTagsCanonical string
-	Timestamp           int64
-	Fields              []Field
+	TenantID            TenantID // Tenant identifier
+	StreamTagsCanonical string   // Pre-formatted stream tags (e.g., `{app="nginx",host="server1"}`)
+	Timestamp           int64    // Unix nanosecond timestamp
+	Fields              []Field  // Log fields (key-value pairs)
 }
 
-// Reset resets r to zero value.
+// Reset clears all fields in InsertRow.
 func (r *InsertRow) Reset() {
 	r.TenantID.Reset()
 	r.StreamTagsCanonical = ""
@@ -680,7 +896,7 @@ func (r *InsertRow) Reset() {
 	r.Fields = r.Fields[:0]
 }
 
-// Marshal appends marshaled r to dst and returns the result.
+// Marshal serializes InsertRow to binary format for native protocol.
 func (r *InsertRow) Marshal(dst []byte) []byte {
 	dst = r.TenantID.marshal(dst)
 	dst = encoding.MarshalBytes(dst, bytesutil.ToUnsafeBytes(r.StreamTagsCanonical))
@@ -692,9 +908,8 @@ func (r *InsertRow) Marshal(dst []byte) []byte {
 	return dst
 }
 
-// UnmarshalInplace unmarshals r from src and returns the remaining tail.
-//
-// The r is valid until src contents isn't changed.
+// UnmarshalInplace deserializes InsertRow from binary format.
+// The returned InsertRow references data in src - do not modify src while using r.
 func (r *InsertRow) UnmarshalInplace(src []byte) ([]byte, error) {
 	srcOrig := src
 

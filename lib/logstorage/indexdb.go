@@ -1,3 +1,64 @@
+// Package logstorage provides the core storage engine for VictoriaLogs.
+//
+// ============== Indexdb Overview ==============
+//
+// The indexdb is the metadata index for VictoriaLogs, storing information about
+// log streams and their associated tags. It enables efficient stream discovery
+// based on label filters without scanning the actual log data.
+//
+// WHY INDEX STREAMS?
+// When a query filters logs by labels (e.g., app="nginx" AND host="server1"),
+// we need to quickly find which streams match those criteria. Without an index,
+// we'd have to scan all log data to find matching entries - extremely slow.
+//
+// With the index, we can:
+//  1. Narrow candidate streams via prefix lookups/scans in mergeset
+//  2. Then search only those streams' log data
+//  3. Skip entire streams that don't match the filter
+//
+// ============== Storage Architecture ==============
+//
+// indexdb uses the `mergeset` storage engine (from VictoriaMetrics) which provides:
+//   - LSM-tree style storage with automatic background merges
+//   - Efficient prefix-based searches
+//   - Compression and block-based storage
+//   - Point-in-time snapshots
+//
+// ============== Index Entry Types ==============
+//
+// Three types of entries are stored, distinguished by namespace prefix:
+//
+//  1. nsPrefixStreamID (0): Stream existence marker
+//     Key: tenantID + streamID
+//     Value: (none - just the key presence indicates the stream exists)
+//     Purpose: Quickly check if a stream is already registered
+//
+//  2. nsPrefixStreamIDToStreamTags (1): Stream ID to tags mapping
+//     Key: tenantID + streamID
+//     Value: streamTagsCanonical (e.g., {app="nginx",host="server1"})
+//     Purpose: Look up stream labels from stream ID (for display, logging)
+//
+//  3. nsPrefixTagToStreamIDs (2): Tag to streams reverse index
+//     Key: tenantID + tagName + tagValue
+//     Value: list of streamIDs that have this tag=value
+//     Purpose: Find all streams matching a label filter
+//
+// ============== Query Flow ==============
+//
+// When querying with a stream filter like "app=~"nginx.*" AND host!="localhost":
+//  1. Parse the filter into individual conditions
+//  2. For each condition, look up matching stream IDs using nsPrefixTagToStreamIDs
+//  3. Intersect (AND) or subtract (!=) the stream ID sets
+//  4. Return the final set of stream IDs to search
+//
+// ============== Caching ==============
+//
+// Stream ID lookups are cached in two levels:
+//  1. streamIDCache: Per-stream existence cache (shared across partitions)
+//  2. filterStreamCache: Stream filter result cache (shared across partitions)
+//
+// filterStreamCache is generation-keyed and effectively invalidated when new streams
+// are registered. streamIDCache is updated incrementally during ingestion.
 package logstorage
 
 import (
@@ -17,87 +78,128 @@ import (
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/slicesutil"
 )
 
+// ==================== Namespace Prefixes ====================
+//
+// These prefixes distinguish different types of entries in the mergeset table.
+// The first byte of each key indicates the entry type.
+
 const (
-	// (tenantID:streamID) entries have this prefix
-	//
-	// These entries are used for detecting whether the given stream is already registered
+	// nsPrefixStreamID marks stream existence entries.
+	// Entry format: [0][tenantID][streamID] -> (empty value)
+	// Used for fast existence checks: "is this stream already registered?"
 	nsPrefixStreamID = 0
 
-	// (tenantID:streamID -> streamTagsCanonical) entries have this prefix
+	// nsPrefixStreamIDToStreamTags marks stream ID to tags mapping entries.
+	// Entry format: [1][tenantID][streamID] -> [streamTagsCanonical]
+	// Used for reverse lookup: "what are the labels for stream ID X?"
 	nsPrefixStreamIDToStreamTags = 1
 
-	// (tenantID:name:value => streamIDs) entries have this prefix
+	// nsPrefixTagToStreamIDs marks the reverse index from tags to streams.
+	// Entry format: [2][tenantID][tagName][tagValue] -> [streamID1][streamID2]...
+	// Used for forward lookup: "which streams have tag=value?"
 	nsPrefixTagToStreamIDs = 2
 )
 
-// IndexdbStats contains indexdb stats
+// ==================== Indexdb Statistics ====================
+
+// IndexdbStats contains metrics about the index database.
+// These are exposed via the /metrics endpoint for monitoring.
 type IndexdbStats struct {
-	// StreamsCreatedTotal is the number of log streams created since the indexdb initialization.
+	// StreamsCreatedTotal is the cumulative count of streams created since startup.
+	// This helps track stream cardinality growth.
 	StreamsCreatedTotal uint64
 
-	// IndexdbSizeBytes is the size of data in indexdb.
+	// IndexdbSizeBytes is the total size of index data (in-memory + on-disk).
 	IndexdbSizeBytes uint64
 
-	// IndexdbItemsCount is the number of items in indexdb.
+	// IndexdbItemsCount is the number of index entries.
+	// Roughly: streams * (2 + number_of_tags_per_stream), plus merge/layout overhead.
 	IndexdbItemsCount uint64
 
-	// IndexdbBlocksCount is the number of blocks in indexdb.
+	// IndexdbBlocksCount is the number of storage blocks.
+	// More blocks = more files to read during queries.
 	IndexdbBlocksCount uint64
 
-	// IndexdbPartsCount is the number of parts in indexdb.
+	// IndexdbPartsCount is the number of parts in the LSM tree.
+	// Higher count may indicate compaction lag.
 	IndexdbPartsCount uint64
 
-	// IndexdbPendingItems is the number of pending items in IndexedDB before they are merged into the part.
+	// IndexdbPendingItems is the count of items waiting to be merged.
 	IndexdbPendingItems uint64
 
-	// IndexdbActiveFileMerges is the number of active merges in indexdb.
+	// IndexdbActiveFileMerges is the current number of active on-disk merges.
 	IndexdbActiveFileMerges uint64
 
-	// IndexdbActiveInmemoryMerges is the number of active merges in indexdb.
+	// IndexdbActiveInmemoryMerges is the current number of active in-memory merges.
 	IndexdbActiveInmemoryMerges uint64
 
-	// IndexdbFileMergesCount is the number of merges in indexdb.
+	// IndexdbFileMergesCount is the total number of on-disk merges completed.
 	IndexdbFileMergesCount uint64
 
-	// IndexdbInmemoryMergesCount is the number of merges in indexdb.
+	// IndexdbInmemoryMergesCount is the total number of in-memory merges completed.
 	IndexdbInmemoryMergesCount uint64
 
-	// IndexdbFileItemsMerged is the number of items merged in indexdb.
+	// IndexdbFileItemsMerged is the total count of items merged to disk.
 	IndexdbFileItemsMerged uint64
 
-	// IndexdbInmemoryItemsMerged is the number of items merged in indexdb.
+	// IndexdbInmemoryItemsMerged is the total count of items merged in memory.
 	IndexdbInmemoryItemsMerged uint64
 }
 
+// ==================== Indexdb Structure ====================
+
+// indexdb manages the stream metadata index for a partition.
+// It is backed by a mergeset.Table which provides the actual storage.
+//
+// Each partition has its own indexdb, which stores:
+//   - Stream existence markers (for deduplication)
+//   - Stream ID to labels mappings (for reverse lookup)
+//   - Label to stream ID reverse index (for query filtering)
 type indexdb struct {
-	// streamsCreatedTotal is the number of log streams created since the indexdb initialization.
+	// streamsCreatedTotal counts streams created since indexdb initialization.
 	streamsCreatedTotal atomic.Uint64
 
-	// the generation of the filterStreamCache.
-	// It is updated each time new item is added to tb.
+	// filterStreamCacheGeneration is incremented each time a new stream is registered.
+	// This invalidates the filterStreamCache because new streams may match existing queries.
 	filterStreamCacheGeneration atomic.Uint32
 
-	// path is the path to indexdb
+	// path is the filesystem path to the indexdb directory.
 	path string
 
-	// partitionName is the name of the partition for the indexdb.
+	// partitionName is the name of the parent partition (e.g., "20240115").
+	// Used in cache keys to distinguish streams across partitions.
 	partitionName string
 
-	// tb is the storage for indexdb
+	// tb is the underlying mergeset table that stores index entries.
+	// All index data is stored here using the namespace prefixes defined above.
 	tb *mergeset.Table
 
-	// indexSearchPool is a pool of indexSearch struct for the given indexdb
+	// indexSearchPool is a pool of indexSearch structs for query reuse.
+	// Avoids allocations during frequent stream lookups.
 	indexSearchPool sync.Pool
 
-	// s is the storage where indexdb belongs to.
+	// s is the parent Storage that owns this indexdb's partition.
+	// Provides access to shared caches and configuration.
 	s *Storage
 }
 
+// ==================== Indexdb Lifecycle ====================
+
+// mustCreateIndexdb creates the indexdb directory structure on disk.
+// This is called when creating a new partition.
 func mustCreateIndexdb(path string) {
 	fs.MustMkdirFailIfExist(path)
 	fs.MustSyncPathAndParentDir(path)
 }
 
+// mustOpenIndexdb opens an existing indexdb for use.
+//
+// The mergeset.Table is initialized with:
+//   - A callback to invalidate the stream filter cache when new data is added
+//   - A merge callback to combine tag-to-streamID entries
+//
+// The isReadOnly flag is shared with the caller but not set here; it's managed
+// by the storage layer for snapshot operations.
 func mustOpenIndexdb(path, partitionName string, s *Storage) *indexdb {
 	idb := &indexdb{
 		path:          path,
@@ -109,6 +211,8 @@ func mustOpenIndexdb(path, partitionName string, s *Storage) *indexdb {
 	return idb
 }
 
+// mustCloseIndexdb closes the indexdb and releases resources.
+// Must be called before deleting the partition.
 func mustCloseIndexdb(idb *indexdb) {
 	idb.tb.MustClose()
 	idb.tb = nil
@@ -117,14 +221,18 @@ func mustCloseIndexdb(idb *indexdb) {
 	idb.path = ""
 }
 
+// debugFlush forces pending index data to be persisted and searchable.
+// Used primarily for testing to ensure query visibility.
 func (idb *indexdb) debugFlush() {
 	idb.tb.DebugFlush()
 }
 
+// mustCreateSnapshotAt creates a point-in-time snapshot of the indexdb.
 func (idb *indexdb) mustCreateSnapshotAt(dstDir string) {
 	idb.tb.MustCreateSnapshotAt(dstDir)
 }
 
+// updateStats populates the provided stats structure with current metrics.
 func (idb *indexdb) updateStats(d *IndexdbStats) {
 	d.StreamsCreatedTotal += idb.streamsCreatedTotal.Load()
 
@@ -144,6 +252,10 @@ func (idb *indexdb) updateStats(d *IndexdbStats) {
 	d.IndexdbInmemoryItemsMerged += tm.InmemoryItemsMerged
 }
 
+// ==================== Stream Tag Lookup ====================
+
+// appendStreamString returns the human-readable stream tags string for a stream ID.
+// Used for logging and displaying stream information.
 func (idb *indexdb) appendStreamString(dst []byte, sid *streamID) []byte {
 	dstLen := len(dst)
 	dst = idb.appendStreamTagsByStreamID(dst, sid)
@@ -164,6 +276,8 @@ func (idb *indexdb) appendStreamString(dst []byte, sid *streamID) []byte {
 	return dst
 }
 
+// appendStreamTagsByStreamID looks up the canonical stream tags for a stream ID.
+// Returns the tags as a canonical string (e.g., {app="nginx",host="server1"}).
 func (idb *indexdb) appendStreamTagsByStreamID(dst []byte, sid *streamID) []byte {
 	is := idb.getIndexSearch()
 	defer idb.putIndexSearch(is)
@@ -171,9 +285,11 @@ func (idb *indexdb) appendStreamTagsByStreamID(dst []byte, sid *streamID) []byte
 	ts := &is.ts
 	kb := &is.kb
 
+	// Build key: [nsPrefixStreamIDToStreamTags][tenantID][streamID]
 	kb.B = marshalCommonPrefix(kb.B[:0], nsPrefixStreamIDToStreamTags, sid.tenantID)
 	kb.B = sid.id.marshal(kb.B)
 
+	// Look up the entry
 	if err := ts.FirstItemWithPrefix(kb.B); err != nil {
 		if err == io.EOF {
 			return dst
@@ -185,7 +301,8 @@ func (idb *indexdb) appendStreamTagsByStreamID(dst []byte, sid *streamID) []byte
 	return dst
 }
 
-// hasStreamID returns true if streamID exists in idb
+// hasStreamID checks if a stream with the given ID exists in the index.
+// This is used during ingestion to avoid re-registering known streams.
 func (idb *indexdb) hasStreamID(sid *streamID) bool {
 	is := idb.getIndexSearch()
 	defer idb.putIndexSearch(is)
@@ -193,9 +310,11 @@ func (idb *indexdb) hasStreamID(sid *streamID) bool {
 	ts := &is.ts
 	kb := &is.kb
 
+	// Build key: [nsPrefixStreamID][tenantID][streamID]
 	kb.B = marshalCommonPrefix(kb.B, nsPrefixStreamID, sid.tenantID)
 	kb.B = sid.id.marshal(kb.B)
 
+	// Check for exact match
 	if err := ts.FirstItemWithPrefix(kb.B); err != nil {
 		if err == io.EOF {
 			return false
@@ -205,12 +324,17 @@ func (idb *indexdb) hasStreamID(sid *streamID) bool {
 	return len(kb.B) == len(ts.Item)
 }
 
+// ==================== Index Search Pool ====================
+
+// indexSearch is a reusable structure for searching the index.
+// Pooling reduces allocations during high-throughput queries.
 type indexSearch struct {
 	idb *indexdb
 	ts  mergeset.TableSearch
 	kb  bytesutil.ByteBuffer
 }
 
+// getIndexSearch retrieves an indexSearch from the pool.
 func (idb *indexdb) getIndexSearch() *indexSearch {
 	v := idb.indexSearchPool.Get()
 	if v == nil {
@@ -223,6 +347,7 @@ func (idb *indexdb) getIndexSearch() *indexSearch {
 	return is
 }
 
+// putIndexSearch returns an indexSearch to the pool.
 func (idb *indexdb) putIndexSearch(is *indexSearch) {
 	is.idb = nil
 	is.ts.MustClose()
@@ -231,7 +356,16 @@ func (idb *indexdb) putIndexSearch(is *indexSearch) {
 	idb.indexSearchPool.Put(is)
 }
 
-// searchStreamIDs returns streamIDs for the given tenantIDs and the given stream filters
+// ==================== Stream ID Search ====================
+
+// searchStreamIDs finds all stream IDs matching the given filter for the specified tenants.
+//
+// This is the core function for query optimization - it returns the set of streams
+// that match the stream label filter, allowing the query to skip non-matching streams.
+//
+// The function uses a two-tier caching strategy:
+//  1. Check filterStreamCache for cached results (fast path)
+//  2. If miss, search indexdb and cache the results (slow path)
 func (idb *indexdb) searchStreamIDs(tenantIDs []TenantID, sf *StreamFilter) []streamID {
 	// Try obtaining streamIDs from cache
 	streamIDs, ok := idb.loadStreamIDsFromCache(tenantIDs, sf)
@@ -265,12 +399,15 @@ func (idb *indexdb) searchStreamIDs(tenantIDs []TenantID, sf *StreamFilter) []st
 	return streamIDs
 }
 
+// sortStreamIDs sorts stream IDs by (tenantID, streamID) for consistent ordering.
 func sortStreamIDs(streamIDs []streamID) {
 	sort.Slice(streamIDs, func(i, j int) bool {
 		return streamIDs[i].less(&streamIDs[j])
 	})
 }
 
+// updateStreamIDs adds stream IDs matching the AND filter to the destination map.
+// For an AND filter, the result is the intersection of all tag filter results.
 func (is *indexSearch) updateStreamIDs(dst map[streamID]struct{}, tenantID TenantID, asf *andStreamFilter) {
 	var m map[u128]struct{}
 	for _, tf := range asf.tagFilters {
@@ -283,6 +420,7 @@ func (is *indexSearch) updateStreamIDs(dst map[streamID]struct{}, tenantID Tenan
 		if m == nil {
 			m = ids
 		} else {
+			// Intersection: remove IDs not in the new set
 			for id := range m {
 				if _, ok := ids[id]; !ok {
 					delete(m, id)
@@ -291,6 +429,7 @@ func (is *indexSearch) updateStreamIDs(dst map[streamID]struct{}, tenantID Tenan
 		}
 	}
 
+	// Add matched stream IDs to destination with tenant ID
 	var sid streamID
 	for id := range m {
 		sid.tenantID = tenantID
@@ -299,21 +438,23 @@ func (is *indexSearch) updateStreamIDs(dst map[streamID]struct{}, tenantID Tenan
 	}
 }
 
+// getStreamIDsForTagFilter returns stream IDs matching a single tag filter.
+// Handles all filter operators: =, !=, =~, !~
 func (is *indexSearch) getStreamIDsForTagFilter(tenantID TenantID, tf *streamTagFilter) map[u128]struct{} {
 	switch tf.op {
 	case "=":
 		if tf.value == "" {
-			// (field="")
+			// (field="") - find streams WITHOUT this tag
 			return is.getStreamIDsForEmptyTagValue(tenantID, tf.tagName)
 		}
-		// (field="value")
+		// (field="value") - exact match
 		return is.getStreamIDsForNonEmptyTagValue(tenantID, tf.tagName, tf.value)
 	case "!=":
 		if tf.value == "" {
-			// (field!="")
+			// (field!="") - find streams WITH this tag (any value)
 			return is.getStreamIDsForTagName(tenantID, tf.tagName)
 		}
-		// (field!="value") => (all and not field="value")
+		// (field!="value") => (all streams) minus (streams with value)
 		ids := is.getStreamIDsForTenant(tenantID)
 		idsForTag := is.getStreamIDsForNonEmptyTagValue(tenantID, tf.tagName, tf.value)
 		for id := range idsForTag {
@@ -324,6 +465,7 @@ func (is *indexSearch) getStreamIDsForTagFilter(tenantID TenantID, tf *streamTag
 		re := tf.regexp
 		if re.MatchString("") {
 			// (field=~"|re") => (field="" or field=~"re")
+			// Regex matches empty string, so include streams without the tag
 			ids := is.getStreamIDsForEmptyTagValue(tenantID, tf.tagName)
 			idsForRe := is.getStreamIDsForTagRegexp(tenantID, tf.tagName, re)
 			for id := range idsForRe {
@@ -331,11 +473,13 @@ func (is *indexSearch) getStreamIDsForTagFilter(tenantID TenantID, tf *streamTag
 			}
 			return ids
 		}
+		// Standard regex match
 		return is.getStreamIDsForTagRegexp(tenantID, tf.tagName, re)
 	case "!~":
 		re := tf.regexp
 		if re.MatchString("") {
 			// (field!~"|re") => (field!="" and not field=~"re")
+			// Regex matches empty string, exclude streams without the tag
 			ids := is.getStreamIDsForTagName(tenantID, tf.tagName)
 			if len(ids) == 0 {
 				return ids
@@ -346,7 +490,7 @@ func (is *indexSearch) getStreamIDsForTagFilter(tenantID TenantID, tf *streamTag
 			}
 			return ids
 		}
-		// (field!~"re") => (all and not field=~"re")
+		// (field!~"re") => (all streams) minus (streams matching regex)
 		ids := is.getStreamIDsForTenant(tenantID)
 		idsForRe := is.getStreamIDsForTagRegexp(tenantID, tf.tagName, re)
 		for id := range idsForRe {
@@ -359,6 +503,7 @@ func (is *indexSearch) getStreamIDsForTagFilter(tenantID TenantID, tf *streamTag
 	}
 }
 
+// getStreamIDsForNonEmptyTagValue finds streams with tagName=tagValue.
 func (is *indexSearch) getStreamIDsForNonEmptyTagValue(tenantID TenantID, tagName, tagValue string) map[u128]struct{} {
 	ids := make(map[u128]struct{})
 	var sp tagToStreamIDsRowParser
@@ -385,6 +530,8 @@ func (is *indexSearch) getStreamIDsForNonEmptyTagValue(tenantID TenantID, tagNam
 	return ids
 }
 
+// getStreamIDsForEmptyTagValue finds streams that do NOT have tagName.
+// This is computed as: (all streams) minus (streams with tagName).
 func (is *indexSearch) getStreamIDsForEmptyTagValue(tenantID TenantID, tagName string) map[u128]struct{} {
 	ids := is.getStreamIDsForTenant(tenantID)
 	idsForTag := is.getStreamIDsForTagName(tenantID, tagName)
@@ -394,6 +541,7 @@ func (is *indexSearch) getStreamIDsForEmptyTagValue(tenantID TenantID, tagName s
 	return ids
 }
 
+// getStreamIDsForTenant returns all stream IDs for a tenant.
 func (is *indexSearch) getStreamIDsForTenant(tenantID TenantID) map[u128]struct{} {
 	ids := make(map[u128]struct{})
 	ts := &is.ts
@@ -423,6 +571,7 @@ func (is *indexSearch) getStreamIDsForTenant(tenantID TenantID) map[u128]struct{
 	return ids
 }
 
+// getStreamIDsForTagName finds streams that have tagName with ANY value.
 func (is *indexSearch) getStreamIDsForTagName(tenantID TenantID, tagName string) map[u128]struct{} {
 	ids := make(map[u128]struct{})
 	var sp tagToStreamIDsRowParser
@@ -453,6 +602,7 @@ func (is *indexSearch) getStreamIDsForTagName(tenantID TenantID, tagName string)
 	return ids
 }
 
+// getStreamIDsForTagRegexp finds streams where tagName matches the regex.
 func (is *indexSearch) getStreamIDsForTagRegexp(tenantID TenantID, tagName string, re *regexutil.PromRegex) map[u128]struct{} {
 	ids := make(map[u128]struct{})
 	var sp tagToStreamIDsRowParser
@@ -475,6 +625,7 @@ func (is *indexSearch) getStreamIDsForTagRegexp(tenantID TenantID, tagName strin
 		if err != nil {
 			logger.Panicf("FATAL: cannot unmarshal tag value: %s", err)
 		}
+		// Optimization: skip regex check if same value as previous match
 		if !bytes.Equal(tagValue, prevMatchingTagValue) {
 			if !re.MatchString(bytesutil.ToUnsafeString(tagValue)) {
 				continue
@@ -490,6 +641,7 @@ func (is *indexSearch) getStreamIDsForTagRegexp(tenantID TenantID, tagName strin
 	return ids
 }
 
+// getTenantIDs returns all tenant IDs that have streams in this partition.
 func (is *indexSearch) getTenantIDs() []TenantID {
 	var tenantIDs []TenantID // return as result
 	var tenantID TenantID    // variable for unmarshal
@@ -531,6 +683,13 @@ func (is *indexSearch) getTenantIDs() []TenantID {
 	return tenantIDs
 }
 
+// ==================== Stream Registration ====================
+
+// mustRegisterStream adds a new stream to the index.
+// This creates three types of entries:
+//  1. Stream existence marker (nsPrefixStreamID)
+//  2. Stream ID to tags mapping (nsPrefixStreamIDToStreamTags)
+//  3. Tag to stream ID reverse entries (nsPrefixTagToStreamIDs) for each tag
 func (idb *indexdb) mustRegisterStream(streamID *streamID, streamTagsCanonical string) {
 	st := GetStreamTags()
 	mustUnmarshalStreamTags(st, streamTagsCanonical)
@@ -540,7 +699,7 @@ func (idb *indexdb) mustRegisterStream(streamID *streamID, streamTagsCanonical s
 	buf := bi.buf[:0]
 	items := bi.items[:0]
 
-	// Register tenantID:streamID entry.
+	// Register tenantID:streamID entry (existence marker).
 	bufLen := len(buf)
 	buf = marshalCommonPrefix(buf, nsPrefixStreamID, tenantID)
 	buf = streamID.id.marshal(buf)
@@ -553,7 +712,7 @@ func (idb *indexdb) mustRegisterStream(streamID *streamID, streamTagsCanonical s
 	buf = append(buf, streamTagsCanonical...)
 	items = append(items, buf[bufLen:])
 
-	// Register tenantID:name:value -> streamIDs entries.
+	// Register tenantID:name:value -> streamIDs entries for each tag.
 	tags := st.tags
 	for i := range tags {
 		bufLen = len(buf)
@@ -574,12 +733,18 @@ func (idb *indexdb) mustRegisterStream(streamID *streamID, streamTagsCanonical s
 	idb.streamsCreatedTotal.Add(1)
 }
 
+// ==================== Cache Management ====================
+
+// invalidateStreamFilterCache is called when new data is added to the index.
+// It increments the generation counter, invalidating all cached filter results.
 func (idb *indexdb) invalidateStreamFilterCache() {
 	// This function must be fast, since it is called each
 	// time new indexdb entry is added.
 	idb.filterStreamCacheGeneration.Add(1)
 }
 
+// marshalStreamFilterCacheKey creates a unique cache key for a stream filter query.
+// The key includes the cache generation, partition name, tenant IDs, and filter.
 func (idb *indexdb) marshalStreamFilterCacheKey(dst []byte, tenantIDs []TenantID, sf *StreamFilter) []byte {
 	dst = encoding.MarshalUint32(dst, idb.filterStreamCacheGeneration.Load())
 	dst = encoding.MarshalBytes(dst, bytesutil.ToUnsafeBytes(idb.partitionName))
@@ -591,6 +756,8 @@ func (idb *indexdb) marshalStreamFilterCacheKey(dst []byte, tenantIDs []TenantID
 	return dst
 }
 
+// loadStreamIDsFromCache attempts to load cached stream IDs for a filter query.
+// Returns (nil, false) on cache miss.
 func (idb *indexdb) loadStreamIDsFromCache(tenantIDs []TenantID, sf *StreamFilter) ([]streamID, bool) {
 	bb := bbPool.Get()
 	bb.B = idb.marshalStreamFilterCacheKey(bb.B[:0], tenantIDs, sf)
@@ -621,6 +788,7 @@ func (idb *indexdb) loadStreamIDsFromCache(tenantIDs []TenantID, sf *StreamFilte
 	return streamIDs, true
 }
 
+// storeStreamIDsToCache caches the result of a stream filter query.
 func (idb *indexdb) storeStreamIDsToCache(tenantIDs []TenantID, sf *StreamFilter, streamIDs []streamID) {
 	// marshal streamIDs
 	var b []byte
@@ -636,6 +804,7 @@ func (idb *indexdb) storeStreamIDsToCache(tenantIDs []TenantID, sf *StreamFilter
 	bbPool.Put(bb)
 }
 
+// searchTenants returns all tenant IDs with streams in this partition.
 func (idb *indexdb) searchTenants() []TenantID {
 	is := idb.getIndexSearch()
 	defer idb.putIndexSearch(is)
@@ -643,6 +812,10 @@ func (idb *indexdb) searchTenants() []TenantID {
 	return is.getTenantIDs()
 }
 
+// ==================== Helper Structures ====================
+
+// batchItems is a reusable buffer for batch index insertions.
+// Pooling reduces allocations during stream registration.
 type batchItems struct {
 	buf []byte
 
@@ -674,6 +847,23 @@ func putBatchItems(bi *batchItems) {
 
 var batchItemsPool sync.Pool
 
+// ==================== Tag-to-StreamIDs Merge Logic ====================
+//
+// When index entries are merged (during compaction), we optimize by combining
+// multiple tag-to-streamID entries that share the same (tenantID, tagName, tagValue).
+// This reduces storage overhead and improves query performance.
+
+// mergeTagToStreamIDsRows is a mergeset callback that combines tag-to-streamID entries.
+// During compaction, multiple entries like:
+//
+//	[tenantID][tag][value] -> [streamID1]
+//	[tenantID][tag][value] -> [streamID2]
+//
+// Are merged into:
+//
+//	[tenantID][tag][value] -> [streamID1][streamID2]
+//
+// This reduces the number of index entries while maintaining the same information.
 func mergeTagToStreamIDsRows(data []byte, items []mergeset.Item) ([]byte, []mergeset.Item) {
 	// Perform quick checks whether items contain rows starting from nsPrefixTagToStreamIDs
 	// based on the fact that items are sorted.
@@ -763,11 +953,11 @@ func mergeTagToStreamIDsRows(data []byte, items []mergeset.Item) ([]byte, []merg
 	return dstData, dstItems
 }
 
-// maxStreamIDsPerRow limits the number of streamIDs in tenantID:name:value -> streamIDs row.
-//
-// This reduces overhead on index and metaindex in lib/mergeset.
+// maxStreamIDsPerRow limits the number of streamIDs stored per tag-to-streamIDs row.
+// This prevents individual rows from becoming too large, which would hurt index performance.
 const maxStreamIDsPerRow = 32
 
+// u128Sorter implements sort.Interface for 128-bit IDs.
 type u128Sorter []u128
 
 func (s u128Sorter) Len() int { return len(s) }
@@ -778,6 +968,7 @@ func (s u128Sorter) Swap(i, j int) {
 	s[i], s[j] = s[j], s[i]
 }
 
+// tagToStreamIDsRowsMerger holds state for merging tag-to-streamID entries.
 type tagToStreamIDsRowsMerger struct {
 	pendingStreamIDs u128Sorter
 	sp               tagToStreamIDsRowParser
@@ -796,6 +987,7 @@ func (tsm *tagToStreamIDsRowsMerger) Reset() {
 	tsm.dataCopy = tsm.dataCopy[:0]
 }
 
+// flushPendingStreamIDs writes accumulated stream IDs as a merged index entry.
 func (tsm *tagToStreamIDsRowsMerger) flushPendingStreamIDs(dstData []byte, dstItems []mergeset.Item, sp *tagToStreamIDsRowParser) ([]byte, []mergeset.Item) {
 	if len(tsm.pendingStreamIDs) == 0 {
 		// Nothing to flush
@@ -820,6 +1012,7 @@ func (tsm *tagToStreamIDsRowsMerger) flushPendingStreamIDs(dstData []byte, dstIt
 	return dstData, dstItems
 }
 
+// removeDuplicateStreamIDs removes duplicates from a sorted slice of stream IDs.
 func removeDuplicateStreamIDs(sortedStreamIDs []u128) []u128 {
 	if len(sortedStreamIDs) < 2 {
 		return sortedStreamIDs
@@ -859,6 +1052,8 @@ func putTagToStreamIDsRowsMerger(tsm *tagToStreamIDsRowsMerger) {
 
 var tsmPool sync.Pool
 
+// tagToStreamIDsRowParser parses entries of the form:
+// [tenantID][tagName][tagValue][streamID1][streamID2]...
 type tagToStreamIDsRowParser struct {
 	// TenantID contains TenantID of the parsed row
 	TenantID TenantID
@@ -885,10 +1080,6 @@ func (sp *tagToStreamIDsRowParser) Reset() {
 }
 
 // Init initializes sp from b, which should contain encoded tenantID:name:value -> streamIDs row.
-//
-// b cannot be reused until Reset call.
-//
-// ParseStreamIDs() must be called later for obtaining sp.StreamIDs from the given tail.
 func (sp *tagToStreamIDsRowParser) Init(b []byte) error {
 	tail, nsPrefix, err := unmarshalCommonPrefix(&sp.TenantID, b)
 	if err != nil {
@@ -907,18 +1098,14 @@ func (sp *tagToStreamIDsRowParser) Init(b []byte) error {
 	return nil
 }
 
-// MarshalPrefix marshals row prefix without tail to dst.
+// MarshalPrefix marshals row prefix (tenantID + tag) without streamIDs.
 func (sp *tagToStreamIDsRowParser) MarshalPrefix(dst []byte) []byte {
 	dst = marshalCommonPrefix(dst, nsPrefixTagToStreamIDs, sp.TenantID)
 	dst = sp.Tag.indexdbMarshal(dst)
 	return dst
 }
 
-// InitOnlyTail initializes sp.tail from tail, which must contain streamIDs.
-//
-// tail cannot be reused until Reset call.
-//
-// ParseStreamIDs() must be called later for obtaining sp.StreamIDs from the given tail.
+// InitOnlyTail initializes sp.tail from a byte slice containing just streamIDs.
 func (sp *tagToStreamIDsRowParser) InitOnlyTail(tail []byte) error {
 	if len(tail) == 0 {
 		return fmt.Errorf("missing streamID in the tenantID:name:value -> streamIDs row")
@@ -931,9 +1118,7 @@ func (sp *tagToStreamIDsRowParser) InitOnlyTail(tail []byte) error {
 	return nil
 }
 
-// EqualPrefix returns true if prefixes for sp and x are equal.
-//
-// Prefix contains (tenantID:name:value)
+// EqualPrefix returns true if two rows have the same (tenantID, tagName, tagValue).
 func (sp *tagToStreamIDsRowParser) EqualPrefix(x *tagToStreamIDsRowParser) bool {
 	if !sp.TenantID.Equal(&x.TenantID) {
 		return false
@@ -944,12 +1129,12 @@ func (sp *tagToStreamIDsRowParser) EqualPrefix(x *tagToStreamIDsRowParser) bool 
 	return true
 }
 
-// StreamIDsLen returns the number of StreamIDs in the sp.tail
+// StreamIDsLen returns the number of streamIDs in the row (without parsing them).
 func (sp *tagToStreamIDsRowParser) StreamIDsLen() int {
 	return len(sp.tail) / 16
 }
 
-// ParseStreamIDs parses StreamIDs from sp.tail into sp.StreamIDs.
+// ParseStreamIDs parses the stream IDs from tail into sp.StreamIDs.
 func (sp *tagToStreamIDsRowParser) ParseStreamIDs() {
 	if sp.streamIDsParsed {
 		return
@@ -969,6 +1154,7 @@ func (sp *tagToStreamIDsRowParser) ParseStreamIDs() {
 	sp.streamIDsParsed = true
 }
 
+// UpdateStreamIDs adds stream IDs from tail to the provided map.
 func (sp *tagToStreamIDsRowParser) UpdateStreamIDs(ids map[u128]struct{}, tail []byte) {
 	sp.Reset()
 	if err := sp.InitOnlyTail(tail); err != nil {
@@ -980,16 +1166,20 @@ func (sp *tagToStreamIDsRowParser) UpdateStreamIDs(ids map[u128]struct{}, tail [
 	}
 }
 
-// commonPrefixLen is the length of common prefix for indexdb rows
-// 1 byte for ns* prefix + 8 bytes for tenantID
+// ==================== Key Encoding Utilities ====================
+
+// commonPrefixLen is the length of the common prefix for all indexdb rows.
+// Format: [1 byte namespace prefix] + [8 bytes tenant ID]
 const commonPrefixLen = 1 + 8
 
+// marshalCommonPrefix writes the namespace prefix and tenant ID to dst.
 func marshalCommonPrefix(dst []byte, nsPrefix byte, tenantID TenantID) []byte {
 	dst = append(dst, nsPrefix)
 	dst = tenantID.marshal(dst)
 	return dst
 }
 
+// unmarshalCommonPrefix extracts the namespace prefix and tenant ID from src.
 func unmarshalCommonPrefix(dstTenantID *TenantID, src []byte) ([]byte, byte, error) {
 	if len(src) < commonPrefixLen {
 		return nil, 0, fmt.Errorf("cannot unmarshal common prefix from %d bytes; need at least %d bytes; data=%X", len(src), commonPrefixLen, src)
@@ -1003,6 +1193,7 @@ func unmarshalCommonPrefix(dstTenantID *TenantID, src []byte) ([]byte, byte, err
 	return tail, prefix, nil
 }
 
+// checkItemsSorted verifies that items are in sorted order.
 func checkItemsSorted(data []byte, items []mergeset.Item) bool {
 	if len(items) == 0 {
 		return true
