@@ -52,48 +52,48 @@ localStorage.MustAddRows(lr)              pushToRemoteStorages(lr)
 ## Complete Data Flow
 
 **Key Files**:
-- [`app/vlagent/main.go`](../app/vlagent/main.go#L34) - Entry point
-- [`app/vlagent/kubernetescollector/kubernetes.go`](../app/vlagent/kubernetescollector/kubernetes.go#L36) - Kubernetes collector init
-- [`app/vlagent/kubernetescollector/collector.go`](../app/vlagent/kubernetescollector/collector.go#L43) - Pod discovery and watching
-- [`app/vlagent/kubernetescollector/file_collector.go`](../app/vlagent/kubernetescollector/file_collector.go#L63) - File monitoring
-- [`app/vlagent/kubernetescollector/logfile.go`](../app/vlagent/kubernetescollector/logfile.go#L22) - Log file reading
-- [`app/vlagent/kubernetescollector/processor.go`](../app/vlagent/kubernetescollector/processor.go#L50) - Log processing
-- [`app/vlagent/remotewrite/remotewrite.go`](../app/vlagent/remotewrite/remotewrite.go#L48) - Remote write orchestration
-- [`app/vlagent/remotewrite/pendinglogrows.go`](../app/vlagent/remotewrite/pendinglogrows.go#L27) - Batching and compression
-- [`app/vlagent/remotewrite/client.go`](../app/vlagent/remotewrite/client.go#L66) - HTTP client with retry
+- [`app/vlagent/main.go`](../app/vlagent/main.go#L93) - Entry point
+- [`app/vlagent/kubernetescollector/kubernetes.go`](../app/vlagent/kubernetescollector/kubernetes.go#L101) - Kubernetes collector init
+- [`app/vlagent/kubernetescollector/collector.go`](../app/vlagent/kubernetescollector/collector.go#L72) - Pod discovery and watching
+- [`app/vlagent/kubernetescollector/file_collector.go`](../app/vlagent/kubernetescollector/file_collector.go#L95) - File monitoring
+- [`app/vlagent/kubernetescollector/logfile.go`](../app/vlagent/kubernetescollector/logfile.go#L23) - Log file reading
+- [`app/vlagent/kubernetescollector/processor.go`](../app/vlagent/kubernetescollector/processor.go#L74) - Log processing
+- [`app/vlagent/remotewrite/remotewrite.go`](../app/vlagent/remotewrite/remotewrite.go#L102) - Remote write orchestration
+- [`app/vlagent/remotewrite/pendinglogrows.go`](../app/vlagent/remotewrite/pendinglogrows.go#L35) - Batching and compression
+- [`app/vlagent/remotewrite/client.go`](../app/vlagent/remotewrite/client.go#L78) - HTTP client with retry
 
 ```
 Kubernetes API (watch /api/v1/pods)
     ↓
-kubernetesCollector.watchForPodsUpdates  [collector.go:95](../app/vlagent/kubernetescollector/collector.go#L95)
+kubernetesCollector.watchForPodsUpdates  [collector.go:150](../app/vlagent/kubernetescollector/collector.go#L150)
     ↓
-startReadPodLogs(pod)                    [collector.go:189](../app/vlagent/kubernetescollector/collector.go#L189)
+startReadPodLogs(pod)                    [collector.go:274](../app/vlagent/kubernetescollector/collector.go#L274)
     ↓
-getCommonFields(node, pod, cs)           [collector.go:217](../app/vlagent/kubernetescollector/collector.go#L217)
+getCommonFields(node, pod, cs)           [collector.go:322](../app/vlagent/kubernetescollector/collector.go#L322)
     ↓
-fileCollector.startRead(filePath, fields) [file_collector.go:78](../app/vlagent/kubernetescollector/file_collector.go#L78)
+fileCollector.startRead(filePath, fields) [file_collector.go:124](../app/vlagent/kubernetescollector/file_collector.go#L124)
     ↓
-logFile.readLines(stopCh, proc)          [logfile.go:90](../app/vlagent/kubernetescollector/logfile.go#L90)
+logFile.readLines(stopCh, proc)          [logfile.go:146](../app/vlagent/kubernetescollector/logfile.go#L146)
     ↓
-logFileProcessor.tryAddLine(line)        [processor.go:100](../app/vlagent/kubernetescollector/processor.go#L100)
+logFileProcessor.tryAddLine(line)        [processor.go:175](../app/vlagent/kubernetescollector/processor.go#L175)
     ↓
-parseCRILine(line) / parseCRILineJSON    [processor.go:426](../app/vlagent/kubernetescollector/processor.go#L426)  ([CRI](./glossary.md#cri))
+parseCRILine(line) / parseCRILineJSON    [processor.go:610](../app/vlagent/kubernetescollector/processor.go#L610)  ([CRI](./glossary.md#cri))
     ↓
-parseLogRowContent (JSON / klog)         [processor.go:226](../app/vlagent/kubernetescollector/processor.go#L226)
+parseLogRowContent (JSON / klog)         [processor.go:360](../app/vlagent/kubernetescollector/processor.go#L360)
     ↓
-addRow(timestamp, fields)                [processor.go:216](../app/vlagent/kubernetescollector/processor.go#L216)
+addRow(timestamp, fields)                [processor.go:331](../app/vlagent/kubernetescollector/processor.go#L331)
     ↓
-remotewrite.Storage.MustAddRows(lr)      [remotewrite.go:51](../app/vlagent/remotewrite/remotewrite.go#L51)
+remotewrite.Storage.MustAddRows(lr)      [remotewrite.go:114](../app/vlagent/remotewrite/remotewrite.go#L114)
     ↓
-pushToRemoteStorages(lr)                 [remotewrite.go:170](../app/vlagent/remotewrite/remotewrite.go#L170)
+pushToRemoteStorages(lr)                 [remotewrite.go:268](../app/vlagent/remotewrite/remotewrite.go#L268)
     ↓
-pendingLogs.add(lr) → marshal + zstd    [pendinglogrows.go:52](../app/vlagent/remotewrite/pendinglogrows.go#L52)
+pendingLogs.add(lr) → marshal + zstd    [pendinglogrows.go:90](../app/vlagent/remotewrite/pendinglogrows.go#L90)
     ↓
-persistentqueue.FastQueue.TryWriteBlock  [pendinglogrows.go:75](../app/vlagent/remotewrite/pendinglogrows.go#L75)
+persistentqueue.FastQueue.TryWriteBlock  [pendinglogrows.go:129](../app/vlagent/remotewrite/pendinglogrows.go#L129)
     ↓
-client.runWorker → fq.MustReadBlock      [client.go:232](../app/vlagent/remotewrite/client.go#L232)
+client.runWorker → fq.MustReadBlock      [client.go:318](../app/vlagent/remotewrite/client.go#L318)
     ↓
-sendBlockHTTP(block)                     [client.go:326](../app/vlagent/remotewrite/client.go#L326)
+sendBlockHTTP(block)                     [client.go:434](../app/vlagent/remotewrite/client.go#L434)
     ↓
 POST http://<victorialogs>:9428/insert/native?version=v1
     Content-Encoding: zstd
@@ -106,11 +106,11 @@ POST http://<victorialogs>:9428/insert/native?version=v1
 
 ### 1. Entry Point & Initialization
 
-**File**: [`app/vlagent/main.go`](../app/vlagent/main.go#L34)
+**File**: [`app/vlagent/main.go`](../app/vlagent/main.go#L93)
 
 **Key Functions**:
-- [`main()`](../app/vlagent/main.go#L34) - Entry point
-- [`requestHandler(w, r)`](../app/vlagent/main.go#L79) - HTTP request handler
+- [`main()`](../app/vlagent/main.go#L93) - Entry point
+- [`requestHandler(w, r)`](../app/vlagent/main.go#L182) - HTTP request handler
 
 The initialization order is important — remote write must be ready before any log collection begins:
 
@@ -143,7 +143,7 @@ remotewrite.Stop()
 
 **Key design choice**: vlagent reuses the full `vlinsert` package. This means external clients can also push logs directly to vlagent via any supported protocol (Elasticsearch, Loki, OTLP, etc.) on port 9429, and vlagent will forward them to the configured `-remoteWrite.url` destinations. The Kubernetes collector is just one data source among potentially many.
 
-**Location**: [`app/vlagent/main.go:34-76`](../app/vlagent/main.go#L34)
+**Location**: [`app/vlagent/main.go:93-170`](../app/vlagent/main.go#L93)
 
 ---
 
@@ -152,10 +152,10 @@ remotewrite.Stop()
 **File**: [`app/vlagent/kubernetescollector/collector.go`](../app/vlagent/kubernetescollector/collector.go#L22)
 
 **Key Functions**:
-- [`startKubernetesCollector(client, nodeName, logsPath, checkpointsPath, excludeFilter)`](../app/vlagent/kubernetescollector/collector.go#L43) - Start the collector
-- [`watchForPodsUpdates(ctx, resourceVersion)`](../app/vlagent/kubernetescollector/collector.go#L95) - Continuous pod watch loop
-- [`startReadPodLogs(pod)`](../app/vlagent/kubernetescollector/collector.go#L189) - Start log collection for a pod
-- [`getCommonFields(node, pod, cs)`](../app/vlagent/kubernetescollector/collector.go#L217) - Build Kubernetes metadata fields
+- [`startKubernetesCollector(client, nodeName, logsPath, checkpointsPath, excludeFilter)`](../app/vlagent/kubernetescollector/collector.go#L72) - Start the collector
+- [`watchForPodsUpdates(ctx, resourceVersion)`](../app/vlagent/kubernetescollector/collector.go#L150) - Continuous pod watch loop
+- [`startReadPodLogs(pod)`](../app/vlagent/kubernetescollector/collector.go#L274) - Start log collection for a pod
+- [`getCommonFields(node, pod, cs)`](../app/vlagent/kubernetescollector/collector.go#L322) - Build Kubernetes metadata fields
 
 ```go
 type kubernetesCollector struct {
@@ -178,7 +178,7 @@ type kubernetesCollector struct {
 
 #### Watch reconnection with backoff
 
-The watch loop uses a [`backoffTimer`](../app/vlagent/kubernetescollector/backoff_timer.go#L11) (200ms–30s exponential with jitter) to handle API server disconnections:
+The watch loop uses a [`backoffTimer`](../app/vlagent/kubernetescollector/backoff_timer.go#L10) (200ms–30s exponential with jitter) to handle API server disconnections:
 
 ```go
 func (kc *kubernetesCollector) watchForPodsUpdates(ctx context.Context, resourceVersion string) {
@@ -200,7 +200,7 @@ The watch also handles `410 Gone` responses (stale `resourceVersion`) by resetti
 
 #### Metadata enrichment
 
-[`getCommonFields()`](../app/vlagent/kubernetescollector/collector.go#L217) builds the following fields for each container, matching the Vector.dev `kubernetes_source` schema:
+[`getCommonFields()`](../app/vlagent/kubernetescollector/collector.go#L322) builds the following fields for each container, matching the Vector.dev `kubernetes_source` schema:
 
 | Field | Source |
 |-------|--------|
@@ -217,19 +217,19 @@ The watch also handles `410 Gone` responses (stale `resourceVersion`) by resetti
 
 Labels/annotations inclusion is controlled by `-kubernetesCollector.includePodLabels` (default: true), `-kubernetesCollector.includePodAnnotations` (default: false), etc.
 
-**Location**: [`app/vlagent/kubernetescollector/collector.go:22-272`](../app/vlagent/kubernetescollector/collector.go#L22)
+**Location**: [`app/vlagent/kubernetescollector/collector.go:22-411`](../app/vlagent/kubernetescollector/collector.go#L22)
 
 ---
 
 ### 3. Kubernetes Collector — File Collection
 
-**File**: [`app/vlagent/kubernetescollector/file_collector.go`](../app/vlagent/kubernetescollector/file_collector.go#L38)
+**File**: [`app/vlagent/kubernetescollector/file_collector.go`](../app/vlagent/kubernetescollector/file_collector.go#L48)
 
 **Key Functions**:
-- [`startFileCollector(checkpointsPath, excludeFilter, newProcessor)`](../app/vlagent/kubernetescollector/file_collector.go#L63) - Start file monitoring
-- [`startRead(filepath, commonFields)`](../app/vlagent/kubernetescollector/file_collector.go#L78) - Begin tailing a log file
-- [`process(lf, commonFields)`](../app/vlagent/kubernetescollector/file_collector.go#L181) - Main file processing loop
-- [`tryResumeFromCheckpoint(filepath, cp)`](../app/vlagent/kubernetescollector/file_collector.go#L109) - Resume from saved offset
+- [`startFileCollector(checkpointsPath, excludeFilter, newProcessor)`](../app/vlagent/kubernetescollector/file_collector.go#L95) - Start file monitoring
+- [`startRead(filepath, commonFields)`](../app/vlagent/kubernetescollector/file_collector.go#L124) - Begin tailing a log file
+- [`process(lf, commonFields)`](../app/vlagent/kubernetescollector/file_collector.go#L283) - Main file processing loop
+- [`tryResumeFromCheckpoint(filepath, cp)`](../app/vlagent/kubernetescollector/file_collector.go#L184) - Resume from saved offset
 
 ```go
 type fileCollector struct {
@@ -245,7 +245,7 @@ type fileCollector struct {
 
 #### One goroutine per container
 
-When `startRead()` is called for a new file, a dedicated goroutine is spawned to run the [`process()`](../app/vlagent/kubernetescollector/file_collector.go#L181) loop. This goroutine runs for the lifetime of the container.
+When `startRead()` is called for a new file, a dedicated goroutine is spawned to run the [`process()`](../app/vlagent/kubernetescollector/file_collector.go#L283) loop. This goroutine runs for the lifetime of the container.
 
 #### The process() loop
 
@@ -288,7 +288,7 @@ func (fc *fileCollector) process(lf *logFile, commonFields []logstorage.Field) {
 
 #### File rotation detection
 
-**File**: [`app/vlagent/kubernetescollector/logfile.go`](../app/vlagent/kubernetescollector/logfile.go#L282)
+**File**: [`app/vlagent/kubernetescollector/logfile.go`](../app/vlagent/kubernetescollector/logfile.go#L419)
 
 Kubernetes container log files are symlinks in `/var/log/containers/` that point to the actual log files under `/var/log/pods/`. When kubelet rotates logs, it creates a new file with a new inode. vlagent detects rotation by comparing inodes:
 
@@ -318,20 +318,20 @@ var (
 )
 ```
 
-**Location**: [`app/vlagent/kubernetescollector/file_collector.go:38-345`](../app/vlagent/kubernetescollector/file_collector.go#L38)
+**Location**: [`app/vlagent/kubernetescollector/file_collector.go:48-539`](../app/vlagent/kubernetescollector/file_collector.go#L48)
 
 ---
 
 ### 4. Log Processing & Metadata Enrichment
 
-**File**: [`app/vlagent/kubernetescollector/processor.go`](../app/vlagent/kubernetescollector/processor.go#L20)
+**File**: [`app/vlagent/kubernetescollector/processor.go`](../app/vlagent/kubernetescollector/processor.go#L74)
 
 **Key Functions**:
-- [`tryAddLine(logLine)`](../app/vlagent/kubernetescollector/processor.go#L100) - Parse and process a log line
-- [`addLineInternal(criTimestamp, line)`](../app/vlagent/kubernetescollector/processor.go#L190) - Parse content and route to storage
-- [`addRow(timestamp, fields)`](../app/vlagent/kubernetescollector/processor.go#L216) - Merge metadata fields and send to storage
-- [`parseCRILine(b)`](../app/vlagent/kubernetescollector/processor.go#L426) - Parse CRI format log lines
-- [`parseCRILineJSON(parser, b)`](../app/vlagent/kubernetescollector/processor.go#L467) - Parse Docker json-file format
+- [`tryAddLine(logLine)`](../app/vlagent/kubernetescollector/processor.go#L175) - Parse and process a log line
+- [`addLineInternal(criTimestamp, line)`](../app/vlagent/kubernetescollector/processor.go#L294) - Parse content and route to storage
+- [`addRow(timestamp, fields)`](../app/vlagent/kubernetescollector/processor.go#L331) - Merge metadata fields and send to storage
+- [`parseCRILine(b)`](../app/vlagent/kubernetescollector/processor.go#L610) - Parse CRI format log lines
+- [`parseCRILineJSON(parser, b)`](../app/vlagent/kubernetescollector/processor.go#L662) - Parse Docker json-file format
 
 #### The `processor` interface
 
@@ -345,7 +345,7 @@ type processor interface {
 }
 ```
 
-The [`logFileProcessor`](../app/vlagent/kubernetescollector/processor.go#L50) is the concrete implementation:
+The [`logFileProcessor`](../app/vlagent/kubernetescollector/processor.go#L74) is the concrete implementation:
 
 ```go
 type logFileProcessor struct {
@@ -397,20 +397,20 @@ I0214 10:30:00.123456 12345 main.go:42] Starting server
 
 Parsed into fields: `level=INFO`, `thread_id=12345`, `source_line=main.go:42`, `_msg=Starting server`.
 
-**Location**: [`app/vlagent/kubernetescollector/processor.go:50-602`](../app/vlagent/kubernetescollector/processor.go#L50)
+**Location**: [`app/vlagent/kubernetescollector/processor.go:74-804`](../app/vlagent/kubernetescollector/processor.go#L74)
 
 ---
 
 ### 5. Checkpoint System
 
-**File**: [`app/vlagent/kubernetescollector/checkpoints_db.go`](../app/vlagent/kubernetescollector/checkpoints_db.go#L23)
+**File**: [`app/vlagent/kubernetescollector/checkpoints_db.go`](../app/vlagent/kubernetescollector/checkpoints_db.go#L17)
 
 **Key Functions**:
-- [`startCheckpointsDB(path)`](../app/vlagent/kubernetescollector/checkpoints_db.go#L35) - Start checkpoint persistence
-- [`set(cp)`](../app/vlagent/kubernetescollector/checkpoints_db.go#L71) - Update checkpoint for a file
-- [`get(path)`](../app/vlagent/kubernetescollector/checkpoints_db.go#L78) - Retrieve checkpoint for a file
-- [`mustSync()`](../app/vlagent/kubernetescollector/checkpoints_db.go#L105) - Persist all checkpoints to disk
-- [`readCheckpoints(path)`](../app/vlagent/kubernetescollector/checkpoints_db.go#L120) - Load checkpoints from disk
+- [`startCheckpointsDB(path)`](../app/vlagent/kubernetescollector/checkpoints_db.go#L54) - Start checkpoint persistence
+- [`set(cp)`](../app/vlagent/kubernetescollector/checkpoints_db.go#L111) - Update checkpoint for a file
+- [`get(path)`](../app/vlagent/kubernetescollector/checkpoints_db.go#L120) - Retrieve checkpoint for a file
+- [`mustSync()`](../app/vlagent/kubernetescollector/checkpoints_db.go#L155) - Persist all checkpoints to disk
+- [`readCheckpoints(path)`](../app/vlagent/kubernetescollector/checkpoints_db.go#L177) - Load checkpoints from disk
 
 The checkpoint system persists the exact read position for each log file, enabling best-effort crash recovery with minimal duplication.
 
@@ -440,23 +440,23 @@ When vlagent restarts and finds a checkpoint for a file:
 4. Verify the file fingerprint (xxhash of first line) to detect inode reuse
 5. If everything matches, seek to the checkpointed offset and continue reading
 
-This is handled in [`tryResumeFromCheckpoint()`](../app/vlagent/kubernetescollector/file_collector.go#L109).
+This is handled in [`tryResumeFromCheckpoint()`](../app/vlagent/kubernetescollector/file_collector.go#L184).
 
 If the rotated file cannot be found (or fingerprint validation fails), vlagent logs a warning and resumes from the current file, so some historical lines may be lost.
 
-**Location**: [`app/vlagent/kubernetescollector/checkpoints_db.go:23-167`](../app/vlagent/kubernetescollector/checkpoints_db.go#L23)
+**Location**: [`app/vlagent/kubernetescollector/checkpoints_db.go:17-230`](../app/vlagent/kubernetescollector/checkpoints_db.go#L17)
 
 ---
 
 ### 6. Remote Write — Batching & Queuing
 
-**File**: [`app/vlagent/remotewrite/remotewrite.go`](../app/vlagent/remotewrite/remotewrite.go#L48)
+**File**: [`app/vlagent/remotewrite/remotewrite.go`](../app/vlagent/remotewrite/remotewrite.go#L102)
 
 **Key Functions**:
-- [`Init(tmpDataPath)`](../app/vlagent/remotewrite/remotewrite.go#L79) - Initialize remote write contexts
-- [`Stop()`](../app/vlagent/remotewrite/remotewrite.go#L100) - Flush and stop
-- [`pushToRemoteStorages(lr)`](../app/vlagent/remotewrite/remotewrite.go#L170) - Distribute to all URLs
-- [`newRemoteWriteCtx(argIdx, url, maxInmemoryBlocks, sanitizedURL, tmpDataPath)`](../app/vlagent/remotewrite/remotewrite.go#L198) - Create a per-URL context
+- [`Init(tmpDataPath)`](../app/vlagent/remotewrite/remotewrite.go#L148) - Initialize remote write contexts
+- [`Stop()`](../app/vlagent/remotewrite/remotewrite.go#L174) - Flush and stop
+- [`pushToRemoteStorages(lr)`](../app/vlagent/remotewrite/remotewrite.go#L268) - Distribute to all URLs
+- [`newRemoteWriteCtx(argIdx, url, maxInmemoryBlocks, sanitizedURL, tmpDataPath)`](../app/vlagent/remotewrite/remotewrite.go#L316) - Create a per-URL context
 
 #### Storage interface
 
@@ -500,12 +500,12 @@ func pushToRemoteStorages(lr *logstorage.LogRows) {
 
 #### Batching layer (pendingLogs)
 
-**File**: [`app/vlagent/remotewrite/pendinglogrows.go`](../app/vlagent/remotewrite/pendinglogrows.go#L27)
+**File**: [`app/vlagent/remotewrite/pendinglogrows.go`](../app/vlagent/remotewrite/pendinglogrows.go#L35)
 
 **Key Functions**:
-- [`add(lr)`](../app/vlagent/remotewrite/pendinglogrows.go#L52) - Add log rows to the pending buffer
-- [`mustFlushLocked()`](../app/vlagent/remotewrite/pendinglogrows.go#L72) - Compress and write to persistent queue
-- [`periodicFlusher()`](../app/vlagent/remotewrite/pendinglogrows.go#L82) - Background flush timer
+- [`add(lr)`](../app/vlagent/remotewrite/pendinglogrows.go#L90) - Add log rows to the pending buffer
+- [`mustFlushLocked()`](../app/vlagent/remotewrite/pendinglogrows.go#L123) - Compress and write to persistent queue
+- [`periodicFlusher()`](../app/vlagent/remotewrite/pendinglogrows.go#L145) - Background flush timer
 
 ```go
 type pendingLogs struct {
@@ -548,20 +548,20 @@ The `persistentqueue.FastQueue` (from VictoriaMetrics shared lib) provides a two
 
 When disk is full and writes are blocked, the queue drops the oldest data.
 
-**Location**: [`app/vlagent/remotewrite/remotewrite.go:48-281`](../app/vlagent/remotewrite/remotewrite.go#L48)
+**Location**: [`app/vlagent/remotewrite/remotewrite.go:102-423`](../app/vlagent/remotewrite/remotewrite.go#L102)
 
 ---
 
 ### 7. Remote Write — HTTP Client & Retry
 
-**File**: [`app/vlagent/remotewrite/client.go`](../app/vlagent/remotewrite/client.go#L66)
+**File**: [`app/vlagent/remotewrite/client.go`](../app/vlagent/remotewrite/client.go#L78)
 
 **Key Functions**:
-- [`newHTTPClient(argIdx, url, sanitizedURL, fq, concurrency)`](../app/vlagent/remotewrite/client.go#L95) - Create HTTP client
-- [`init(argIdx, concurrency, sanitizedURL)`](../app/vlagent/remotewrite/client.go#L137) - Start worker goroutines
-- [`runWorker()`](../app/vlagent/remotewrite/client.go#L232) - Worker loop: read from queue, send blocks
-- [`sendBlockHTTP(block)`](../app/vlagent/remotewrite/client.go#L326) - Send a single block with retry
-- [`getRetryDuration(retryAfter, retryDuration, maxRetryDuration)`](../app/vlagent/remotewrite/client.go#L407) - Exponential backoff calculation
+- [`newHTTPClient(argIdx, url, sanitizedURL, fq, concurrency)`](../app/vlagent/remotewrite/client.go#L142) - Create HTTP client
+- [`init(argIdx, concurrency, sanitizedURL)`](../app/vlagent/remotewrite/client.go#L193) - Start worker goroutines
+- [`runWorker()`](../app/vlagent/remotewrite/client.go#L318) - Worker loop: read from queue, send blocks
+- [`sendBlockHTTP(block)`](../app/vlagent/remotewrite/client.go#L434) - Send a single block with retry
+- [`getRetryDuration(retryAfter, retryDuration, maxRetryDuration)`](../app/vlagent/remotewrite/client.go#L533) - Exponential backoff calculation
 
 ```go
 type client struct {
@@ -644,7 +644,7 @@ Optional per-URL rate limiting via `-remoteWrite.rateLimit` (bytes/second). When
 
 Supports basic auth, bearer token, OAuth2, custom headers, and TLS client certificates. All configured via `-remoteWrite.*` flags and managed through VictoriaMetrics' `promauth` library.
 
-**Location**: [`app/vlagent/remotewrite/client.go:66-458`](../app/vlagent/remotewrite/client.go#L66)
+**Location**: [`app/vlagent/remotewrite/client.go:78-591`](../app/vlagent/remotewrite/client.go#L78)
 
 ---
 
@@ -663,9 +663,9 @@ Each stage can be tuned independently (concurrency limits, backoff timers, buffe
 ### 2. Exponential Backoff with Jitter
 
 Used in three places:
-- **Kubernetes watch reconnection**: 200ms–30s ([`backoff_timer.go`](../app/vlagent/kubernetescollector/backoff_timer.go#L11))
-- **File polling**: 100ms–10s ([`file_collector.go:190`](../app/vlagent/kubernetescollector/file_collector.go#L190))
-- **HTTP retry**: configurable min/max ([`client.go:326`](../app/vlagent/remotewrite/client.go#L326))
+- **Kubernetes watch reconnection**: 200ms–30s ([`backoff_timer.go`](../app/vlagent/kubernetescollector/backoff_timer.go#L10))
+- **File polling**: 100ms–10s ([`file_collector.go:296`](../app/vlagent/kubernetescollector/file_collector.go#L296))
+- **HTTP retry**: configurable min/max ([`client.go:434`](../app/vlagent/remotewrite/client.go#L434))
 
 All use `timeutil.AddJitterToDuration()` (up to +10% positive jitter, max +10s) to prevent synchronized retry storms across agents.
 
@@ -847,26 +847,26 @@ All file and line number references must use the following format:
 **1. Section Headers - File References**
 
 ```markdown
-**File**: [`app/vlagent/main.go`](../app/vlagent/main.go#L34)
+**File**: [`app/vlagent/main.go`](../app/vlagent/main.go#L93)
 ```
 
 **2. Function References in Key Functions Lists**
 
 ```markdown
 **Key Functions**:
-- [`Init(tmpDataPath)`](../app/vlagent/remotewrite/remotewrite.go#L79) - Initialize remote write
+- [`Init(tmpDataPath)`](../app/vlagent/remotewrite/remotewrite.go#L148) - Initialize remote write
 ```
 
 **3. Flow Diagram References**
 
 ```markdown
-logFile.readLines(stopCh, proc)          [logfile.go:90](../app/vlagent/kubernetescollector/logfile.go#L90)
+logFile.readLines(stopCh, proc)          [logfile.go:146](../app/vlagent/kubernetescollector/logfile.go#L146)
 ```
 
 **4. Location References**
 
 ```markdown
-**Location**: [`app/vlagent/remotewrite/client.go:66-458`](../app/vlagent/remotewrite/client.go#L66)
+**Location**: [`app/vlagent/remotewrite/client.go:78-591`](../app/vlagent/remotewrite/client.go#L78)
 ```
 
 #### Line Number Selection
@@ -883,16 +883,16 @@ When linking to code:
 
 Correct:
 ```markdown
-- [`Init(tmpDataPath)`](../app/vlagent/remotewrite/remotewrite.go#L79) - Initialize remote write
-- **File**: [`client.go`](../app/vlagent/remotewrite/client.go#L66)
-- [pendinglogrows.go:72](../app/vlagent/remotewrite/pendinglogrows.go#L72)
+- [`Init(tmpDataPath)`](../app/vlagent/remotewrite/remotewrite.go#L148) - Initialize remote write
+- **File**: [`client.go`](../app/vlagent/remotewrite/client.go#L78)
+- [pendinglogrows.go:123](../app/vlagent/remotewrite/pendinglogrows.go#L123)
 ```
 
 Incorrect:
 ```markdown
 - `Init(tmpDataPath)` - Initialize remote write (line 79)  # Not clickable
 - **File**: `client.go` (line 66)  # Not clickable
-- [pendinglogrows.go:72](../app/vlagent/remotewrite/pendinglogrows.go#72)  # Missing L prefix
+- [pendinglogrows.go:123](../app/vlagent/remotewrite/pendinglogrows.go#123)  # Missing L prefix
 ```
 
 #### Updating File References
