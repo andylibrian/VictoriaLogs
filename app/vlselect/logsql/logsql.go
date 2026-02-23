@@ -1,3 +1,41 @@
+// Package logsql implements the HTTP handlers for all /select/logsql/* query endpoints.
+//
+// This package is responsible for:
+//   - Parsing HTTP request parameters into LogsQL queries
+//   - Transforming queries for specific endpoint needs (e.g., adding stats pipes for hits)
+//   - Executing queries via vlstorage.RunQuery()
+//   - Formatting results as JSON responses
+//
+// Query Endpoint Categories:
+//
+// 1. Log Query Endpoints:
+//   - /select/logsql/query: Stream matching logs as NDJSON
+//   - /select/logsql/tail: Live tailing for real-time log streaming
+//
+// 2. Aggregation Endpoints:
+//   - /select/logsql/hits: Hit counts over time buckets
+//   - /select/logsql/stats_query: Instant statistics (Prometheus-style)
+//   - /select/logsql/stats_query_range: Range statistics (Prometheus-style)
+//   - /select/logsql/facets: Field value facets with hit counts
+//
+// 3. Metadata Endpoints:
+//   - /select/logsql/field_names: List field names
+//   - /select/logsql/field_values: List unique values for a field
+//   - /select/logsql/streams: List log streams
+//   - /select/logsql/stream_ids: List internal stream IDs
+//   - /select/logsql/stream_field_names: List stream field names
+//   - /select/logsql/stream_field_values: List stream field values
+//
+// Common Request Pattern:
+//
+// All endpoints (except query_time_range and tenant_ids) follow this pattern:
+//  1. Parse common args via parseCommonArgs() (query, tenant, time range, etc.)
+//  2. Optionally modify the query (add pipes, drop pipes)
+//  3. Create a writeBlock callback to collect results
+//  4. Execute via vlstorage.RunQuery()
+//  5. Format and write JSON response
+//
+// See onboarding/onboarding-select-flow.md for the complete query flow documentation.
 package logsql
 
 import (
@@ -31,9 +69,18 @@ import (
 )
 
 var (
+	// maxQueryTimeRange limits the maximum time range allowed in queries.
+	// This prevents resource exhaustion from queries spanning years of data.
+	// Set to 0 (default) for unlimited time range.
 	maxQueryTimeRange = flagutil.NewExtendedDuration("search.maxQueryTimeRange", "0", "The maximum time range, which can be set in the query sent to querying APIs. "+
 		"Queries with bigger time ranges are rejected. See https://docs.victoriametrics.com/victorialogs/querying/#resource-usage-limits")
 
+	// allowPartialResponseFlag controls behavior in cluster mode when some
+	// vlstorage nodes are unavailable:
+	//   - false (default): Return error if any node is unavailable
+	//   - true: Return partial results from available nodes
+	//
+	// This trades completeness for availability during node outages.
 	allowPartialResponseFlag = flag.Bool("search.allowPartialResponse", false, "Whether to allow returning partial responses when some of vlstorage nodes "+
 		"from the -storageNode list are unavailable for querying. This flag works only for cluster setup of VictoriaLogs. "+
 		"See https://docs.victoriametrics.com/victorialogs/querying/#partial-responses")
@@ -41,9 +88,9 @@ var (
 
 // ProcessQueryTimeRangeRequest handles /select/logsql/query_time_range request.
 //
-// This request returns JSON object with "start" and "end" fields containing
-// the really selected time range by the provided query in RFC3339Nano format.
-// This is needed for https://github.com/VictoriaMetrics/VictoriaLogs/issues/558#issuecomment-3527811816
+// This endpoint returns the effective time range that a query would scan,
+// WITHOUT actually executing the query. It's useful for UI tools that need
+// to know the query scope before running it.
 //
 // The format of the returned JSON:
 //
@@ -52,6 +99,9 @@ var (
 //	  "end":"YYYY-MM-DDThh:mm:sss.nnnnnnnnnZ",
 //	  "hasTimeFilter":true|false
 //	}
+//
+// hasTimeFilter indicates whether the query itself contains a _time filter.
+// If false, start/end come from the request's start/end parameters.
 func ProcessQueryTimeRangeRequest(ctx context.Context, w http.ResponseWriter, r *http.Request) {
 	minTimestamp, maxTimestamp, hasTimeFilter, err := parseQueryTimeRangeArgs(r)
 	if err != nil {
@@ -66,6 +116,13 @@ func ProcessQueryTimeRangeRequest(ctx context.Context, w http.ResponseWriter, r 
 	fmt.Fprintf(w, `{"start":%q,"end":%q,"hasTimeFilter":%t}`, startStr, endStr, hasTimeFilter)
 }
 
+// parseQueryTimeRangeArgs extracts the time range from query and request parameters.
+//
+// For each boundary:
+//  1. Use _time filter boundary from the query if it is present
+//  2. Otherwise, fall back to start/end request parameters
+//
+// Returns hasTimeFilter=true if the query contains its own _time filter.
 func parseQueryTimeRangeArgs(r *http.Request) (int64, int64, bool, error) {
 	qStr := r.FormValue("query")
 	if qStr == "" {
@@ -82,6 +139,7 @@ func parseQueryTimeRangeArgs(r *http.Request) (int64, int64, bool, error) {
 	// hasTimeFilter is true if the query itself contains a _time filter
 	hasTimeFilter := (minTimestamp != math.MinInt64 || maxTimestamp != math.MaxInt64)
 
+	// If query doesn't define start/end boundary, fall back to request parameters
 	if minTimestamp == math.MinInt64 {
 		start, ok, err := getTimeNsec(r, "start")
 		if err != nil {
@@ -110,6 +168,17 @@ func timestampToRFC3339Nano(nsec int64) string {
 
 // ProcessFacetsRequest handles /select/logsql/facets request.
 //
+// Facets provide a way to explore the distribution of field values in log data.
+// For each field, it returns the top N values with their hit counts.
+//
+// Query transformation:
+//   - All existing pipes are dropped (facets must come from raw data)
+//   - A facets pipe is added to compute the aggregation
+//
+// Response format:
+//
+//	{"facets":{"field1":[{"value":"x","hits":100},...],"field2":[...]}}
+//
 // See https://docs.victoriametrics.com/victorialogs/querying/#querying-facets
 func ProcessFacetsRequest(ctx context.Context, w http.ResponseWriter, r *http.Request) {
 	ca, err := parseCommonArgs(r)
@@ -135,12 +204,13 @@ func ProcessFacetsRequest(ctx context.Context, w http.ResponseWriter, r *http.Re
 	}
 	keepConstFields := httputil.GetBool(r, "keep_const_fields")
 
-	// Pipes must be dropped, since it is expected facets are obtained
-	// from the real logs stored in the database.
+	// Pipes must be dropped, since facets are computed from raw log data,
+	// not from transformed results
 	ca.q.DropAllPipes()
 
 	ca.q.AddFacetsPipe(limit, maxValuesPerField, maxValueLen, keepConstFields)
 
+	// Collect facets results into a map: fieldName -> []facetEntry
 	var mLock sync.Mutex
 	m := make(map[string][]facetEntry)
 	writeBlock := func(_ uint, db *logstorage.DataBlock) {
@@ -154,8 +224,8 @@ func ProcessFacetsRequest(ctx context.Context, w http.ResponseWriter, r *http.Re
 			logger.Panicf("BUG: expecting 3 columns; got %d columns", len(columns))
 		}
 
-		// Fetch columns by name to avoid relying on column ordering at VictoriaLogs cluster.
-		// See https://github.com/VictoriaMetrics/VictoriaLogs/issues/648
+		// Fetch columns by name to avoid relying on column ordering
+		// (different VictoriaLogs versions may return columns in different order)
 		cFieldName := db.GetColumnByName("field_name")
 		cFieldValue := db.GetColumnByName("field_value")
 		cHits := db.GetColumnByName("hits")
@@ -204,12 +274,26 @@ func ProcessFacetsRequest(ctx context.Context, w http.ResponseWriter, r *http.Re
 	WriteFacetsResponse(w, m)
 }
 
+// facetEntry represents a single facet value with its hit count
 type facetEntry struct {
 	value string
 	hits  string
 }
 
 // ProcessHitsRequest handles /select/logsql/hits request.
+//
+// Hits returns the count of matching log entries grouped into time buckets,
+// optionally further grouped by specified fields. This is useful for building
+// time-series visualizations of log volume.
+//
+// Query transformation:
+//   - Adds: | stats by (_time:<step> offset <offset>, <fields...>) count() hits
+//   - Adds: | sort by (_time, <fields...>)
+//   - Drops unsafe trailing pipes that could alter _time
+//
+// Response format:
+//
+//	{"series":[{"fields":"{...}","timestamps":[...],"hits":[...],"hitsTotal":N},...]}
 //
 // See https://docs.victoriametrics.com/victorialogs/querying/#querying-hits-stats
 func ProcessHitsRequest(ctx context.Context, w http.ResponseWriter, r *http.Request) {
@@ -219,7 +303,7 @@ func ProcessHitsRequest(ctx context.Context, w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	// Obtain step
+	// Obtain step - the time bucket size
 	step, err := parseDuration(r, "step", "")
 	if err != nil {
 		httpserver.Errorf(w, r, "%s", err)
@@ -230,26 +314,27 @@ func ProcessHitsRequest(ctx context.Context, w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	// Obtain offset
+	// Obtain offset for time alignment (e.g., for timezone adjustment)
 	offset, err := parseDuration(r, "offset", "0s")
 	if err != nil {
 		httpserver.Errorf(w, r, "%s", err)
 		return
 	}
 
-	// Obtain field entries
+	// Obtain field entries for additional grouping beyond time
 	fields := r.Form["field"]
 
-	// Obtain limit on the number of top fields entries.
+	// Obtain limit on the number of top field entries to return
 	fieldsLimit, err := getPositiveInt(r, "fields_limit")
 	if err != nil {
 		httpserver.Errorf(w, r, "%s", err)
 		return
 	}
 
-	// Add a pipe, which calculates hits over time with the given step and offset for the given fields.
+	// Add the count-by-time pipe to the query
 	ca.q.AddCountByTimePipe(step, offset, fields)
 
+	// Collect hits results grouped by field values
 	var mLock sync.Mutex
 	m := make(map[string]*hitsSeries)
 	writeBlock := func(_ uint, db *logstorage.DataBlock) {
@@ -259,9 +344,9 @@ func ProcessHitsRequest(ctx context.Context, w http.ResponseWriter, r *http.Requ
 		}
 
 		columns := db.Columns
-		timestampValues := columns[0].Values
-		hitsValues := columns[len(columns)-1].Values
-		columns = columns[1 : len(columns)-1]
+		timestampValues := columns[0].Values         // _time column
+		hitsValues := columns[len(columns)-1].Values // hits column (last)
+		columns = columns[1 : len(columns)-1]        // grouping fields
 
 		bb := blockResultPool.Get()
 		for i := 0; i < rowsCount; i++ {
@@ -275,6 +360,7 @@ func ProcessHitsRequest(ctx context.Context, w http.ResponseWriter, r *http.Requ
 				logger.Panicf("BUG: cannot parse hitsStr=%q: %s", hitsStr, err)
 			}
 
+			// Build a key from the field values for grouping
 			bb.Reset()
 			WriteFieldsForHits(bb, columns, i)
 
@@ -302,6 +388,7 @@ func ProcessHitsRequest(ctx context.Context, w http.ResponseWriter, r *http.Requ
 		return
 	}
 
+	// Post-process: limit to top series and fill in missing time buckets with zeros
 	m = getTopHitsSeries(m, fieldsLimit)
 	addMissingZeroHits(m, ca.startAligned, ca.endAligned, step, offset)
 
@@ -315,7 +402,15 @@ func ProcessHitsRequest(ctx context.Context, w http.ResponseWriter, r *http.Requ
 	WriteHitsSeries(w, m)
 }
 
+// addMissingZeroHits fills in missing time buckets with zero hit counts.
+//
+// This ensures that time series charts have continuous data points even when
+// some time buckets had no matching logs. The function:
+//  1. Determines the actual start/end if not provided (from existing data)
+//  2. Aligns the range to the step boundary
+//  3. Adds (timestamp, 0) entries for missing buckets
 func addMissingZeroHits(m map[string]*hitsSeries, start, end, step, offset int64) {
+	// If start/end not provided, derive from actual data
 	if start == math.MinInt64 {
 		start = math.MaxInt64
 		for _, hs := range m {
@@ -333,10 +428,10 @@ func addMissingZeroHits(m map[string]*hitsSeries, start, end, step, offset int64
 	start, end = alignStartEndToStep(start, end, step, offset)
 
 	if start > end {
-		// nothing to do
 		return
 	}
 
+	// For each series, add zero entries for missing timestamps
 	for _, hs := range m {
 		ts := start
 		for ts <= end {
@@ -354,8 +449,10 @@ func addMissingZeroHits(m map[string]*hitsSeries, start, end, step, offset int64
 	}
 }
 
+// blockResultPool is a pool for reusing byte buffers during result processing
 var blockResultPool bytesutil.ByteBufferPool
 
+// getTopHitsSeries returns the top N series by total hits, merging the rest into "{}"
 func getTopHitsSeries(m map[string]*hitsSeries, fieldsLimit int) map[string]*hitsSeries {
 	if fieldsLimit <= 0 || fieldsLimit >= len(m) {
 		return m
@@ -372,10 +469,12 @@ func getTopHitsSeries(m map[string]*hitsSeries, fieldsLimit int) map[string]*hit
 			hs:        hs,
 		})
 	}
+	// Sort by total hits descending
 	sort.Slice(a, func(i, j int) bool {
 		return a[i].hs.hitsTotal > a[j].hs.hitsTotal
 	})
 
+	// Merge all remaining series into a single "{}" series
 	hitsOther := make(map[int64]uint64)
 	for _, x := range a[fieldsLimit:] {
 		for i, timestamp := range x.hs.timestamps {
@@ -398,10 +497,11 @@ func getTopHitsSeries(m map[string]*hitsSeries, fieldsLimit int) map[string]*hit
 	return mNew
 }
 
+// hitsSeries represents a single time series of hit counts
 type hitsSeries struct {
-	hitsTotal  uint64
-	timestamps []int64
-	hits       []uint64
+	hitsTotal  uint64   // Total hits across all timestamps (for sorting)
+	timestamps []int64  // Timestamps for each data point
+	hits       []uint64 // Hit counts at each timestamp
 }
 
 func (hs *hitsSeries) sort() {
@@ -422,6 +522,13 @@ func (hs *hitsSeries) Less(i, j int) bool {
 }
 
 // ProcessFieldNamesRequest handles /select/logsql/field_names request.
+//
+// Returns a list of field names that appear in logs matching the query,
+// along with the number of hits for each field. Useful for:
+//   - Discovering available fields in your logs
+//   - Building autocomplete for query editors
+//
+// Response format: {"values":[{"value":"field_name","hits":N},...]}
 //
 // See https://docs.victoriametrics.com/victorialogs/querying/#querying-field-names
 func ProcessFieldNamesRequest(ctx context.Context, w http.ResponseWriter, r *http.Request) {
@@ -454,6 +561,13 @@ func ProcessFieldNamesRequest(ctx context.Context, w http.ResponseWriter, r *htt
 
 // ProcessFieldValuesRequest handles /select/logsql/field_values request.
 //
+// Returns unique values for a specific field from logs matching the query,
+// along with hit counts. Useful for:
+//   - Building filter dropdowns
+//   - Exploring value distributions
+//
+// Response format: {"values":[{"value":"field_value","hits":N},...]}
+//
 // See https://docs.victoriametrics.com/victorialogs/querying/#querying-field-values
 func ProcessFieldValuesRequest(ctx context.Context, w http.ResponseWriter, r *http.Request) {
 	ca, err := parseCommonArgs(r)
@@ -462,14 +576,12 @@ func ProcessFieldValuesRequest(ctx context.Context, w http.ResponseWriter, r *ht
 		return
 	}
 
-	// Parse fieldName query arg
 	fieldName := r.FormValue("field")
 	if fieldName == "" {
 		httpserver.Errorf(w, r, "missing 'field' query arg")
 		return
 	}
 
-	// Parse limit query arg
 	limit, err := getPositiveInt(r, "limit")
 	if err != nil {
 		httpserver.Errorf(w, r, "%s", err)
@@ -479,7 +591,6 @@ func ProcessFieldValuesRequest(ctx context.Context, w http.ResponseWriter, r *ht
 	qctx := ca.newQueryContext(ctx)
 	defer ca.updatePerQueryStatsMetrics()
 
-	// Obtain unique values for the given field
 	startTime := time.Now()
 	values, err := vlstorage.GetFieldValues(qctx, fieldName, uint64(limit))
 	if err != nil {
@@ -487,17 +598,18 @@ func ProcessFieldValuesRequest(ctx context.Context, w http.ResponseWriter, r *ht
 		return
 	}
 
-	// Write response headers
 	h := w.Header()
 
 	h.Set("Content-Type", "application/json")
 	ca.writeResponseHeaders(h, startTime)
 
-	// Write results
 	WriteValuesWithHitsJSON(w, values)
 }
 
 // ProcessStreamFieldNamesRequest processes /select/logsql/stream_field_names request.
+//
+// Returns the field names that define log streams (e.g., host, app, level).
+// These are the fields specified via _stream_fields at ingestion time.
 //
 // See https://docs.victoriametrics.com/victorialogs/querying/#querying-stream-field-names
 func ProcessStreamFieldNamesRequest(ctx context.Context, w http.ResponseWriter, r *http.Request) {
@@ -510,7 +622,6 @@ func ProcessStreamFieldNamesRequest(ctx context.Context, w http.ResponseWriter, 
 	qctx := ca.newQueryContext(ctx)
 	defer ca.updatePerQueryStatsMetrics()
 
-	// Obtain stream field names for the given query
 	startTime := time.Now()
 	names, err := vlstorage.GetStreamFieldNames(qctx)
 	if err != nil {
@@ -518,17 +629,18 @@ func ProcessStreamFieldNamesRequest(ctx context.Context, w http.ResponseWriter, 
 		return
 	}
 
-	// Write response headers
 	h := w.Header()
 
 	h.Set("Content-Type", "application/json")
 	ca.writeResponseHeaders(h, startTime)
 
-	// Write results
 	WriteValuesWithHitsJSON(w, names)
 }
 
 // ProcessStreamFieldValuesRequest processes /select/logsql/stream_field_values request.
+//
+// Returns unique values for a specific stream field. Useful for discovering
+// all hosts, applications, or other stream dimensions in your logs.
 //
 // See https://docs.victoriametrics.com/victorialogs/querying/#querying-stream-field-values
 func ProcessStreamFieldValuesRequest(ctx context.Context, w http.ResponseWriter, r *http.Request) {
@@ -538,14 +650,12 @@ func ProcessStreamFieldValuesRequest(ctx context.Context, w http.ResponseWriter,
 		return
 	}
 
-	// Parse fieldName query arg
 	fieldName := r.FormValue("field")
 	if fieldName == "" {
 		httpserver.Errorf(w, r, "missing 'field' query arg")
 		return
 	}
 
-	// Parse limit query arg
 	limit, err := getPositiveInt(r, "limit")
 	if err != nil {
 		httpserver.Errorf(w, r, "%s", err)
@@ -555,7 +665,6 @@ func ProcessStreamFieldValuesRequest(ctx context.Context, w http.ResponseWriter,
 	qctx := ca.newQueryContext(ctx)
 	defer ca.updatePerQueryStatsMetrics()
 
-	// Obtain stream field values for the given query and the given fieldName
 	startTime := time.Now()
 	values, err := vlstorage.GetStreamFieldValues(qctx, fieldName, uint64(limit))
 	if err != nil {
@@ -563,17 +672,18 @@ func ProcessStreamFieldValuesRequest(ctx context.Context, w http.ResponseWriter,
 		return
 	}
 
-	// Write response headers
 	h := w.Header()
 
 	h.Set("Content-Type", "application/json")
 	ca.writeResponseHeaders(h, startTime)
 
-	// Write results
 	WriteValuesWithHitsJSON(w, values)
 }
 
 // ProcessStreamIDsRequest processes /select/logsql/stream_ids request.
+//
+// Returns internal stream IDs (128-bit identifiers) for streams matching
+// the query. Stream IDs are useful for low-level debugging.
 //
 // See https://docs.victoriametrics.com/victorialogs/querying/#querying-stream_ids
 func ProcessStreamIDsRequest(ctx context.Context, w http.ResponseWriter, r *http.Request) {
@@ -583,7 +693,6 @@ func ProcessStreamIDsRequest(ctx context.Context, w http.ResponseWriter, r *http
 		return
 	}
 
-	// Parse limit query arg
 	limit, err := getPositiveInt(r, "limit")
 	if err != nil {
 		httpserver.Errorf(w, r, "%s", err)
@@ -593,7 +702,6 @@ func ProcessStreamIDsRequest(ctx context.Context, w http.ResponseWriter, r *http
 	qctx := ca.newQueryContext(ctx)
 	defer ca.updatePerQueryStatsMetrics()
 
-	// Obtain streamIDs for the given query
 	startTime := time.Now()
 	streamIDs, err := vlstorage.GetStreamIDs(qctx, uint64(limit))
 	if err != nil {
@@ -601,17 +709,18 @@ func ProcessStreamIDsRequest(ctx context.Context, w http.ResponseWriter, r *http
 		return
 	}
 
-	// Write response headers
 	h := w.Header()
 
 	h.Set("Content-Type", "application/json")
 	ca.writeResponseHeaders(h, startTime)
 
-	// Write results
 	WriteValuesWithHitsJSON(w, streamIDs)
 }
 
 // ProcessStreamsRequest processes /select/logsql/streams request.
+//
+// Returns log streams (unique combinations of stream field values) that
+// contain logs matching the query. A stream is like {host="app1",level="error"}.
 //
 // See https://docs.victoriametrics.com/victorialogs/querying/#querying-streams
 func ProcessStreamsRequest(ctx context.Context, w http.ResponseWriter, r *http.Request) {
@@ -621,7 +730,6 @@ func ProcessStreamsRequest(ctx context.Context, w http.ResponseWriter, r *http.R
 		return
 	}
 
-	// Parse limit query arg
 	limit, err := getPositiveInt(r, "limit")
 	if err != nil {
 		httpserver.Errorf(w, r, "%s", err)
@@ -631,7 +739,6 @@ func ProcessStreamsRequest(ctx context.Context, w http.ResponseWriter, r *http.R
 	qctx := ca.newQueryContext(ctx)
 	defer ca.updatePerQueryStatsMetrics()
 
-	// Obtain streams for the given query
 	startTime := time.Now()
 	streams, err := vlstorage.GetStreams(qctx, uint64(limit))
 	if err != nil {
@@ -639,23 +746,38 @@ func ProcessStreamsRequest(ctx context.Context, w http.ResponseWriter, r *http.R
 		return
 	}
 
-	// Write response headers
 	h := w.Header()
 
 	h.Set("Content-Type", "application/json")
 	ca.writeResponseHeaders(h, startTime)
 
-	// Write results
 	WriteValuesWithHitsJSON(w, streams)
 }
 
-// ProcessLiveTailRequest processes live tailing request to /select/logsq/tail
+// ProcessLiveTailRequest processes live tailing request to /select/logsql/tail
+//
+// Live tailing provides real-time log streaming by periodically polling for new
+// log entries and streaming them to the client as NDJSON.
+//
+// Key design decisions:
+//   - No concurrency limit: Tail requests are long-lived and mostly idle
+//   - No timeout: Runs until client disconnects
+//   - Per-stream deduplication: Tracks last-seen timestamp per stream to avoid duplicates
+//   - Overlapping poll windows: Each poll looks back 5 seconds to catch late-arriving logs
+//
+// Poll algorithm:
+//  1. Query logs in [end-startOffset, end-offset] time range
+//  2. Deduplicate against last-seen timestamps per stream
+//  3. Stream new logs to client
+//  4. Wait refresh_interval (default 1s)
+//  5. Update time range and repeat
 //
 // See https://docs.victoriametrics.com/victorialogs/querying/#live-tailing
 func ProcessLiveTailRequest(ctx context.Context, w http.ResponseWriter, r *http.Request) {
 	liveTailRequests.Inc()
 	defer liveTailRequests.Dec()
 
+	// Skip max time range check - tail queries don't have a fixed range
 	ca, err := parseCommonArgsWithConfig(r, true)
 	if err != nil {
 		httpserver.Errorf(w, r, "%s", err)
@@ -673,12 +795,14 @@ func ProcessLiveTailRequest(ctx context.Context, w http.ResponseWriter, r *http.
 		return
 	}
 
+	// How far back to look in the first poll
 	startOffset, err := parseDuration(r, "start_offset", "5s")
 	if err != nil {
 		httpserver.Errorf(w, r, "%s", err)
 		return
 	}
 
+	// How far behind "now" to query (accounts for ingestion delay)
 	offset, err := parseDuration(r, "offset", "5s")
 	if err != nil {
 		httpserver.Errorf(w, r, "%s", err)
@@ -691,6 +815,7 @@ func ProcessLiveTailRequest(ctx context.Context, w http.ResponseWriter, r *http.
 	ticker := time.NewTicker(time.Duration(refreshInterval))
 	defer ticker.Stop()
 
+	// Initial time window
 	end := time.Now().UnixNano() - offset
 	start := end - startOffset
 	doneCh := ctxWithCancel.Done()
@@ -709,12 +834,14 @@ func ProcessLiveTailRequest(ctx context.Context, w http.ResponseWriter, r *http.
 	q := ca.q
 	qOrig := q
 	for {
+		// Clone query with updated time filter for this poll window
 		q = qOrig.CloneWithTimeFilter(end, start, end)
 		qctxLocal := qctx.WithQuery(q)
 		if err := vlstorage.RunQuery(qctxLocal, tp.writeBlock); err != nil {
 			httpserver.Errorf(w, r, "cannot execute tail query [%s]: %s", q, err)
 			return
 		}
+		// Get deduplicated results
 		resultRows, err := tp.getTailRows()
 		if err != nil {
 			httpserver.Errorf(w, r, "cannot get tail results for query [%q]: %s", q, err)
@@ -725,10 +852,12 @@ func ProcessLiveTailRequest(ctx context.Context, w http.ResponseWriter, r *http.
 			flusher.Flush()
 		}
 
+		// Wait for next poll interval or client disconnect
 		select {
 		case <-doneCh:
 			return
 		case <-ticker.C:
+			// Shift time window, with overlap for deduplication
 			start = end - tailOffsetNsecs
 			end = time.Now().UnixNano() - offset
 		}
@@ -737,28 +866,34 @@ func ProcessLiveTailRequest(ctx context.Context, w http.ResponseWriter, r *http.
 
 var liveTailRequests = metrics.NewCounter(`vl_live_tailing_requests`)
 
+// tailOffsetNsecs is the overlap window for deduplication (5 seconds)
 const tailOffsetNsecs = 5e9
 
+// logRow represents a single log entry with timestamp and fields
 type logRow struct {
 	timestamp int64
 	fields    []logstorage.Field
 }
 
+// sortLogRows sorts log rows by timestamp ascending
 func sortLogRows(rows []logRow) {
 	sort.SliceStable(rows, func(i, j int) bool {
 		return rows[i].timestamp < rows[j].timestamp
 	})
 }
 
+// tailProcessor handles deduplication and buffering for live tailing
 type tailProcessor struct {
-	cancel func()
+	cancel func() // Cancel function for the request context
 
 	mu sync.Mutex
 
-	perStreamRows  map[string][]logRow
+	// Per-stream rows collected in current poll window
+	perStreamRows map[string][]logRow
+	// Last timestamp seen per stream (for deduplication)
 	lastTimestamps map[string]int64
 
-	err error
+	err error // Any error encountered during processing
 }
 
 func newTailProcessor(cancel func()) *tailProcessor {
@@ -770,6 +905,7 @@ func newTailProcessor(cancel func()) *tailProcessor {
 	}
 }
 
+// writeBlock receives DataBlocks from the query and stores rows per-stream
 func (tp *tailProcessor) writeBlock(_ uint, db *logstorage.DataBlock) {
 	if db.RowsCount() == 0 {
 		return
@@ -782,7 +918,7 @@ func (tp *tailProcessor) writeBlock(_ uint, db *logstorage.DataBlock) {
 		return
 	}
 
-	// Make sure columns contain _time field, since it is needed for proper tail work.
+	// Must have _time field for proper tail operation
 	timestamps, ok := db.GetTimestamps(nil)
 	if !ok {
 		tp.err = fmt.Errorf("missing _time field")
@@ -790,7 +926,7 @@ func (tp *tailProcessor) writeBlock(_ uint, db *logstorage.DataBlock) {
 		return
 	}
 
-	// Copy block rows to tp.perStreamRows
+	// Copy block rows to tp.perStreamRows, keyed by stream ID
 	for i, timestamp := range timestamps {
 		streamID := ""
 		fields := make([]logstorage.Field, len(db.Columns))
@@ -815,6 +951,11 @@ func (tp *tailProcessor) writeBlock(_ uint, db *logstorage.DataBlock) {
 	}
 }
 
+// getTailRows returns deduplicated rows from the current poll window
+//
+// Deduplication: For each stream, skip rows with timestamps <= the last
+// timestamp seen in previous polls. This prevents sending duplicates when
+// poll windows overlap.
 func (tp *tailProcessor) getTailRows() ([][]logstorage.Field, error) {
 	if tp.err != nil {
 		return nil, tp.err
@@ -826,13 +967,14 @@ func (tp *tailProcessor) getTailRows() ([][]logstorage.Field, error) {
 
 		lastTimestamp, ok := tp.lastTimestamps[streamID]
 		if ok {
-			// Skip already written rows
+			// Skip rows already sent in previous polls
 			for len(rows) > 0 && rows[0].timestamp <= lastTimestamp {
 				rows = rows[1:]
 			}
 		}
 		if len(rows) > 0 {
 			resultRows = append(resultRows, rows...)
+			// Update last seen timestamp for this stream
 			tp.lastTimestamps[streamID] = rows[len(rows)-1].timestamp
 		}
 	}
@@ -850,6 +992,18 @@ func (tp *tailProcessor) getTailRows() ([][]logstorage.Field, error) {
 
 // ProcessStatsQueryRangeRequest handles /select/logsql/stats_query_range request.
 //
+// Returns Prometheus-style range vector results, where the query's stats pipe
+// grouping is augmented with _time:<step> to produce time series.
+//
+// Unlike /hits which counts log entries, this endpoint returns the actual
+// stats function results (e.g., avg, sum, quantiles) over time.
+//
+// Query transformation:
+//   - Adds _time:<step> offset <offset> to the final stats pipe's grouping
+//   - Does NOT add a separate group_by_time pipe
+//
+// Response format: Prometheus-compatible JSON with "data" containing "result" array
+//
 // See https://docs.victoriametrics.com/victorialogs/querying/#querying-log-range-stats
 func ProcessStatsQueryRangeRequest(ctx context.Context, w http.ResponseWriter, r *http.Request) {
 	ca, err := parseCommonArgs(r)
@@ -858,7 +1012,6 @@ func ProcessStatsQueryRangeRequest(ctx context.Context, w http.ResponseWriter, r
 		return
 	}
 
-	// Obtain step
 	step, err := parseDuration(r, "step", "")
 	if err != nil {
 		httpserver.SendPrometheusError(w, r, err)
@@ -870,19 +1023,20 @@ func ProcessStatsQueryRangeRequest(ctx context.Context, w http.ResponseWriter, r
 		return
 	}
 
-	// Obtain offset
 	offset, err := parseDuration(r, "offset", "0s")
 	if err != nil {
 		httpserver.SendPrometheusError(w, r, err)
 		return
 	}
 
+	// Get the labels that need _time grouping added
 	labelFields, err := ca.q.GetStatsLabelsAddGroupingByTime(step, offset)
 	if err != nil {
 		httpserver.SendPrometheusError(w, r, err)
 		return
 	}
 
+	// Map from series key (name + labels JSON) to stats series
 	m := make(map[string]*statsSeries)
 	var mLock sync.Mutex
 
@@ -914,9 +1068,7 @@ func ProcessStatsQueryRangeRequest(ctx context.Context, w http.ResponseWriter, r
 			clonedColumnNames[i] = strings.Clone(c.Name)
 		}
 		for i := 0; i < rowsCount; i++ {
-			// Do not move q.GetTimestamp() outside writeBlock, since ts
-			// must be initialized to query timestamp for every processed log row.
-			// See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/8312
+			// Initialize timestamp from query timestamp; may be overridden by _time column
 			ts := ca.q.GetTimestamp()
 			labels := make([]logstorage.Field, 0, len(labelFields))
 			for j, c := range columns {
@@ -935,6 +1087,7 @@ func ProcessStatsQueryRangeRequest(ctx context.Context, w http.ResponseWriter, r
 				}
 			}
 
+			// Process each non-label column as a separate metric
 			for j, c := range columns {
 				if slices.Contains(labelFields, c.Name) {
 					continue
@@ -942,9 +1095,8 @@ func ProcessStatsQueryRangeRequest(ctx context.Context, w http.ResponseWriter, r
 
 				v := strings.Clone(c.Values[i])
 				if v == "[]" || strings.HasPrefix(v, `[{"vmrange":"`) {
-					// Special case - the value is the result of histogram() stats function.
-					// See https://docs.victoriametrics.com/victorialogs/logsql/#histogram-stats .
-					// Convert it to values for individual buckets.
+					// Special case: histogram() stats function result
+					// Expand into individual bucket series
 					var buckets []histogramBucket
 					if err := json.Unmarshal([]byte(v), &buckets); err == nil {
 						name := clonedColumnNames[j] + "_bucket"
@@ -978,7 +1130,6 @@ func ProcessStatsQueryRangeRequest(ctx context.Context, w http.ResponseWriter, r
 	qctx := ca.newQueryContext(ctx)
 	defer ca.updatePerQueryStatsMetrics()
 
-	// Execute the request.
 	startTime := time.Now()
 	if err := vlstorage.RunQuery(qctx, writeBlock); err != nil {
 		err = fmt.Errorf("cannot execute query [%s]: %s", ca.q, err)
@@ -999,30 +1150,40 @@ func ProcessStatsQueryRangeRequest(ctx context.Context, w http.ResponseWriter, r
 		return rows[i].key < rows[j].key
 	})
 
-	// Write response headers
 	h := w.Header()
 
 	h.Set("Content-Type", "application/json")
 	ca.writeResponseHeaders(h, startTime)
 
-	// Write response
 	WriteStatsQueryRangeResponse(w, rows)
 }
 
+// statsSeries represents a single time series for stats results
 type statsSeries struct {
-	key string
+	key string // Unique key (name + labels JSON)
 
-	Name   string
-	Labels []logstorage.Field
-	Points []statsPoint
+	Name   string             // Metric name
+	Labels []logstorage.Field // Label set
+	Points []statsPoint       // Data points over time
 }
 
+// statsPoint represents a single data point in a stats series
 type statsPoint struct {
 	Timestamp int64
 	Value     string
 }
 
 // ProcessStatsQueryRequest handles /select/logsql/stats_query request.
+//
+// Returns Prometheus-style instant vector results - stats function values
+// evaluated at a single point in time (the 'time' parameter or 'end' or now).
+//
+// Unlike stats_query_range, this doesn't group by time - it returns a single
+// value per metric/label combination.
+//
+// The query must end with a stats pipe (e.g., | stats count() as total).
+//
+// Response format: Prometheus-compatible JSON with "data" containing "result" array
 //
 // See https://docs.victoriametrics.com/victorialogs/querying/#querying-log-stats
 func ProcessStatsQueryRequest(ctx context.Context, w http.ResponseWriter, r *http.Request) {
@@ -1032,6 +1193,7 @@ func ProcessStatsQueryRequest(ctx context.Context, w http.ResponseWriter, r *htt
 		return
 	}
 
+	// Get the labels that are grouping keys in the stats pipe
 	labelFields, err := ca.q.GetStatsLabels()
 	if err != nil {
 		httpserver.SendPrometheusError(w, r, err)
@@ -1060,6 +1222,7 @@ func ProcessStatsQueryRequest(ctx context.Context, w http.ResponseWriter, r *htt
 				}
 			}
 
+			// Process each non-label column as a separate metric
 			for j, c := range columns {
 				if slices.Contains(labelFields, c.Name) {
 					continue
@@ -1067,9 +1230,8 @@ func ProcessStatsQueryRequest(ctx context.Context, w http.ResponseWriter, r *htt
 
 				v := strings.Clone(c.Values[i])
 				if v == "[]" || strings.HasPrefix(v, `[{"vmrange":"`) {
-					// Special case - the value is the result of histogram() stats function.
-					// See https://docs.victoriametrics.com/victorialogs/logsql/#histogram-stats .
-					// Convert it to values for individual buckets.
+					// Special case: histogram() stats function result
+					// Expand into individual bucket series
 					var buckets []histogramBucket
 					if err := json.Unmarshal([]byte(v), &buckets); err == nil {
 						name := clonedColumnNames[j] + "_bucket"
@@ -1113,7 +1275,6 @@ func ProcessStatsQueryRequest(ctx context.Context, w http.ResponseWriter, r *htt
 	qctx := ca.newQueryContext(ctx)
 	defer ca.updatePerQueryStatsMetrics()
 
-	// Execute the query
 	startTime := time.Now()
 	if err := vlstorage.RunQuery(qctx, writeBlock); err != nil {
 		err = fmt.Errorf("cannot execute query [%s]: %s", ca.q, err)
@@ -1121,16 +1282,15 @@ func ProcessStatsQueryRequest(ctx context.Context, w http.ResponseWriter, r *htt
 		return
 	}
 
-	// Write response headers
 	h := w.Header()
 
 	h.Set("Content-Type", "application/json")
 	ca.writeResponseHeaders(h, startTime)
 
-	// Write response
 	WriteStatsQueryResponse(w, rows)
 }
 
+// statsRow represents a single stats result row (metric + labels + value)
 type statsRow struct {
 	Name      string
 	Labels    []logstorage.Field
@@ -1138,12 +1298,26 @@ type statsRow struct {
 	Value     string
 }
 
+// histogramBucket represents a single bucket in histogram() stats results
 type histogramBucket struct {
 	VMRange string `json:"vmrange"`
 	Hits    uint64 `json:"hits"`
 }
 
 // ProcessQueryRequest handles /select/logsql/query request.
+//
+// This is the main query endpoint for fetching log entries. Results are
+// streamed as NDJSON (one JSON object per line) for low latency.
+//
+// Query transformation (if limit > 0):
+//   - Adds: | sort by (_time) desc (if query can return last N results)
+//   - Adds: | offset <offset> | limit <limit>
+//
+// The sort-by-time-desc is automatically optimized to use binary search
+// over the time range instead of full scan (see lastnoptimization.go).
+//
+// Response format: application/stream+json (NDJSON)
+// Each line is a JSON object with field name/value pairs.
 //
 // See https://docs.victoriametrics.com/victorialogs/querying/#querying-logs
 func ProcessQueryRequest(ctx context.Context, w http.ResponseWriter, r *http.Request) {
@@ -1153,29 +1327,30 @@ func ProcessQueryRequest(ctx context.Context, w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	// Parse offset query arg
 	offset, err := getPositiveInt(r, "offset")
 	if err != nil {
 		httpserver.Errorf(w, r, "%s", err)
 		return
 	}
 
-	// Parse limit query arg
 	limit, err := getPositiveInt(r, "limit")
 	if err != nil {
 		httpserver.Errorf(w, r, "%s", err)
 		return
 	}
 
+	// Thread-safe writer for parallel workers
 	sw := &syncWriter{
 		w: w,
 	}
 
+	// Per-worker buffers for batching writes
 	var bwShards atomicutil.Slice[bufferedWriter]
 	bwShards.Init = func(shard *bufferedWriter) {
 		shard.sw = sw
 	}
 	defer func() {
+		// Flush all buffers on exit
 		shards := bwShards.All()
 		for _, shard := range shards {
 			shard.FlushIgnoreErrors()
@@ -1183,8 +1358,8 @@ func ProcessQueryRequest(ctx context.Context, w http.ResponseWriter, r *http.Req
 	}()
 
 	if limit > 0 {
-		// Add '| sort by (_time) desc | offset <offset> | limit <limit>' to the end of the query.
-		// This pattern is automatically optimized during query execution - see https://github.com/VictoriaMetrics/VictoriaLogs/issues/96 .
+		// Add pagination pipes to the query
+		// The sort-by-time-desc is optimized to use binary search
 		if ca.q.CanReturnLastNResults() {
 			ca.q.AddPipeSortByTimeDesc()
 		}
@@ -1192,8 +1367,8 @@ func ProcessQueryRequest(ctx context.Context, w http.ResponseWriter, r *http.Req
 	}
 
 	startTime := time.Now()
+	// Write headers on first result (lazy initialization)
 	writeResponseHeadersOnce := sync.OnceFunc(func() {
-		// Write response headers
 		h := w.Header()
 
 		h.Set("Content-Type", "application/stream+json")
@@ -1208,9 +1383,11 @@ func ProcessQueryRequest(ctx context.Context, w http.ResponseWriter, r *http.Req
 		}
 		columns := db.Columns
 
+		// Use per-worker buffer for batching
 		bw := bwShards.Get(workerID)
 		for i := 0; i < rowsCount; i++ {
 			WriteJSONRow(bw, columns, i)
+			// Flush when buffer exceeds 16KB
 			if len(bw.buf) > 16*1024 {
 				bw.FlushIgnoreErrors()
 			}
@@ -1226,17 +1403,25 @@ func ProcessQueryRequest(ctx context.Context, w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	// This call is needed for the case when the response didn't return any results.
+	// Ensure headers are written even for empty results
 	writeResponseHeadersOnce()
 }
 
 // ProcessTenantIDsRequest processes /select/tenant_ids request.
+//
+// Returns all tenant IDs that have data within the specified time range.
+// This is used for multi-tenant cluster management and administrative queries.
+//
+// Security note: This endpoint is forbidden when AccountID header is non-empty.
+// This allows vmauth to enforce tenant isolation by preventing users from
+// discovering other tenants' IDs.
+//
+// Response format: [{"account_id":N,"project_id":M},...]
 func ProcessTenantIDsRequest(ctx context.Context, w http.ResponseWriter, r *http.Request) {
 	accountID := r.Header.Get("AccountID")
 	if accountID != "" {
-		// Security measure - prevent from requesting tenant_ids for requests with the already specified tenant.
-		// This allows enforcing the needed tenants at vmauth side, so they won't have access to /select/tenant_ids endpoint.
-		// See https://docs.victoriametrics.com/victoriametrics/vmauth/#modifying-http-headers
+		// Security measure - prevent requesting tenant_ids when tenant is already specified
+		// This allows vmauth to enforce isolation at the proxy level
 		err := &httpserver.ErrorWithStatusCode{
 			Err:        fmt.Errorf("the /select/tenant_ids endpoint cannot be requested with non-empty AccountID=%q header", accountID),
 			StatusCode: http.StatusForbidden,
@@ -1293,6 +1478,8 @@ func ProcessTenantIDsRequest(ctx context.Context, w http.ResponseWriter, r *http
 	}
 }
 
+// syncWriter is a thread-safe wrapper around io.Writer
+// Used for parallel workers writing to the same HTTP response
 type syncWriter struct {
 	mu sync.Mutex
 	w  io.Writer
@@ -1305,6 +1492,8 @@ func (sw *syncWriter) Write(p []byte) (int, error) {
 	return n, err
 }
 
+// bufferedWriter batches writes before flushing to the underlying syncWriter
+// This reduces syscalls when writing many small JSON lines
 type bufferedWriter struct {
 	buf []byte
 	sw  *syncWriter
@@ -1312,9 +1501,7 @@ type bufferedWriter struct {
 
 func (bw *bufferedWriter) Write(p []byte) (int, error) {
 	bw.buf = append(bw.buf, p...)
-
-	// Do not send bw.buf to bw.sw here, since the data at bw.buf may be incomplete (it must end with '\n')
-
+	// Don't flush here - wait for complete lines
 	return len(p), nil
 }
 
@@ -1323,51 +1510,74 @@ func (bw *bufferedWriter) FlushIgnoreErrors() {
 	bw.buf = bw.buf[:0]
 }
 
+// commonArgs holds the parsed parameters shared across most /select/logsql/* endpoints.
+//
+// This struct is created by parseCommonArgs() and contains:
+//   - The parsed LogsQL query with time filters and extra filters applied
+//   - Tenant IDs extracted from HTTP headers
+//   - Options for partial responses and hidden fields
+//   - Query execution statistics
+//   - Time range aligned to step (for hits/stats_query_range)
 type commonArgs struct {
-	// The parsed query. It includes optional extra_filters, extra_stream_filters and (start, end) time range filter.
+	// The parsed query including optional extra_filters, extra_stream_filters,
+	// and (start, end) time range filter.
 	q *logstorage.Query
 
-	// tenantIDs is the list of tenantIDs to query.
+	// tenantIDs is the list of tenant IDs to query.
+	// Extracted from AccountID/ProjectID HTTP headers.
 	tenantIDs []logstorage.TenantID
 
-	// Whether to allow partial response when some of vlstorage nodes are unavailable for querying.
-	// This option makes sense only for cluster setup when vlselect queries vlstorage nodes.
+	// Whether to allow partial response when some vlstorage nodes
+	// are unavailable. Only applies in cluster mode.
 	allowPartialResponse bool
 
 	// Optional fields and field prefixes to hide during query execution.
+	// Supports both exact field names and prefixes ending with *.
 	hiddenFieldsFilters []string
 
-	// qs contains query execution statistics.
+	// qs accumulates query execution statistics (rows scanned, blocks read, etc.)
 	qs logstorage.QueryStats
 
-	// startAligned is the start of the selected time range aligned to the given step.
+	// startAligned and endAligned are the time range boundaries aligned to step.
+	// Used by hits and stats_query_range for consistent time bucketing.
 	startAligned int64
-
-	// endAligned is the aligned end of the selected time range aligned to the given step.
-	endAligned int64
+	endAligned   int64
 }
 
+// newQueryContext creates a QueryContext from commonArgs for query execution.
 func (ca *commonArgs) newQueryContext(ctx context.Context) *logstorage.QueryContext {
 	return logstorage.NewQueryContext(ctx, &ca.qs, ca.tenantIDs, ca.q, ca.allowPartialResponse, ca.hiddenFieldsFilters)
 }
 
+// updatePerQueryStatsMetrics updates global metrics from query statistics
 func (ca *commonArgs) updatePerQueryStatsMetrics() {
 	vlstorage.UpdatePerQueryStatsMetrics(&ca.qs)
 }
 
+// parseCommonArgs parses the shared request parameters for /select/logsql/* endpoints.
+//
+// This is the main argument parsing function that:
+//  1. Extracts tenant ID from AccountID/ProjectID headers
+//  2. Parses optional start/end/time parameters for time range
+//  3. Parses the LogsQL query string
+//  4. Applies time filters and extra filters to the query
+//  5. Validates the time range against -search.maxQueryTimeRange
+//  6. Parses allow_partial_response and hidden_fields_filters options
 func parseCommonArgs(r *http.Request) (*commonArgs, error) {
 	return parseCommonArgsWithConfig(r, false)
 }
 
+// parseCommonArgsWithConfig is like parseCommonArgs but can skip the max time range check.
+// This is used by live tailing which doesn't have a fixed time range.
 func parseCommonArgsWithConfig(r *http.Request, skipMaxRangeCheck bool) (*commonArgs, error) {
-	// Extract tenantID
+	// Extract tenantID from HTTP headers
 	tenantID, err := logstorage.GetTenantIDFromRequest(r)
 	if err != nil {
 		return nil, fmt.Errorf("cannot obtain tenantID: %w", err)
 	}
 	tenantIDs := []logstorage.TenantID{tenantID}
 
-	// Parse optional start and end args
+	// Parse optional start and end args for time range filtering
 	start, startOK, err := getTimeNsec(r, "start")
 	if err != nil {
 		return nil, err
@@ -1377,26 +1587,24 @@ func parseCommonArgsWithConfig(r *http.Request, skipMaxRangeCheck bool) (*common
 		return nil, err
 	}
 	if endOK {
-		// Treat HTTP 'end' query arg as exclusive: [start, end)
-		// Convert to inclusive bound for internal filter by subtracting 1ns.
+		// HTTP 'end' is exclusive [start, end), convert to inclusive for internal filter
 		if end != math.MinInt64 {
 			end--
 		}
 	}
 
-	// Parse optional time arg
+	// Parse optional time arg - the evaluation timestamp for relative time expressions
 	timestamp, timeOK, err := getTimeNsec(r, "time")
 	if err != nil {
 		return nil, err
 	}
-	// decrease timestamp by one nanosecond in order to avoid capturing logs belonging
-	// to the first nanosecond at the next period of time (month, week, day, hour, etc.)
+	// Decrease timestamp by 1ns to avoid boundary issues with time-based functions
+	// (e.g., "now()/1h" shouldn't spill into next hour)
 	timestamp--
 
 	currTimestamp := time.Now().UnixNano()
 	if !timeOK {
-		// If time arg is missing, then evaluate query either at the end timestamp (if it is set)
-		// or at the current timestamp (if end query arg isn't set)
+		// If time not specified, use end timestamp or current time
 		if endOK {
 			timestamp = end
 		} else {
@@ -1404,7 +1612,7 @@ func parseCommonArgsWithConfig(r *http.Request, skipMaxRangeCheck bool) (*common
 		}
 	}
 
-	// Parse query
+	// Parse the LogsQL query string
 	qStr := r.FormValue("query")
 	q, err := logstorage.ParseQueryAtTimestamp(qStr, timestamp)
 	if err != nil {
@@ -1412,7 +1620,7 @@ func parseCommonArgsWithConfig(r *http.Request, skipMaxRangeCheck bool) (*common
 	}
 
 	if startOK || endOK {
-		// Add _time:[start, end] filter if start or end args were set.
+		// Add _time:[start, end] filter if start or end args were set
 		if !startOK {
 			start = math.MinInt64
 		}
@@ -1420,6 +1628,7 @@ func parseCommonArgsWithConfig(r *http.Request, skipMaxRangeCheck bool) (*common
 			end = math.MaxInt64
 		}
 
+		// Align to step if step parameter is provided
 		if stepStr := r.FormValue("step"); stepStr != "" {
 			if step, ok := logstorage.TryParseDuration(stepStr); ok {
 				offset := int64(0)
@@ -1436,7 +1645,7 @@ func parseCommonArgsWithConfig(r *http.Request, skipMaxRangeCheck bool) (*common
 		q.AddTimeFilter(start, end)
 	}
 
-	// Initialize startAligned and endAligned
+	// Initialize aligned time range values
 	startAligned := int64(math.MinInt64)
 	if startOK {
 		startAligned = start
@@ -1446,7 +1655,7 @@ func parseCommonArgsWithConfig(r *http.Request, skipMaxRangeCheck bool) (*common
 		endAligned = end
 	}
 
-	// Parse optional extra_filters
+	// Parse optional extra_filters - additional filters to AND with the query
 	for _, extraFiltersStr := range r.Form["extra_filters"] {
 		extraFilters, err := parseExtraFilters(extraFiltersStr)
 		if err != nil {
@@ -1455,7 +1664,7 @@ func parseCommonArgsWithConfig(r *http.Request, skipMaxRangeCheck bool) (*common
 		q.AddExtraFilters(extraFilters)
 	}
 
-	// Parse optional extra_stream_filters
+	// Parse optional extra_stream_filters - additional stream-level filters
 	for _, extraStreamFiltersStr := range r.Form["extra_stream_filters"] {
 		extraStreamFilters, err := parseExtraStreamFilters(extraStreamFiltersStr)
 		if err != nil {
@@ -1464,6 +1673,7 @@ func parseCommonArgsWithConfig(r *http.Request, skipMaxRangeCheck bool) (*common
 		q.AddExtraFilters(extraStreamFilters)
 	}
 
+	// Validate time range against configured maximum
 	if maxRange := maxQueryTimeRange.Duration(); maxRange > 0 && !skipMaxRangeCheck {
 		start, end := q.GetFilterTimeRange()
 		if end > start {
@@ -1499,11 +1709,20 @@ func parseCommonArgsWithConfig(r *http.Request, skipMaxRangeCheck bool) (*common
 	return ca, nil
 }
 
+// alignStartEndToStep aligns the start and end timestamps to step boundaries.
+//
+// This ensures that time buckets in hits/stats_query_range align properly:
+//   - start is rounded down to the nearest step boundary
+//   - end is rounded up to the nearest step boundary
+//
+// The offset parameter shifts the alignment (e.g., for timezone adjustment).
+// The final end is decremented by 1ns to make it an inclusive bound.
 func alignStartEndToStep(start, end, step, offset int64) (int64, int64) {
 	if step <= 0 {
 		return start, end
 	}
 
+	// Align start: shift by offset, round down to step, shift back
 	start = logstorage.SubInt64NoOverflow(start, -offset)
 	if start >= 0 {
 		start -= start % step
@@ -1513,6 +1732,7 @@ func alignStartEndToStep(start, end, step, offset int64) (int64, int64) {
 	}
 	start = logstorage.SubInt64NoOverflow(start, offset)
 
+	// Align end: shift by offset, round up to step, shift back
 	end = logstorage.SubInt64NoOverflow(end, -offset)
 	if end <= 0 {
 		end -= end % step
@@ -1522,6 +1742,7 @@ func alignStartEndToStep(start, end, step, offset int64) (int64, int64) {
 	}
 	end = logstorage.SubInt64NoOverflow(end, offset)
 
+	// Convert to inclusive bound
 	if end > math.MinInt64 {
 		end--
 	}
@@ -1534,6 +1755,10 @@ func timestampToString(nsecs int64) string {
 	return t.Format(time.RFC3339Nano)
 }
 
+// getTimeNsec parses a time parameter from the request.
+// Returns (timestamp, true, nil) if the parameter is present and valid.
+// Returns (0, false, nil) if the parameter is absent.
+// Returns (0, false, error) if the parameter is invalid.
 func getTimeNsec(r *http.Request, argName string) (int64, bool, error) {
 	s := r.FormValue(argName)
 	if s == "" {
@@ -1547,6 +1772,9 @@ func getTimeNsec(r *http.Request, argName string) (int64, bool, error) {
 	return nsecs, true, nil
 }
 
+// parseExtraFilters parses extra_filters parameter which can be:
+//   - LogsQL filter syntax: "level:error host:app1"
+//   - JSON object: {"level":"error","host":"app1"}
 func parseExtraFilters(s string) (*logstorage.Filter, error) {
 	if s == "" {
 		return nil, nil
@@ -1555,7 +1783,7 @@ func parseExtraFilters(s string) (*logstorage.Filter, error) {
 		return logstorage.ParseFilter(s)
 	}
 
-	// Extra filters in the form {"field":"value",...}.
+	// JSON format: {"field":"value",...} or {"field":["value1","value2"],...}
 	kvs, err := parseExtraFiltersJSON(s)
 	if err != nil {
 		return nil, err
@@ -1564,8 +1792,10 @@ func parseExtraFilters(s string) (*logstorage.Filter, error) {
 	filters := make([]string, len(kvs))
 	for i, kv := range kvs {
 		if len(kv.values) == 1 {
+			// Single value: "field":="value"
 			filters[i] = fmt.Sprintf("%q:=%q", kv.key, kv.values[0])
 		} else {
+			// Multiple values: "field":in("value1","value2")
 			orValues := make([]string, len(kv.values))
 			for j, v := range kv.values {
 				orValues[j] = fmt.Sprintf("%q", v)
@@ -1577,6 +1807,8 @@ func parseExtraFilters(s string) (*logstorage.Filter, error) {
 	return logstorage.ParseFilter(s)
 }
 
+// parseExtraStreamFilters parses extra_stream_filters for stream-level filtering.
+// Similar to parseExtraFilters but generates stream filter syntax (= instead of :=)
 func parseExtraStreamFilters(s string) (*logstorage.Filter, error) {
 	if s == "" {
 		return nil, nil
@@ -1585,7 +1817,6 @@ func parseExtraStreamFilters(s string) (*logstorage.Filter, error) {
 		return logstorage.ParseFilter(s)
 	}
 
-	// Extra stream filters in the form {"field":"value",...}.
 	kvs, err := parseExtraFiltersJSON(s)
 	if err != nil {
 		return nil, err
@@ -1594,8 +1825,10 @@ func parseExtraStreamFilters(s string) (*logstorage.Filter, error) {
 	filters := make([]string, len(kvs))
 	for i, kv := range kvs {
 		if len(kv.values) == 1 {
+			// Single value: "field"="value"
 			filters[i] = fmt.Sprintf("%q=%q", kv.key, kv.values[0])
 		} else {
+			// Multiple values: "field"=~"value1|value2"
 			orValues := make([]string, len(kv.values))
 			for j, v := range kv.values {
 				orValues[j] = regexp.QuoteMeta(v)
@@ -1607,11 +1840,13 @@ func parseExtraStreamFilters(s string) (*logstorage.Filter, error) {
 	return logstorage.ParseFilter(s)
 }
 
+// extraFilter represents a parsed key-value(s) pair from JSON extra_filters
 type extraFilter struct {
 	key    string
 	values []string
 }
 
+// parseExtraFiltersJSON parses JSON-format extra filters
 func parseExtraFiltersJSON(s string) ([]extraFilter, error) {
 	v, err := fastjson.Parse(s)
 	if err != nil {
@@ -1683,6 +1918,8 @@ func getBoolFromRequest(dst *bool, r *http.Request, argName string) error {
 	return nil
 }
 
+// getStringSliceFromRequest parses a string slice parameter.
+// Accepts either JSON array format or comma-separated values.
 func getStringSliceFromRequest(r *http.Request, argName string) ([]string, error) {
 	s := r.FormValue(argName)
 	if s == "" {
@@ -1690,7 +1927,7 @@ func getStringSliceFromRequest(r *http.Request, argName string) ([]string, error
 	}
 
 	if strings.HasPrefix(s, "[") {
-		// Parse as a JSON array of strings.
+		// Parse as JSON array
 		var a []string
 		if err := json.Unmarshal([]byte(s), &a); err != nil {
 			return nil, fmt.Errorf("cannot unmarshal JSON array from %s=%q: %w", argName, s, err)
@@ -1698,18 +1935,22 @@ func getStringSliceFromRequest(r *http.Request, argName string) ([]string, error
 		return a, nil
 	}
 
-	// Parse as a comma-separated list of strings
-	a := strings.Split(s, ",")
-	return a, nil
+	// Parse as comma-separated list
+	return strings.Split(s, ","), nil
 }
 
+// writeResponseHeaders writes common response headers for all query endpoints.
+//
+// Headers written:
+//   - VL-Request-Duration-Seconds: Query execution time
+//   - AccountID / ProjectID: The tenant used for the query (for client visibility)
+//   - Access-Control-Expose-Headers: Makes custom headers visible to CORS clients
 func (ca *commonArgs) writeResponseHeaders(h http.Header, startTime time.Time) {
-	// Write request duration
 	accessControlExposeHeaders := []string{"VL-Request-Duration-Seconds"}
 	h.Set("VL-Request-Duration-Seconds", fmt.Sprintf("%.3f", time.Since(startTime).Seconds()))
 
 	if len(ca.tenantIDs) == 1 {
-		// Write the used AccountID and ProjectID, so the client could show them properly.
+		// Expose the tenant ID used for the query
 		accessControlExposeHeaders = append(accessControlExposeHeaders, "AccountID", "ProjectID")
 		tenantID := ca.tenantIDs[0]
 		h.Set("AccountID", fmt.Sprintf("%d", tenantID.AccountID))
@@ -1722,6 +1963,8 @@ func (ca *commonArgs) writeResponseHeaders(h http.Header, startTime time.Time) {
 	h.Set("Access-Control-Expose-Headers", strings.Join(accessControlExposeHeaders, ", "))
 }
 
+// parseDuration parses a duration parameter from the request.
+// Returns the default value if the parameter is not present.
 func parseDuration(r *http.Request, argName, defaultValue string) (int64, error) {
 	s := r.FormValue(argName)
 	if s == "" {

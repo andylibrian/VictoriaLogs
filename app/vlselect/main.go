@@ -1,3 +1,37 @@
+// Package vlselect implements the HTTP query layer for VictoriaLogs.
+//
+// This package is the entry point for all log queries from external clients. It handles:
+//   - HTTP routing for /select/*, /delete/*, and /internal/select/* endpoints
+//   - Concurrency control to prevent resource exhaustion from too many parallel queries
+//   - Request timeout management with configurable per-query limits
+//   - Live tailing for real-time log streaming
+//   - Asynchronous delete task management
+//
+// Architecture Overview:
+//
+//	The query flow through this package is:
+//
+//	HTTP Request → RequestHandler (routing) → selectHandler (concurrency + timeout)
+//	    → processSelectRequest (path dispatch) → logsql.ProcessQueryRequest (parsing)
+//	    → vlstorage.RunQuery (execution) → streaming JSON response
+//
+// Concurrency Control:
+//
+//	Queries are CPU-intensive operations that can saturate all cores. The default
+//	concurrency limit is calculated based on CPU count (2× for ≤4 CPUs, capped at 16
+//	for larger systems). This prevents CPU thrashing when many queries arrive simultaneously.
+//
+//	Requests that exceed the limit wait in a queue until a slot opens or the request
+//	times out. The wait is bounded by the request's timeout (either the 'timeout' query
+//	parameter or -search.maxQueryDuration).
+//
+// Live Tailing:
+//
+//	The /select/logsql/tail endpoint is special - it bypasses concurrency limits because
+//	it's a long-lived connection that polls for new logs at regular intervals. These
+//	connections can run for hours or days, so they're handled separately.
+//
+// See onboarding/onboarding-select-flow.md for the complete query flow documentation.
 package vlselect
 
 import (
@@ -22,38 +56,73 @@ import (
 )
 
 var (
+	// Concurrency control flags
+	//
+	// These flags manage how many queries can run simultaneously. The limits are crucial
+	// because log queries are CPU-intensive and can consume significant memory when
+	// processing large result sets.
+
+	// maxConcurrentRequests limits parallel query execution. The default is CPU-based:
+	// - 2× CPUs when CPUs ≤ 4 (to utilize small systems better)
+	// - Capped at 16 for larger systems (a single query can saturate all cores)
+	// Going higher causes CPU contention without throughput improvement.
 	maxConcurrentRequests = flag.Int("search.maxConcurrentRequests", getDefaultMaxConcurrentRequests(), "The maximum number of concurrent search requests. "+
 		"It shouldn't be high, since a single request can saturate all the CPU cores, while many concurrently executed requests may require high amounts of memory. "+
 		"See also -search.maxQueueDuration")
+
+	// maxQueueDuration is a hint for queue wait time. The actual wait is bounded by
+	// the request's timeout (from 'timeout' param or -search.maxQueryDuration).
 	maxQueueDuration = flag.Duration("search.maxQueueDuration", 10*time.Second, "The maximum time the search request waits for execution when -search.maxConcurrentRequests "+
 		"limit is reached; see also -search.maxQueryDuration")
+
+	// maxQueryDuration is the default query timeout. Individual queries can request
+	// a shorter timeout via the 'timeout' query parameter, but cannot exceed this limit.
 	maxQueryDuration = flag.Duration("search.maxQueryDuration", time.Second*30, "The maximum duration for query execution. It can be overridden to a smaller value on a per-query basis via 'timeout' query arg")
+
+	// Endpoint control flags
+	// These allow disabling specific endpoint groups for security or operational reasons.
 
 	disableSelect         = flag.Bool("select.disable", false, "Whether to disable /select/* HTTP endpoints")
 	disableInternalSelect = flag.Bool("internalselect.disable", false, "Whether to disable /internal/select/* HTTP endpoints")
 
+	// Delete is disabled by default because it's a destructive operation.
+	// The internal delete endpoints are used for cluster mode fan-out.
 	enableDelete         = flag.Bool("delete.enable", false, "Whether to enable /delete/* HTTP endpoints; see https://docs.victoriametrics.com/victorialogs/#how-to-delete-logs")
 	enableInternalDelete = flag.Bool("internaldelete.enable", false, "Whether to enable /internal/delete/* HTTP endpoints, which are used by vlselect for deleting logs "+
 		"via delete API at vlstorage nodes; see https://docs.victoriametrics.com/victorialogs/#how-to-delete-logs")
+
+	// Slow query logging helps identify queries that need optimization
 	logSlowQueryDuration = flag.Duration("search.logSlowQueryDuration", 5*time.Second,
 		"Log queries with execution time exceeding this value. Zero disables slow query logging")
 )
 
+// getDefaultMaxConcurrentRequests calculates the default concurrency limit based on CPU count.
+//
+// The logic balances throughput against CPU contention:
+//   - Small systems (≤4 CPUs): Allow 2× CPUs to improve utilization
+//   - Large systems: Cap at 16 because a single query can saturate all cores
+//
+// Why cap at 16? When queries compete for CPU time, they all slow down without
+// improving total throughput. It's better to queue excess requests than to thrash.
 func getDefaultMaxConcurrentRequests() int {
 	n := cgroup.AvailableCPUs()
 	if n <= 4 {
 		n *= 2
 	}
 	if n > 16 {
-		// A single request can saturate all the CPU cores, so there is no sense
-		// in allowing higher number of concurrent requests - they will just contend
-		// for unavailable CPU time.
 		n = 16
 	}
 	return n
 }
 
-// Init initializes vlselect
+// Init initializes the vlselect package.
+//
+// This must be called before any requests are handled. It:
+//   - Creates the concurrency limit channel (buffered channel used as semaphore)
+//   - Initializes the internalselect package for /internal/select/* endpoints
+//
+// The concurrency limit channel size matches -search.maxConcurrentRequests.
+// When full, new requests block until a slot opens (bounded by request timeout).
 func Init() {
 	concurrencyLimitCh = make(chan struct{}, *maxConcurrentRequests)
 
@@ -67,12 +136,24 @@ func Stop() {
 	concurrencyLimitCh = nil
 }
 
+// concurrencyLimitCh is a buffered channel used as a counting semaphore.
+//
+// How it works:
+//   - Capacity = maxConcurrentRequests
+//   - Each query sends a struct{}{} to acquire a slot
+//   - When done, it receives <-concurrencyLimitCh to release
+//   - If full, requests block until a slot opens (bounded by timeout)
+//
+// This pattern is simpler than mutex-based semaphores and integrates naturally
+// with Go's select statement for timeout handling.
 var concurrencyLimitCh chan struct{}
 
 var (
+	// Metrics for monitoring the concurrency limiter behavior
 	concurrencyLimitReached = metrics.NewCounter(`vl_concurrent_select_limit_reached_total`)
 	concurrencyLimitTimeout = metrics.NewCounter(`vl_concurrent_select_limit_timeout_total`)
 
+	// Capacity and current usage gauges for dashboards
 	_ = metrics.NewGauge(`vl_concurrent_select_capacity`, func() float64 {
 		return float64(cap(concurrencyLimitCh))
 	})
@@ -81,12 +162,30 @@ var (
 	})
 )
 
+// vmuiFiles embeds the VMUI web interface assets.
+// VMUI provides a graphical interface for querying and exploring logs.
+//
 //go:embed vmui
 var vmuiFiles embed.FS
 
+// vmuiFileServer serves the embedded VMUI static files.
 var vmuiFileServer = http.FileServer(http.FS(vmuiFiles))
 
-// RequestHandler handles select requests for VictoriaLogs
+// RequestHandler is the main HTTP router for all /select/*, /delete/*, and /internal/select/* paths.
+//
+// This function is called by the main HTTP server for every incoming request.
+// It returns true if the request was handled (even if an error occurred),
+// or false if the path doesn't match any vlselect endpoint.
+//
+// Routing order matters:
+//  1. /delete/* - Check enableDelete flag first
+//  2. /select/* - Check disableSelect flag
+//  3. /internal/delete/* - Check enableInternalDelete flag
+//  4. /internal/select/* - Check both disable flags
+//
+// The /internal/* endpoints are used for cluster-mode communication between
+// vlselect (frontend) and vlstorage nodes. They're typically not exposed to
+// external clients.
 func RequestHandler(w http.ResponseWriter, r *http.Request) bool {
 	path := strings.ReplaceAll(r.URL.Path, "//", "/")
 
@@ -135,9 +234,27 @@ func RequestHandler(w http.ResponseWriter, r *http.Request) bool {
 	return false
 }
 
+// selectHandler handles all /select/* requests with timeout and concurrency control.
+//
+// Special cases handled before concurrency control:
+//   - /select/buildinfo: Returns version info (no timeout, no concurrency limit)
+//   - /select/vmui: Redirects to VMUI (no timeout, no concurrency limit)
+//   - /select/logsql/tail: Live tailing (no timeout, no concurrency limit - runs indefinitely)
+//
+// For all other queries:
+//  1. Parse the timeout from request or use -search.maxQueryDuration
+//  2. Create a context with the timeout
+//  3. Acquire a concurrency slot (blocks if limit reached)
+//  4. Execute the query via processSelectRequest
+//  5. Release the concurrency slot on completion
+//  6. Log slow queries if -search.logSlowQueryDuration is exceeded
+//
+// The tail endpoint bypasses concurrency limits because it's a long-lived polling
+// connection that's mostly idle between poll intervals.
 func selectHandler(w http.ResponseWriter, r *http.Request, path string) bool {
 	ctx := r.Context()
 
+	// Handle /select/buildinfo - returns VictoriaLogs version info
 	if path == "/select/buildinfo" {
 		httpserver.EnableCORS(w, r)
 
@@ -150,7 +267,6 @@ func selectHandler(w http.ResponseWriter, r *http.Request, path string) bool {
 
 		v := buildinfo.ShortVersion()
 		if v == "" {
-			// buildinfo.ShortVersion() may return empty result for builds without tags
 			v = buildinfo.Version
 		}
 
@@ -159,20 +275,16 @@ func selectHandler(w http.ResponseWriter, r *http.Request, path string) bool {
 		return true
 	}
 
+	// Handle /select/vmui - redirect to the VMUI web interface
 	if path == "/select/vmui" {
-		// VMUI access via incomplete url without `/` in the end. Redirect to complete url.
-		// Use relative redirect, since the hostname and path prefix may be incorrect if VictoriaMetrics
-		// is hidden behind vmauth or similar proxy.
 		_ = r.ParseForm()
 		newURL := "vmui/?" + r.Form.Encode()
 		httpserver.Redirect(w, newURL)
 		return true
 	}
 	if strings.HasPrefix(path, "/select/vmui/") {
+		// Static assets get long cache TTL since they're versioned by path
 		if strings.HasPrefix(path, "/select/vmui/static/") {
-			// Allow clients caching static contents for long period of time, since it shouldn't change over time.
-			// Path to static contents (such as js and css) must be changed whenever its contents is changed.
-			// See https://developer.chrome.com/docs/lighthouse/performance/uses-long-cache-ttl/
 			w.Header().Set("Cache-Control", "max-age=31536000")
 		}
 		r.URL.Path = strings.TrimPrefix(path, "/select")
@@ -180,15 +292,15 @@ func selectHandler(w http.ResponseWriter, r *http.Request, path string) bool {
 		return true
 	}
 
+	// Live tailing: no timeout, no concurrency limit
+	// These are long-lived connections that poll for new logs periodically
 	if path == "/select/logsql/tail" {
 		logsqlTailRequests.Inc()
-		// Process live tailing request without timeout, since it is OK to run live tailing requests for very long time.
-		// Also do not apply concurrency limit to tail requests, since these limits are intended for non-tail requests.
 		logsql.ProcessLiveTailRequest(ctx, w, r)
 		return true
 	}
 
-	// Limit the number of concurrent queries, which can consume big amounts of CPU time.
+	// All other queries: apply timeout and concurrency limits
 	startTime := time.Now()
 	d, err := getMaxQueryDuration(r)
 	if err != nil {
@@ -198,6 +310,7 @@ func selectHandler(w http.ResponseWriter, r *http.Request, path string) bool {
 	ctxWithTimeout, cancel := context.WithTimeout(ctx, d)
 	defer cancel()
 
+	// Try to acquire a concurrency slot; returns false if timed out waiting
 	if !incRequestConcurrency(ctxWithTimeout, w, r) {
 		return true
 	}
@@ -208,7 +321,7 @@ func selectHandler(w http.ResponseWriter, r *http.Request, path string) bool {
 		return false
 	}
 
-	// Log slow queries
+	// Log slow queries for debugging and optimization
 	if *logSlowQueryDuration > 0 {
 		d := time.Since(startTime)
 		if d >= *logSlowQueryDuration {
@@ -224,14 +337,20 @@ func selectHandler(w http.ResponseWriter, r *http.Request, path string) bool {
 	return true
 }
 
+// logRequestErrorIfNeeded logs context errors that occurred during query execution.
+//
+// This handles three cases:
+//   - nil: Query completed successfully, nothing to log
+//   - context.Canceled: Client disconnected (expected, don't log as error)
+//   - context.DeadlineExceeded: Query timed out - log with helpful suggestions
 func logRequestErrorIfNeeded(ctx context.Context, w http.ResponseWriter, r *http.Request, startTime time.Time) {
 	err := ctx.Err()
 	switch err {
 	case nil:
-		// nothing to do
 	case context.Canceled:
-		// do not log canceled requests, since they are expected and legal.
+		// Client canceled - this is expected and legal, don't spam logs
 	case context.DeadlineExceeded:
+		// Query timed out - provide actionable suggestions
 		err = &httpserver.ErrorWithStatusCode{
 			Err: fmt.Errorf("the request couldn't be executed in %.3f seconds; possible solutions: "+
 				"to increase -search.maxQueryDuration=%s; to pass bigger value to 'timeout' query arg", time.Since(startTime).Seconds(), maxQueryDuration),
@@ -243,26 +362,41 @@ func logRequestErrorIfNeeded(ctx context.Context, w http.ResponseWriter, r *http
 	}
 }
 
+// incRequestConcurrency tries to acquire a slot in the concurrency limiter.
+//
+// Returns true if a slot was acquired, false if the context expired while waiting.
+//
+// The algorithm uses two-stage blocking:
+//  1. Non-blocking try: If channel has space, acquire immediately
+//  2. Blocking wait: If full, wait for space or context cancellation
+//
+// This approach handles short request bursts efficiently (stage 1) while still
+// providing queueing for brief overload periods (stage 2).
 func incRequestConcurrency(ctx context.Context, w http.ResponseWriter, r *http.Request) bool {
 	startTime := time.Now()
 	stopCh := ctx.Done()
 	select {
 	case concurrencyLimitCh <- struct{}{}:
+		// Fast path: slot available immediately
 		return true
 	default:
-		// Sleep for a while until giving up. This should resolve short bursts in requests.
+		// Slow path: need to wait for a slot
 		concurrencyLimitReached.Inc()
 		select {
 		case concurrencyLimitCh <- struct{}{}:
+			// Slot became available
 			return true
 		case <-stopCh:
+			// Context expired while waiting
 			switch ctx.Err() {
 			case context.Canceled:
+				// Client disconnected
 				remoteAddr := httpserver.GetQuotedRemoteAddr(r)
 				requestURI := httpserver.GetRequestURI(r)
 				logger.Infof("client has canceled the pending request after %.3f seconds: remoteAddr=%s, requestURI: %q",
 					time.Since(startTime).Seconds(), remoteAddr, requestURI)
 			case context.DeadlineExceeded:
+				// Timeout while waiting - return error with suggestions
 				concurrencyLimitTimeout.Inc()
 				err := &httpserver.ErrorWithStatusCode{
 					Err: fmt.Errorf("couldn't start executing the request in %.3f seconds, since -search.maxConcurrentRequests=%d concurrent requests "+
@@ -279,74 +413,95 @@ func incRequestConcurrency(ctx context.Context, w http.ResponseWriter, r *http.R
 	}
 }
 
+// decRequestConcurrency releases a concurrency slot.
+// This must be called after a successful incRequestConcurrency, typically via defer.
 func decRequestConcurrency() {
 	<-concurrencyLimitCh
 }
 
+// processSelectRequest routes requests to the appropriate handler based on URL path.
+//
+// Each endpoint has associated metrics (request count and duration) that are
+// updated automatically. Duration isn't tracked only for tail and query_time_range.
+//
+// Returns false if the path doesn't match any known endpoint (for 404 handling).
 func processSelectRequest(ctx context.Context, w http.ResponseWriter, r *http.Request, path string) bool {
 	httpserver.EnableCORS(w, r)
 	startTime := time.Now()
 	switch path {
 	case "/select/logsql/query_time_range":
+		// Returns the effective time range for a query (doesn't execute the query)
 		logsqlQueryTimeRangeRequests.Inc()
 		logsql.ProcessQueryTimeRangeRequest(ctx, w, r)
 		return true
 	case "/select/logsql/facets":
+		// Returns field value facets with hit counts
 		logsqlFacetsRequests.Inc()
 		logsql.ProcessFacetsRequest(ctx, w, r)
 		logsqlFacetsDuration.UpdateDuration(startTime)
 		return true
 	case "/select/logsql/field_names":
+		// Lists field names seen in matching logs
 		logsqlFieldNamesRequests.Inc()
 		logsql.ProcessFieldNamesRequest(ctx, w, r)
 		logsqlFieldNamesDuration.UpdateDuration(startTime)
 		return true
 	case "/select/logsql/field_values":
+		// Lists unique values for a specific field
 		logsqlFieldValuesRequests.Inc()
 		logsql.ProcessFieldValuesRequest(ctx, w, r)
 		logsqlFieldValuesDuration.UpdateDuration(startTime)
 		return true
 	case "/select/logsql/hits":
+		// Returns hit counts over time buckets (histogram)
 		logsqlHitsRequests.Inc()
 		logsql.ProcessHitsRequest(ctx, w, r)
 		logsqlHitsDuration.UpdateDuration(startTime)
 		return true
 	case "/select/logsql/query":
+		// Main query endpoint - streams matching logs as NDJSON
 		logsqlQueryRequests.Inc()
 		logsql.ProcessQueryRequest(ctx, w, r)
 		logsqlQueryDuration.UpdateDuration(startTime)
 		return true
 	case "/select/logsql/stats_query":
+		// Prometheus-style instant vector query
 		logsqlStatsQueryRequests.Inc()
 		logsql.ProcessStatsQueryRequest(ctx, w, r)
 		logsqlStatsQueryDuration.UpdateDuration(startTime)
 		return true
 	case "/select/logsql/stats_query_range":
+		// Prometheus-style range vector query
 		logsqlStatsQueryRangeRequests.Inc()
 		logsql.ProcessStatsQueryRangeRequest(ctx, w, r)
 		logsqlStatsQueryRangeDuration.UpdateDuration(startTime)
 		return true
 	case "/select/logsql/stream_field_names":
+		// Lists stream field names (fields that define streams)
 		logsqlStreamFieldNamesRequests.Inc()
 		logsql.ProcessStreamFieldNamesRequest(ctx, w, r)
 		logsqlStreamFieldNamesDuration.UpdateDuration(startTime)
 		return true
 	case "/select/logsql/stream_field_values":
+		// Lists values for a specific stream field
 		logsqlStreamFieldValuesRequests.Inc()
 		logsql.ProcessStreamFieldValuesRequest(ctx, w, r)
 		logsqlStreamFieldValuesDuration.UpdateDuration(startTime)
 		return true
 	case "/select/logsql/stream_ids":
+		// Lists internal stream IDs
 		logsqlStreamIDsRequests.Inc()
 		logsql.ProcessStreamIDsRequest(ctx, w, r)
 		logsqlStreamIDsDuration.UpdateDuration(startTime)
 		return true
 	case "/select/logsql/streams":
+		// Lists log streams (unique combinations of stream field values)
 		logsqlStreamsRequests.Inc()
 		logsql.ProcessStreamsRequest(ctx, w, r)
 		logsqlStreamsDuration.UpdateDuration(startTime)
 		return true
 	case "/select/tenant_ids":
+		// Lists tenant IDs with data in the specified time range
 		tenantIDsRequests.Inc()
 		logsql.ProcessTenantIDsRequest(ctx, w, r)
 		tenantIDsDuration.UpdateDuration(startTime)
@@ -356,17 +511,24 @@ func processSelectRequest(ctx context.Context, w http.ResponseWriter, r *http.Re
 	}
 }
 
+// deleteHandler routes delete requests to the appropriate handler.
+//
+// Delete operations are asynchronous and run as background tasks. This allows
+// deletion of large amounts of data without blocking the HTTP request.
 func deleteHandler(w http.ResponseWriter, r *http.Request, path string) {
 	ctx := r.Context()
 
 	switch path {
 	case "/delete/run_task":
+		// Start a new delete task
 		deleteRunTaskRequests.Inc()
 		processDeleteRunTaskRequest(ctx, w, r)
 	case "/delete/stop_task":
+		// Stop a running delete task
 		deleteStopTaskRequests.Inc()
 		processDeleteStopTaskRequest(ctx, w, r)
 	case "/delete/active_tasks":
+		// List all active (running) delete tasks
 		deleteActiveTasksRequests.Inc()
 		processDeleteActiveTasksRequest(ctx, w, r)
 	default:
@@ -374,6 +536,14 @@ func deleteHandler(w http.ResponseWriter, r *http.Request, path string) {
 	}
 }
 
+// processDeleteRunTaskRequest starts an asynchronous delete task.
+//
+// Delete tasks run in the background and can be monitored via /delete/active_tasks
+// and stopped via /delete/stop_task. The task ID is generated from the current
+// timestamp (nanoseconds) for uniqueness.
+//
+// In cluster mode, the task is started on ALL vlstorage nodes simultaneously.
+// Each node deletes only the logs it stores locally.
 func processDeleteRunTaskRequest(ctx context.Context, w http.ResponseWriter, r *http.Request) {
 	tenantID, err := logstorage.GetTenantIDFromRequest(r)
 	if err != nil {
@@ -381,6 +551,7 @@ func processDeleteRunTaskRequest(ctx context.Context, w http.ResponseWriter, r *
 		return
 	}
 
+	// Parse the LogsQL filter that determines what to delete
 	fStr := r.FormValue("filter")
 	f, err := logstorage.ParseFilter(fStr)
 	if err != nil {
@@ -388,7 +559,7 @@ func processDeleteRunTaskRequest(ctx context.Context, w http.ResponseWriter, r *
 		return
 	}
 
-	// Generate taskID from the current timestamp in nanoseconds
+	// Generate unique task ID from current timestamp
 	timestamp := time.Now().UnixNano()
 	taskID := fmt.Sprintf("%d", timestamp)
 
@@ -402,6 +573,10 @@ func processDeleteRunTaskRequest(ctx context.Context, w http.ResponseWriter, r *
 	fmt.Fprintf(w, `{"task_id":%q}`, taskID)
 }
 
+// processDeleteStopTaskRequest stops a running delete task.
+//
+// Stopping a task prevents further deletion, but logs that were already deleted
+// before the stop request are permanently removed.
 func processDeleteStopTaskRequest(ctx context.Context, w http.ResponseWriter, r *http.Request) {
 	taskID := r.FormValue("task_id")
 	if taskID == "" {
@@ -418,6 +593,10 @@ func processDeleteStopTaskRequest(ctx context.Context, w http.ResponseWriter, r 
 	fmt.Fprintf(w, `{"status":"ok"}`)
 }
 
+// processDeleteActiveTasksRequest returns all currently running delete tasks.
+//
+// In cluster mode, tasks from all vlstorage nodes are merged and deduplicated.
+// The response includes task ID, filter, timestamp, and tenant IDs for each task.
 func processDeleteActiveTasksRequest(ctx context.Context, w http.ResponseWriter, r *http.Request) {
 	tasks, err := vlstorage.DeleteActiveTasks(ctx)
 	if err != nil {
@@ -432,6 +611,13 @@ func processDeleteActiveTasksRequest(ctx context.Context, w http.ResponseWriter,
 }
 
 // getMaxQueryDuration returns the maximum duration for query from r.
+//
+// The timeout is determined by:
+//  1. If 'timeout' query arg is provided: use that value (capped by -search.maxQueryDuration)
+//  2. Otherwise: use -search.maxQueryDuration (default 30s)
+//
+// This allows clients to request shorter timeouts for interactive queries while
+// preventing abuse via excessively long timeouts.
 func getMaxQueryDuration(r *http.Request) (time.Duration, error) {
 	s := r.FormValue("timeout")
 	if s == "" {
@@ -442,6 +628,7 @@ func getMaxQueryDuration(r *http.Request) (time.Duration, error) {
 		return 0, fmt.Errorf("cannot parse duration at 'timeout=%s' arg", s)
 	}
 	d := time.Duration(nsecs)
+	// Cap to the maximum allowed duration
 	if d <= 0 || d > *maxQueryDuration {
 		d = *maxQueryDuration
 	}
@@ -449,6 +636,10 @@ func getMaxQueryDuration(r *http.Request) (time.Duration, error) {
 }
 
 var (
+	// Request counters and duration metrics for each query endpoint
+	// These follow the pattern: vl_http_requests_total{path="/select/..."}
+	// and vl_http_request_duration_seconds{path="/select/..."}
+
 	logsqlFacetsRequests = metrics.NewCounter(`vl_http_requests_total{path="/select/logsql/facets"}`)
 	logsqlFacetsDuration = metrics.NewSummary(`vl_http_request_duration_seconds{path="/select/logsql/facets"}`)
 
@@ -485,16 +676,17 @@ var (
 	tenantIDsRequests = metrics.NewCounter(`vl_http_requests_total{path="/select/tenant_ids"}`)
 	tenantIDsDuration = metrics.NewSummary(`vl_http_request_duration_seconds{path="/select/tenant_ids"}`)
 
-	// no need to track duration for tail requests, as they usually take long time
+	// Tail requests don't track duration since they run indefinitely
 	logsqlTailRequests = metrics.NewCounter(`vl_http_requests_total{path="/select/logsql/tail"}`)
 
-	// no need to track the duration for query_time_range requests, since they are instant
+	// query_time_range is instant, no duration tracking needed
 	logsqlQueryTimeRangeRequests = metrics.NewCounter(`vl_http_requests_total{path="/select/logsql/query_time_range"}`)
 
-	// no need to track duration for /delete/* requests, because they are asynchornous
+	// Delete endpoints don't track duration since they're asynchronous
 	deleteRunTaskRequests     = metrics.NewCounter(`vl_http_requests_total{path="/delete/run_task"}`)
 	deleteStopTaskRequests    = metrics.NewCounter(`vl_http_requests_total{path="/delete/stop_task"}`)
 	deleteActiveTasksRequests = metrics.NewCounter(`vl_http_requests_total{path="/delete/active_tasks"}`)
 
+	// Slow query counter for monitoring query performance
 	slowQueries = metrics.NewCounter(`vl_slow_queries_total`)
 )

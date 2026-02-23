@@ -69,10 +69,10 @@ The system supports two deployment modes — the same dual-path architecture use
 ## Complete Data Flow
 
 **Key Files**:
-- [`app/vlselect/main.go`](../app/vlselect/main.go#L90) - HTTP routing and concurrency control
-- [`app/vlselect/logsql/logsql.go`](../app/vlselect/logsql/logsql.go#L1149) - Query endpoint handlers
+- [`app/vlselect/main.go`](../app/vlselect/main.go#L189) - HTTP routing and concurrency control
+- [`app/vlselect/logsql/logsql.go`](../app/vlselect/logsql/logsql.go#L1323) - Query endpoint handlers
 - [`app/vlstorage/main.go`](../app/vlstorage/main.go#L554) - Storage router
-- [`app/vlstorage/lastnoptimization.go`](../app/vlstorage/lastnoptimization.go#L15) - Last N results optimization
+- [`app/vlstorage/lastnoptimization.go`](../app/vlstorage/lastnoptimization.go#L69) - Last N results optimization
 - [`app/vlselect/internalselect/internalselect.go`](../app/vlselect/internalselect/internalselect.go#L31) - Internal select endpoint
 - [`app/vlstorage/netselect/netselect.go`](../app/vlstorage/netselect/netselect.go#L385) - Distributed query network layer
 - [`lib/logstorage/storage_search.go`](../lib/logstorage/storage_search.go#L208) - Local storage query execution
@@ -81,24 +81,24 @@ The system supports two deployment modes — the same dual-path architecture use
 ```
 HTTP Request (GET/POST /select/logsql/query?query=...)
     ↓
-vlselect.RequestHandler                   [main.go:90](../app/vlselect/main.go#L90)
+vlselect.RequestHandler                   [main.go:189](../app/vlselect/main.go#L189)
     ↓
-selectHandler                             [main.go:138](../app/vlselect/main.go#L138)
+selectHandler                             [main.go:254](../app/vlselect/main.go#L254)
     ↓
-Timeout + Concurrency Control             [main.go:192-204](../app/vlselect/main.go#L192)
+Timeout + Concurrency Control             [main.go:303-317](../app/vlselect/main.go#L303)
     ↓
-processSelectRequest (route by path)      [main.go:286](../app/vlselect/main.go#L286)
+processSelectRequest (route by path)      [main.go:428](../app/vlselect/main.go#L428)
     ↓
-logsql.ProcessQueryRequest                [logsql.go:1149](../app/vlselect/logsql/logsql.go#L1149)
+logsql.ProcessQueryRequest                [logsql.go:1323](../app/vlselect/logsql/logsql.go#L1323)
     ↓
-parseCommonArgs (query, tenant, time)     [logsql.go:1358](../app/vlselect/logsql/logsql.go#L1358)
+parseCommonArgs (query, tenant, time)     [logsql.go:1566](../app/vlselect/logsql/logsql.go#L1566)
     ↓
-ca.newQueryContext(ctx)                   [logsql.go:1350](../app/vlselect/logsql/logsql.go#L1350)
+ca.newQueryContext(ctx)                   [logsql.go:1548](../app/vlselect/logsql/logsql.go#L1548)
     ↓
 vlstorage.RunQuery(qctx, writeBlock)     [main.go:554](../app/vlstorage/main.go#L554)
     ↓
     ├─→ [LAST-N OPTIMIZATION]
-    │   runOptimizedLastNResultsQuery     [lastnoptimization.go:15](../app/vlstorage/lastnoptimization.go#L15)
+    │   runOptimizedLastNResultsQuery     [lastnoptimization.go:69](../app/vlstorage/lastnoptimization.go#L69)
     │       ↓
     │   Binary search over time range
     │       ↓
@@ -139,14 +139,14 @@ vlstorage.RunQuery(qctx, writeBlock)     [main.go:554](../app/vlstorage/main.go#
 
 ### 1. HTTP Endpoint Layer
 
-**File**: [`app/vlselect/main.go`](../app/vlselect/main.go#L90)
+**File**: [`app/vlselect/main.go`](../app/vlselect/main.go#L189)
 
 The top-level router dispatches incoming requests to the appropriate handler based on the URL path.
 
 **Key Functions**:
-- [`RequestHandler(w, r)`](../app/vlselect/main.go#L90) - Main HTTP router for all `/select/*`, `/delete/*`, and `/internal/select/*` paths
-- [`selectHandler(w, r, path)`](../app/vlselect/main.go#L138) - Handles `/select/*` paths with timeout and concurrency control
-- [`processSelectRequest(ctx, w, r, path)`](../app/vlselect/main.go#L286) - Routes to specific logsql handler by path
+- [`RequestHandler(w, r)`](../app/vlselect/main.go#L189) - Main HTTP router for all `/select/*`, `/delete/*`, and `/internal/select/*` paths
+- [`selectHandler(w, r, path)`](../app/vlselect/main.go#L254) - Handles `/select/*` paths with timeout and concurrency control
+- [`processSelectRequest(ctx, w, r, path)`](../app/vlselect/main.go#L428) - Routes to specific logsql handler by path
 
 ```go
 func RequestHandler(w http.ResponseWriter, r *http.Request) bool {
@@ -187,19 +187,19 @@ func RequestHandler(w http.ResponseWriter, r *http.Request) bool {
 }
 ```
 
-**Location**: [`app/vlselect/main.go:90-136`](../app/vlselect/main.go#L90)
+**Location**: [`app/vlselect/main.go:189-235`](../app/vlselect/main.go#L189)
 
 ---
 
 ### 2. Common Query Arguments
 
-**File**: [`app/vlselect/logsql/logsql.go`](../app/vlselect/logsql/logsql.go#L1326)
+**File**: [`app/vlselect/logsql/logsql.go`](../app/vlselect/logsql/logsql.go#L1521)
 
 Most `/select/logsql/*` endpoints parse a shared set of arguments via `parseCommonArgs*` before executing the query.
 
 **Key Functions**:
-- [`parseCommonArgs(r)`](../app/vlselect/logsql/logsql.go#L1358) - Parse common query arguments from HTTP request
-- [`parseCommonArgsWithConfig(r, skipMaxRangeCheck)`](../app/vlselect/logsql/logsql.go#L1362) - Full implementation
+- [`parseCommonArgs(r)`](../app/vlselect/logsql/logsql.go#L1566) - Parse common query arguments from HTTP request
+- [`parseCommonArgsWithConfig(r, skipMaxRangeCheck)`](../app/vlselect/logsql/logsql.go#L1572) - Full implementation
 
 ```go
 type commonArgs struct {
@@ -252,20 +252,20 @@ Notes:
 - If `time` is provided, parsing uses `time-1ns` internally to avoid boundary spillover into the next period.
 - `/select/tenant_ids` does not use `parseCommonArgs*`; it has its own parsing and security checks.
 
-**Location**: [`app/vlselect/logsql/logsql.go:1326-1500`](../app/vlselect/logsql/logsql.go#L1326)
+**Location**: [`app/vlselect/logsql/logsql.go:1521-1709`](../app/vlselect/logsql/logsql.go#L1521)
 
 ---
 
 ### 3. Concurrency Control
 
-**File**: [`app/vlselect/main.go`](../app/vlselect/main.go#L246)
+**File**: [`app/vlselect/main.go`](../app/vlselect/main.go#L375)
 
 VictoriaLogs limits concurrent query execution to prevent resource exhaustion. A single query can saturate all CPU cores, so the default limit is CPU-based and capped at 16 (`2*CPUs` only when `CPUs <= 4`).
 
 **Key Functions**:
-- [`incRequestConcurrency(ctx, w, r)`](../app/vlselect/main.go#L246) - Acquire concurrency slot (blocks until available or timeout)
-- [`decRequestConcurrency()`](../app/vlselect/main.go#L282) - Release concurrency slot
-- [`getMaxQueryDuration(r)`](../app/vlselect/main.go#L435) - Resolve query timeout
+- [`incRequestConcurrency(ctx, w, r)`](../app/vlselect/main.go#L375) - Acquire concurrency slot (blocks until available or timeout)
+- [`decRequestConcurrency()`](../app/vlselect/main.go#L418) - Release concurrency slot
+- [`getMaxQueryDuration(r)`](../app/vlselect/main.go#L621) - Resolve query timeout
 
 ```go
 func selectHandler(w http.ResponseWriter, r *http.Request, path string) bool {
@@ -297,13 +297,13 @@ concurrencyLimitCh = make(chan struct{}, *maxConcurrentRequests)
 
 If the channel is full, the request waits until a slot opens or the request context is canceled/deadline-exceeded. In this path, the deadline comes from `timeout` / `-search.maxQueryDuration`.
 
-**Location**: [`app/vlselect/main.go:138-284`](../app/vlselect/main.go#L138)
+**Location**: [`app/vlselect/main.go:254-418`](../app/vlselect/main.go#L254)
 
 ---
 
 ### 4. Query Endpoint Handlers
 
-**File**: [`app/vlselect/logsql/logsql.go`](../app/vlselect/logsql/logsql.go#L1149)
+**File**: [`app/vlselect/logsql/logsql.go`](../app/vlselect/logsql/logsql.go#L1323)
 
 Each query endpoint follows a common pattern:
 1. Parse common args (`parseCommonArgs`)
@@ -316,7 +316,7 @@ Each query endpoint follows a common pattern:
 #### `/select/logsql/query` — Full Log Query
 
 **Key Functions**:
-- [`ProcessQueryRequest(ctx, w, r)`](../app/vlselect/logsql/logsql.go#L1149) - Main query handler
+- [`ProcessQueryRequest(ctx, w, r)`](../app/vlselect/logsql/logsql.go#L1323) - Main query handler
 
 ```go
 func ProcessQueryRequest(ctx context.Context, w http.ResponseWriter, r *http.Request) {
@@ -347,12 +347,12 @@ func ProcessQueryRequest(ctx context.Context, w http.ResponseWriter, r *http.Req
 
 This endpoint streams results as `application/stream+json` — each log row is written as a separate JSON object on a single line. This allows the client to start processing results before the query is complete.
 
-**Location**: [`app/vlselect/logsql/logsql.go:1149-1231`](../app/vlselect/logsql/logsql.go#L1149)
+**Location**: [`app/vlselect/logsql/logsql.go:1323-1408`](../app/vlselect/logsql/logsql.go#L1323)
 
 #### `/select/logsql/hits` — Histogram Over Time
 
 **Key Functions**:
-- [`ProcessHitsRequest(ctx, w, r)`](../app/vlselect/logsql/logsql.go#L215) - Hit count handler
+- [`ProcessHitsRequest(ctx, w, r)`](../app/vlselect/logsql/logsql.go#L299) - Hit count handler
 
 Adds a time-bucketed stats pipeline via `AddCountByTimePipe(step, offset, fields)`, which appends:
 - `| stats by (_time:<step> [offset ...], <fields...>) count() hits`
@@ -360,48 +360,48 @@ Adds a time-bucketed stats pipeline via `AddCountByTimePipe(step, offset, fields
 
 Before this, unsafe trailing pipes that can alter/remove `_time` are dropped so bucketing remains correct.
 
-**Location**: [`app/vlselect/logsql/logsql.go:215-316`](../app/vlselect/logsql/logsql.go#L215)
+**Location**: [`app/vlselect/logsql/logsql.go:299-402`](../app/vlselect/logsql/logsql.go#L299)
 
 #### `/select/logsql/stats_query` — Instant Statistics
 
 **Key Functions**:
-- [`ProcessStatsQueryRequest(ctx, w, r)`](../app/vlselect/logsql/logsql.go#L1028) - Stats query handler
+- [`ProcessStatsQueryRequest(ctx, w, r)`](../app/vlselect/logsql/logsql.go#L1189) - Stats query handler
 
 Expects the query to end with a stats pipe (e.g., `| stats count() as total`). Returns Prometheus-compatible instant vector results.
 
-**Location**: [`app/vlselect/logsql/logsql.go:1028-1132`](../app/vlselect/logsql/logsql.go#L1028)
+**Location**: [`app/vlselect/logsql/logsql.go:1189-1291`](../app/vlselect/logsql/logsql.go#L1189)
 
 #### `/select/logsql/stats_query_range` — Range Statistics
 
 **Key Functions**:
-- [`ProcessStatsQueryRangeRequest(ctx, w, r)`](../app/vlselect/logsql/logsql.go#L854) - Range stats handler
+- [`ProcessStatsQueryRangeRequest(ctx, w, r)`](../app/vlselect/logsql/logsql.go#L1008) - Range stats handler
 
 Like `stats_query`, but it augments the final `| stats ...` grouping with `_time:<step> offset <offset>` via `GetStatsLabelsAddGroupingByTime(step, offset)`.
 
 It does not add a separate `group_by_time` pipe.
 
-**Location**: [`app/vlselect/logsql/logsql.go:854-1010`](../app/vlselect/logsql/logsql.go#L854)
+**Location**: [`app/vlselect/logsql/logsql.go:1008-1159`](../app/vlselect/logsql/logsql.go#L1008)
 
 #### `/select/logsql/facets` — Field Facets
 
 **Key Functions**:
-- [`ProcessFacetsRequest(ctx, w, r)`](../app/vlselect/logsql/logsql.go#L114) - Facets handler
+- [`ProcessFacetsRequest(ctx, w, r)`](../app/vlselect/logsql/logsql.go#L183) - Facets handler
 
 Drops all pipes from the query and adds a facets pipe. Returns JSON in the form `{"facets":[...]}` with per-field top values and hits.
 
-**Location**: [`app/vlselect/logsql/logsql.go:114-205`](../app/vlselect/logsql/logsql.go#L114)
+**Location**: [`app/vlselect/logsql/logsql.go:183-275`](../app/vlselect/logsql/logsql.go#L183)
 
 #### Metadata Endpoints
 
 These endpoints query for metadata rather than log rows:
 
-- [`ProcessFieldNamesRequest`](../app/vlselect/logsql/logsql.go#L427) → calls `vlstorage.GetFieldNames(qctx)`
-- [`ProcessFieldValuesRequest`](../app/vlselect/logsql/logsql.go#L458) → calls `vlstorage.GetFieldValues(qctx, fieldName, limit)`
-- [`ProcessStreamFieldNamesRequest`](../app/vlselect/logsql/logsql.go#L503) → calls `vlstorage.GetStreamFieldNames(qctx)`
-- [`ProcessStreamFieldValuesRequest`](../app/vlselect/logsql/logsql.go#L534) → calls `vlstorage.GetStreamFieldValues(qctx, fieldName, limit)`
-- [`ProcessStreamIDsRequest`](../app/vlselect/logsql/logsql.go#L579) → calls `vlstorage.GetStreamIDs(qctx, limit)`
-- [`ProcessStreamsRequest`](../app/vlselect/logsql/logsql.go#L617) → calls `vlstorage.GetStreams(qctx, limit)`
-- [`ProcessTenantIDsRequest`](../app/vlselect/logsql/logsql.go#L1234) → calls `vlstorage.GetTenantIDs(ctx, start, end)`
+- [`ProcessFieldNamesRequest`](../app/vlselect/logsql/logsql.go#L534) → calls `vlstorage.GetFieldNames(qctx)`
+- [`ProcessFieldValuesRequest`](../app/vlselect/logsql/logsql.go#L572) → calls `vlstorage.GetFieldValues(qctx, fieldName, limit)`
+- [`ProcessStreamFieldNamesRequest`](../app/vlselect/logsql/logsql.go#L615) → calls `vlstorage.GetStreamFieldNames(qctx)`
+- [`ProcessStreamFieldValuesRequest`](../app/vlselect/logsql/logsql.go#L646) → calls `vlstorage.GetStreamFieldValues(qctx, fieldName, limit)`
+- [`ProcessStreamIDsRequest`](../app/vlselect/logsql/logsql.go#L689) → calls `vlstorage.GetStreamIDs(qctx, limit)`
+- [`ProcessStreamsRequest`](../app/vlselect/logsql/logsql.go#L726) → calls `vlstorage.GetStreams(qctx, limit)`
+- [`ProcessTenantIDsRequest`](../app/vlselect/logsql/logsql.go#L1420) → calls `vlstorage.GetTenantIDs(ctx, start, end)`
 
 External metadata responses are wrapped as `{"values":[{"value":"...","hits":N}, ...]}`.
 
@@ -922,10 +922,10 @@ func writeValuesWithHits(w http.ResponseWriter, qctx *logstorage.QueryContext, v
 
 ### Live Tailing
 
-**File**: [`app/vlselect/logsql/logsql.go`](../app/vlselect/logsql/logsql.go#L655)
+**File**: [`app/vlselect/logsql/logsql.go`](../app/vlselect/logsql/logsql.go#L776)
 
 **Key Functions**:
-- [`ProcessLiveTailRequest(ctx, w, r)`](../app/vlselect/logsql/logsql.go#L655) - Live tail handler
+- [`ProcessLiveTailRequest(ctx, w, r)`](../app/vlselect/logsql/logsql.go#L776) - Live tail handler
 
 Live tailing provides a streaming connection that periodically polls for new log entries:
 
@@ -967,20 +967,20 @@ func ProcessLiveTailRequest(ctx context.Context, w http.ResponseWriter, r *http.
 - **Per-stream deduplication**: Tracks last-seen timestamp per stream to avoid duplicates across poll intervals
 - **5-second overlap**: Each poll looks back 5 seconds to catch late-arriving logs
 
-**Location**: [`app/vlselect/logsql/logsql.go:655-849`](../app/vlselect/logsql/logsql.go#L655)
+**Location**: [`app/vlselect/logsql/logsql.go:776-992`](../app/vlselect/logsql/logsql.go#L776)
 
 ---
 
 ### Last N Results Optimization
 
-**File**: [`app/vlstorage/lastnoptimization.go`](../app/vlstorage/lastnoptimization.go#L15)
+**File**: [`app/vlstorage/lastnoptimization.go`](../app/vlstorage/lastnoptimization.go#L69)
 
 When a query requests the last N results (detected by `query.GetLastNResultsQuery()`), VictoriaLogs uses a binary search over time ranges instead of scanning all data:
 
 **Key Functions**:
-- [`runOptimizedLastNResultsQuery(qctx, offset, limit, writeBlock)`](../app/vlstorage/lastnoptimization.go#L15) - Entry point
-- [`getLastNQueryResults(qctx, limit)`](../app/vlstorage/lastnoptimization.go#L41) - Binary search implementation
-- [`getLogRowsLastN(qctx, start, end, n)`](../app/vlstorage/lastnoptimization.go#L124) - Fallback for small ranges
+- [`runOptimizedLastNResultsQuery(qctx, offset, limit, writeBlock)`](../app/vlstorage/lastnoptimization.go#L69) - Entry point
+- [`getLastNQueryResults(qctx, limit)`](../app/vlstorage/lastnoptimization.go#L107) - Binary search implementation
+- [`getLogRowsLastN(qctx, start, end, n)`](../app/vlstorage/lastnoptimization.go#L190) - Fallback for small ranges
 
 ```go
 func getLastNQueryResults(qctx *logstorage.QueryContext, limit uint64) ([]logRow, error) {
@@ -1015,20 +1015,20 @@ func getLastNQueryResults(qctx *logstorage.QueryContext, limit uint64) ([]logRow
 
 This optimization is triggered when the query ends with `| sort by (_time) desc | limit N` (or the equivalent implicit pattern), which is the common case for "show me the latest logs" queries.
 
-**Location**: [`app/vlstorage/lastnoptimization.go:15-209`](../app/vlstorage/lastnoptimization.go#L15)
+**Location**: [`app/vlstorage/lastnoptimization.go:69-284`](../app/vlstorage/lastnoptimization.go#L69)
 
 ---
 
 ### Delete Operations
 
-**File**: [`app/vlselect/main.go`](../app/vlselect/main.go#L359)
+**File**: [`app/vlselect/main.go`](../app/vlselect/main.go#L547)
 
 Delete operations are exposed under `/delete/*` and execute asynchronously:
 
 **Key Functions**:
-- [`processDeleteRunTaskRequest(ctx, w, r)`](../app/vlselect/main.go#L377) - Start a delete task
-- [`processDeleteStopTaskRequest(ctx, w, r)`](../app/vlselect/main.go#L405) - Stop a running delete task
-- [`processDeleteActiveTasksRequest(ctx, w, r)`](../app/vlselect/main.go#L421) - List active delete tasks
+- [`processDeleteRunTaskRequest(ctx, w, r)`](../app/vlselect/main.go#L547) - Start a delete task
+- [`processDeleteStopTaskRequest(ctx, w, r)`](../app/vlselect/main.go#L580) - Stop a running delete task
+- [`processDeleteActiveTasksRequest(ctx, w, r)`](../app/vlselect/main.go#L600) - List active delete tasks
 
 ```
 POST /delete/run_task?filter=<LogsQL filter>
@@ -1045,7 +1045,7 @@ Returns {"task_id":"..."}
 
 Delete tasks run in the background and can be monitored via `/delete/active_tasks` and stopped via `/delete/stop_task`.
 
-**Location**: [`app/vlselect/main.go:359-432`](../app/vlselect/main.go#L359)
+**Location**: [`app/vlselect/main.go:547-616`](../app/vlselect/main.go#L547)
 
 ---
 
@@ -1312,27 +1312,27 @@ All file and line number references must use the following format:
 **1. Section Headers - File References**
 
 ```markdown
-**File**: [`app/vlselect/main.go`](../app/vlselect/main.go#L90)
+**File**: [`app/vlselect/main.go`](../app/vlselect/main.go#L189)
 ```
 
 **2. Function References in Key Functions Lists**
 
 ```markdown
 **Key Functions**:
-- [`RequestHandler(w, r)`](../app/vlselect/main.go#L90) - Main HTTP router
-- [`selectHandler(w, r, path)`](../app/vlselect/main.go#L138) - Select handler with concurrency control
+- [`RequestHandler(w, r)`](../app/vlselect/main.go#L189) - Main HTTP router
+- [`selectHandler(w, r, path)`](../app/vlselect/main.go#L254) - Select handler with concurrency control
 ```
 
 **3. Flow Diagram References**
 
 ```markdown
-vlselect.RequestHandler                   [main.go:90](../app/vlselect/main.go#L90)
+vlselect.RequestHandler                   [main.go:189](../app/vlselect/main.go#L189)
 ```
 
 **4. Location References**
 
 ```markdown
-**Location**: [`app/vlselect/main.go:90-136`](../app/vlselect/main.go#L90)
+**Location**: [`app/vlselect/main.go:189-235`](../app/vlselect/main.go#L189)
 ```
 
 #### Updating File References
