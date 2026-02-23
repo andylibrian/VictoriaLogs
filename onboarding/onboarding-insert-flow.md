@@ -62,37 +62,37 @@ The system supports two deployment modes:
 ## Complete Data Flow
 
 **Key Files**:
-- [`app/vlinsert/nativeinsert/nativeinsert.go`](../app/vlinsert/nativeinsert/nativeinsert.go#L28) - Native insert endpoint
-- [`app/vlinsert/insertutil/common_params.go`](../app/vlinsert/insertutil/common_params.go#L49) - Common parameters and LogMessageProcessor
+- [`app/vlinsert/nativeinsert/nativeinsert.go`](../app/vlinsert/nativeinsert/nativeinsert.go#L72) - Native insert endpoint
+- [`app/vlinsert/insertutil/common_params.go`](../app/vlinsert/insertutil/common_params.go#L121) - Common parameters and LogMessageProcessor
 - [`app/vlstorage/main.go`](../app/vlstorage/main.go#L109) - Storage router
 - [`app/vlstorage/netinsert/netinsert.go`](../app/vlstorage/netinsert/netinsert.go#L375) - Distributed storage network layer
 - [`app/vlinsert/internalinsert/internalinsert.go`](../app/vlinsert/internalinsert/internalinsert.go#L24) - Internal insert endpoint
-- [`lib/logstorage/storage.go`](../lib/logstorage/storage.go#L1139) - Local storage implementation
+- [`lib/logstorage/storage.go`](../lib/logstorage/storage.go#L1205) - Local storage implementation
 - [`lib/logstorage/partition.go`](../lib/logstorage/partition.go#L135) - Partition management
 
 ```
 HTTP Request (POST /insert/native)
     ↓
-nativeinsert.RequestHandler               [nativeinsert.go:28](../app/vlinsert/nativeinsert/nativeinsert.go#L28)
+nativeinsert.RequestHandler               [nativeinsert.go:72](../app/vlinsert/nativeinsert/nativeinsert.go#L72)
     ↓
-Common Parameters Extraction              [common_params.go:49](../app/vlinsert/insertutil/common_params.go#L49)
+Common Parameters Extraction              [common_params.go:121](../app/vlinsert/insertutil/common_params.go#L121)
     ↓
-LogMessageProcessor Creation              [common_params.go:348](../app/vlinsert/insertutil/common_params.go#L348)
+LogMessageProcessor Creation              [common_params.go:574](../app/vlinsert/insertutil/common_params.go#L574)
     ↓
-Parse & Add Rows                          [nativeinsert.go:94](../app/vlinsert/nativeinsert/nativeinsert.go#L94)
+Parse & Add Rows                          [nativeinsert.go:163](../app/vlinsert/nativeinsert/nativeinsert.go#L163)
     ↓
-In-Memory Buffer Accumulation             [common_params.go:290](../app/vlinsert/insertutil/common_params.go#L290)
+In-Memory Buffer Accumulation             [common_params.go:464](../app/vlinsert/insertutil/common_params.go#L464)
     ↓
-Flush Trigger (buffer full / request end) [common_params.go:320](../app/vlinsert/insertutil/common_params.go#L320)
+Flush Trigger (buffer full / request end) [common_params.go:512](../app/vlinsert/insertutil/common_params.go#L512)
     ↓
-logRowsStorage.MustAddRows(lr)            [common_params.go:323](../app/vlinsert/insertutil/common_params.go#L323)
+logRowsStorage.MustAddRows(lr)            [common_params.go:517](../app/vlinsert/insertutil/common_params.go#L517)
     ↓
 vlstorage.Storage.MustAddRows(lr)         [main.go:543](../app/vlstorage/main.go#L543)
     ↓
     ├─→ [LOCAL MODE]
-    │   localStorage.MustAddRows(lr)      [storage.go:1139](../lib/logstorage/storage.go#L1139)
+    │   localStorage.MustAddRows(lr)      [storage.go:1205](../lib/logstorage/storage.go#L1205)
     │       ↓
-    │   Partition by Day                  [storage.go:1204](../lib/logstorage/storage.go#L1204)
+    │   Partition by Day                  [storage.go:1235](../lib/logstorage/storage.go#L1235)
     │       ↓
     │   partition.mustAddRows(lr)         [partition.go:135](../lib/logstorage/partition.go#L135)
     │       ↓
@@ -120,13 +120,13 @@ vlstorage.Storage.MustAddRows(lr)         [main.go:543](../app/vlstorage/main.go
 
 ### 1. HTTP Endpoint Layer
 
-**File**: [`app/vlinsert/nativeinsert/nativeinsert.go`](../app/vlinsert/nativeinsert/nativeinsert.go#L28)
+**File**: [`app/vlinsert/nativeinsert/nativeinsert.go`](../app/vlinsert/nativeinsert/nativeinsert.go#L72)
 
 The `/insert/native` endpoint is the entry point for log ingestion using VictoriaLogs' native protocol.
 
 **Key Functions**:
-- [`RequestHandler(w, r)`](../app/vlinsert/nativeinsert/nativeinsert.go#L28) - Main HTTP handler
-- [`parseData(irp, data, tenantID)`](../app/vlinsert/nativeinsert/nativeinsert.go#L94) - Parse and add rows
+- [`RequestHandler(w, r)`](../app/vlinsert/nativeinsert/nativeinsert.go#L72) - Main HTTP handler
+- [`parseData(irp, data, tenantID)`](../app/vlinsert/nativeinsert/nativeinsert.go#L163) - Parse and add rows
 
 ```go
 func RequestHandler(w http.ResponseWriter, r *http.Request) {
@@ -156,20 +156,20 @@ func RequestHandler(w http.ResponseWriter, r *http.Request) {
 - Extract request encoding (Content-Encoding header)
 - Read and decompress request body
 
-**Location**: [`app/vlinsert/nativeinsert/nativeinsert.go:28`](../app/vlinsert/nativeinsert/nativeinsert.go#L28)
+**Location**: [`app/vlinsert/nativeinsert/nativeinsert.go:72`](../app/vlinsert/nativeinsert/nativeinsert.go#L72)
 
 ---
 
 ### 2. Common Parameters Extraction
 
-**File**: [`app/vlinsert/insertutil/common_params.go`](../app/vlinsert/insertutil/common_params.go#L49)
+**File**: [`app/vlinsert/insertutil/common_params.go`](../app/vlinsert/insertutil/common_params.go#L121)
 
 Extracts ingestion parameters from HTTP headers and query arguments.
 
 **Key Functions**:
-- [`GetCommonParams(r)`](../app/vlinsert/insertutil/common_params.go#L49) - Extract parameters from HTTP request
-- [`getArray(r, argKey, headerKey)`](../app/vlinsert/insertutil/common_params.go#L128) - Get array values from query/header
-- [`getExtraFields(r)`](../app/vlinsert/insertutil/common_params.go#L108) - Parse extra_fields parameter
+- [`GetCommonParams(r)`](../app/vlinsert/insertutil/common_params.go#L121) - Extract parameters from HTTP request
+- [`getArray(r, argKey, headerKey)`](../app/vlinsert/insertutil/common_params.go#L199) - Get array values from query/header
+- [`getExtraFields(r)`](../app/vlinsert/insertutil/common_params.go#L179) - Parse extra_fields parameter
 
 ```go
 type CommonParams struct {
@@ -197,13 +197,13 @@ The struct shown above is a focused subset for ingestion flow explanation. The a
 - Query arg `extra_fields` or Header `VL-Extra-Fields` → `ExtraFields`
 - Query arg `debug` or Header `VL-Debug` → `Debug`
 
-**Location**: [`app/vlinsert/insertutil/common_params.go:49-106`](../app/vlinsert/insertutil/common_params.go#L49)
+**Location**: [`app/vlinsert/insertutil/common_params.go:121-177`](../app/vlinsert/insertutil/common_params.go#L121)
 
 ---
 
 ### 3. Log Message Processor
 
-**File**: [`app/vlinsert/insertutil/common_params.go`](../app/vlinsert/insertutil/common_params.go#L210)
+**File**: [`app/vlinsert/insertutil/common_params.go`](../app/vlinsert/insertutil/common_params.go#L325)
 
 The `logMessageProcessor` is the concurrency-safe orchestration layer that wraps a `*logstorage.LogRows` buffer. It is responsible for:
 - Thread-safe accumulation of log rows into the in-memory `LogRows` buffer
@@ -226,11 +226,11 @@ These two types serve different layers:
 In short: `logMessageProcessor` owns a `LogRows` and adds concurrency control, batching policy, and metrics on top of it. `LogRows` is a dumb buffer that knows how to store rows efficiently but has no flushing or concurrency logic.
 
 **Key Functions**:
-- [`NewLogMessageProcessor(protocolName, isStreamMode)`](../app/vlinsert/insertutil/common_params.go#L348) - Create new processor
-- [`AddRow(timestamp, fields, streamFieldsLen)`](../app/vlinsert/insertutil/common_params.go#L254) - Add a parsed log row to the in-memory `LogRows` buffer (`lmp.lr`)
-- [`AddInsertRow(r)`](../app/vlinsert/insertutil/common_params.go#L290) - Add a pre-marshaled `InsertRow` to the in-memory `LogRows` buffer (`lmp.lr`)
-- [`MustClose()`](../app/vlinsert/insertutil/common_params.go#L335) - Flush remaining buffered rows to storage and release resources
-- [`flushLocked()`](../app/vlinsert/insertutil/common_params.go#L320) - Send buffered `LogRows` to `logRowsStorage.MustAddRows()`, then reset the buffer
+- [`NewLogMessageProcessor(protocolName, isStreamMode)`](../app/vlinsert/insertutil/common_params.go#L574) - Create new processor
+- [`AddRow(timestamp, fields, streamFieldsLen)`](../app/vlinsert/insertutil/common_params.go#L401) - Add a parsed log row to the in-memory `LogRows` buffer (`lmp.lr`)
+- [`AddInsertRow(r)`](../app/vlinsert/insertutil/common_params.go#L464) - Add a pre-marshaled `InsertRow` to the in-memory `LogRows` buffer (`lmp.lr`)
+- [`MustClose()`](../app/vlinsert/insertutil/common_params.go#L541) - Flush remaining buffered rows to storage and release resources
+- [`flushLocked()`](../app/vlinsert/insertutil/common_params.go#L512) - Send buffered `LogRows` to `logRowsStorage.MustAddRows()`, then reset the buffer
 
 ```go
 type logMessageProcessor struct {
@@ -256,13 +256,13 @@ type logMessageProcessor struct {
 lmp := cp.NewLogMessageProcessor("nativeinsert", false)
 ```
 
-**Location**: [`app/vlinsert/insertutil/common_params.go:210-226`](../app/vlinsert/insertutil/common_params.go#L210)
+**Location**: [`app/vlinsert/insertutil/common_params.go:325-356`](../app/vlinsert/insertutil/common_params.go#L325)
 
 ---
 
 ### 4. In-Memory Batching
 
-**File**: [`app/vlinsert/insertutil/common_params.go`](../app/vlinsert/insertutil/common_params.go#L290)
+**File**: [`app/vlinsert/insertutil/common_params.go`](../app/vlinsert/insertutil/common_params.go#L464)
 
 Rows are accumulated in memory to reduce disk I/O. Flushing occurs when:
 1. Buffer is full (`lmp.lr.NeedFlush()` returns true)
@@ -271,7 +271,7 @@ Rows are accumulated in memory to reduce disk I/O. Flushing occurs when:
 
 #### What is "stream mode"?
 
-The `isStreamMode` parameter passed to [`NewLogMessageProcessor`](../app/vlinsert/insertutil/common_params.go#L348) distinguishes two connection patterns:
+The `isStreamMode` parameter passed to [`NewLogMessageProcessor`](../app/vlinsert/insertutil/common_params.go#L574) distinguishes two connection patterns:
 
 | | Stream mode (`true`) | Non-stream mode (`false`) |
 |---|---|---|
@@ -284,7 +284,7 @@ The `isStreamMode` parameter passed to [`NewLogMessageProcessor`](../app/vlinser
 - **Stream mode**: `syslog_tcp`, `syslog_udp`, `syslog_unix`, `journald`, `jsonline`, `elasticsearch_bulk`
 - **Non-stream mode**: `loki_json`, `loki_protobuf`, `datadog`, `opentelemetry_protobuf`, `nativeinsert`, `internalinsert`
 
-When stream mode is enabled, [`initPeriodicFlush()`](../app/vlinsert/insertutil/common_params.go#L227) spawns a background goroutine with a ~1-second ticker. On each tick, if at least 1 second has elapsed since the last flush, it calls `flushLocked()`. This bounds the maximum latency for data to reach storage, even when logs trickle in slowly.
+When stream mode is enabled, [`initPeriodicFlush()`](../app/vlinsert/insertutil/common_params.go#L364) spawns a background goroutine with a ~1-second ticker. On each tick, if at least 1 second has elapsed since the last flush, it calls `flushLocked()`. This bounds the maximum latency for data to reach storage, even when logs trickle in slowly.
 
 #### How the buffer works internally
 
@@ -357,19 +357,19 @@ func (lmp *logMessageProcessor) AddInsertRow(r *logstorage.InsertRow) {
 }
 ```
 
-**Location**: [`app/vlinsert/insertutil/common_params.go:290-317`](../app/vlinsert/insertutil/common_params.go#L290)
+**Location**: [`app/vlinsert/insertutil/common_params.go:464-497`](../app/vlinsert/insertutil/common_params.go#L464)
 
 ---
 
 ### 5. Storage Interface
 
-**File**: [`app/vlinsert/insertutil/common_params.go`](../app/vlinsert/insertutil/common_params.go#L174)
+**File**: [`app/vlinsert/insertutil/common_params.go`](../app/vlinsert/insertutil/common_params.go#L254)
 
 The `LogRowsStorage` interface provides a clean abstraction between the ingestion layer and storage layer.
 
 **Key Functions**:
-- [`SetLogRowsStorage(storage)`](../app/vlinsert/insertutil/common_params.go#L188) - Inject storage implementation
-- [`CanWriteData()`](../app/vlinsert/insertutil/common_params.go#L193) - Check if storage can accept writes
+- [`SetLogRowsStorage(storage)`](../app/vlinsert/insertutil/common_params.go#L272) - Inject storage implementation
+- [`CanWriteData()`](../app/vlinsert/insertutil/common_params.go#L278) - Check if storage can accept writes
 
 ```go
 // LogRowsStorage is an interface for ingesting logs into the storage.
@@ -416,7 +416,7 @@ func (lmp *logMessageProcessor) flushLocked() {
 }
 ```
 
-**Location**: [`app/vlinsert/insertutil/common_params.go:174-195, 320-332`](../app/vlinsert/insertutil/common_params.go#L174)
+**Location**: [`app/vlinsert/insertutil/common_params.go:254-279, 512-525`](../app/vlinsert/insertutil/common_params.go#L254)
 
 ---
 
@@ -491,7 +491,7 @@ func Init() {
 
 ### 7. Day-Based Partitioning (logstorage.Storage)
 
-**File**: [`lib/logstorage/storage.go`](../lib/logstorage/storage.go#L1139)
+**File**: [`lib/logstorage/storage.go`](../lib/logstorage/storage.go#L1205)
 
 This is where `localStorage.MustAddRows(lr)` lands in local mode. The `logstorage.Storage` engine is responsible for:
 - Splitting incoming rows by day (each day gets its own partition)
@@ -501,8 +501,8 @@ This is where `localStorage.MustAddRows(lr)` lands in local mode. The `logstorag
 
 **Key Functions**:
 - `MustOpenStorage(path, cfg)` - Open storage (called during initialization)
-- [`MustAddRows(lr)`](../lib/logstorage/storage.go#L1139) - Split rows by day and dispatch to partitions
-- [`getPartitionForWriting(day)`](../lib/logstorage/storage.go#L1244) - Look up or create partition for a given day
+- [`MustAddRows(lr)`](../lib/logstorage/storage.go#L1205) - Split rows by day and dispatch to partitions
+- [`getPartitionForWriting(day)`](../lib/logstorage/storage.go#L1334) - Look up or create partition for a given day
 - `IsReadOnly()` - Check if storage is read-only
 - `MustClose()` - Close storage
 
@@ -522,7 +522,7 @@ logstorage.Storage
 │  s.ptwHot *partitionWrapper            ← cached pointer to most recently used partition
 ```
 
-**`partitionWrapper`** ([`storage.go:538`](../lib/logstorage/storage.go#L538)) is a reference-counted handle around `*partition`:
+**`partitionWrapper`** ([`storage.go:567`](../lib/logstorage/storage.go#L567)) is a reference-counted handle around `*partition`:
 
 ```go
 type partitionWrapper struct {
@@ -598,11 +598,11 @@ func (s *Storage) MustAddRows(lr *LogRows) {
 }
 ```
 
-**`canAddAllRows`** ([`storage.go:594`](../lib/logstorage/storage.go#L594)) checks if every timestamp in the batch falls within the hot partition's day boundary (`[day * nsecsPerDay, (day+1) * nsecsPerDay - 1]`).
+**`canAddAllRows`** ([`storage.go:631`](../lib/logstorage/storage.go#L631)) checks if every timestamp in the batch falls within the hot partition's day boundary (`[day * nsecsPerDay, (day+1) * nsecsPerDay - 1]`).
 
 #### Partition lookup and creation
 
-**`getPartitionForWriting(day)`** ([`storage.go:1244`](../lib/logstorage/storage.go#L1244)):
+**`getPartitionForWriting(day)`** ([`storage.go:1334`](../lib/logstorage/storage.go#L1334)):
 1. **Binary search** `s.partitions` (sorted by day) for the requested day
 2. **If found**: increment ref count and return
 3. **If missing**: check if it was previously deleted or detached → return `nil` (rows dropped)
@@ -626,7 +626,7 @@ The struct above is intentionally trimmed to fields most relevant to this insert
 
 Important behavior detail: although the flag default for `-maxBackfillAge` is `0`, storage normalizes non-positive values to `retention`, so the effective default is "bounded by retention", not "disabled".
 
-**Location**: [`lib/logstorage/storage.go:1139-1293`](../lib/logstorage/storage.go#L1139)
+**Location**: [`lib/logstorage/storage.go:1205-1299`](../lib/logstorage/storage.go#L1205)
 
 ---
 
@@ -938,11 +938,11 @@ The `/internal/insert` endpoint is used for inter-node communication in distribu
 
 ### Endpoint Registration
 
-**File**: [`app/vlinsert/main.go`](../app/vlinsert/main.go#L50) (lines 50-57)
+**File**: [`app/vlinsert/main.go`](../app/vlinsert/main.go#L88) (lines 88-111)
 
 **Key Functions**:
-- [`RequestHandler(w, r)`](../app/vlinsert/main.go#L38) - Main router for all /insert/* endpoints
-- [`insertHandler(w, r, path)`](../app/vlinsert/main.go#L62) - Route specific insert endpoints
+- [`RequestHandler(w, r)`](../app/vlinsert/main.go#L88) - Main router for all /insert/* endpoints
+- [`insertHandler(w, r, path)`](../app/vlinsert/main.go#L116) - Route specific insert endpoints
 
 ```go
 func RequestHandler(w http.ResponseWriter, r *http.Request) bool {
@@ -1190,8 +1190,8 @@ Important guardrails that affect correctness and troubleshooting:
 - In distributed mode, pending blocks can be dropped on shutdown if all storage nodes are unavailable.
 
 **Key references**:
-- [`app/vlinsert/insertutil/line_reader.go#L105`](../app/vlinsert/insertutil/line_reader.go#L105)
-- [`app/vlinsert/insertutil/common_params.go#L263`](../app/vlinsert/insertutil/common_params.go#L263)
+- [`app/vlinsert/insertutil/line_reader.go#L161`](../app/vlinsert/insertutil/line_reader.go#L161)
+- [`app/vlinsert/insertutil/common_params.go#L411`](../app/vlinsert/insertutil/common_params.go#L411)
 - [`app/vlstorage/netinsert/netinsert.go#L163`](../app/vlstorage/netinsert/netinsert.go#L163)
 - [`app/vlstorage/netinsert/netinsert.go#L216`](../app/vlstorage/netinsert/netinsert.go#L216)
 
@@ -1353,27 +1353,27 @@ All file and line number references must use the following format:
 **1. Section Headers - File References**
 
 ```markdown
-**File**: [`app/vlinsert/nativeinsert/nativeinsert.go`](../app/vlinsert/nativeinsert/nativeinsert.go#L28)
+**File**: [`app/vlinsert/nativeinsert/nativeinsert.go`](../app/vlinsert/nativeinsert/nativeinsert.go#L72)
 ```
 
 **2. Function References in Key Functions Lists**
 
 ```markdown
 **Key Functions**:
-- [`RequestHandler(w, r)`](../app/vlinsert/nativeinsert/nativeinsert.go#L28) - Main HTTP handler
-- [`parseData(irp, data, tenantID)`](../app/vlinsert/nativeinsert/nativeinsert.go#L94) - Parse and add rows
+- [`RequestHandler(w, r)`](../app/vlinsert/nativeinsert/nativeinsert.go#L72) - Main HTTP handler
+- [`parseData(irp, data, tenantID)`](../app/vlinsert/nativeinsert/nativeinsert.go#L163) - Parse and add rows
 ```
 
 **3. Flow Diagram References**
 
 ```markdown
-nativeinsert.RequestHandler               [nativeinsert.go:28](../app/vlinsert/nativeinsert/nativeinsert.go#L28)
+nativeinsert.RequestHandler               [nativeinsert.go:72](../app/vlinsert/nativeinsert/nativeinsert.go#L72)
 ```
 
 **4. Location References**
 
 ```markdown
-**Location**: [`app/vlinsert/nativeinsert/nativeinsert.go:28-90`](../app/vlinsert/nativeinsert/nativeinsert.go#L28)
+**Location**: [`app/vlinsert/nativeinsert/nativeinsert.go:72-146`](../app/vlinsert/nativeinsert/nativeinsert.go#L72)
 ```
 
 #### Display Text Options
@@ -1399,16 +1399,16 @@ When linking to code:
 
 ✅ **Correct**:
 ```markdown
-- [`GetCommonParams(r)`](../app/vlinsert/insertutil/common_params.go#L49) - Extract parameters
-- **File**: [`storage.go`](../lib/logstorage/storage.go#L1139)
-- [common_params.go:323](../app/vlinsert/insertutil/common_params.go#L323)
+- [`GetCommonParams(r)`](../app/vlinsert/insertutil/common_params.go#L121) - Extract parameters
+- **File**: [`storage.go`](../lib/logstorage/storage.go#L1205)
+- [common_params.go:517](../app/vlinsert/insertutil/common_params.go#L517)
 ```
 
 ❌ **Incorrect**:
 ```markdown
-- `GetCommonParams(r)` - Extract parameters (line 49)  # Not clickable
-- **File**: `storage.go` (line 1139)  # Not clickable
-- [common_params.go:323](../app/vlinsert/insertutil/common_params.go#323)  # Missing L prefix
+- `GetCommonParams(r)` - Extract parameters (line 121)  # Not clickable
+- **File**: `storage.go` (line 1205)  # Not clickable
+- [common_params.go:517](../app/vlinsert/insertutil/common_params.go#517)  # Missing L prefix
 ```
 
 #### Updating File References

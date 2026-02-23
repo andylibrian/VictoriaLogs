@@ -541,21 +541,47 @@ func (s *Storage) EnableLogNewStreams(seconds int) {
 	})
 }
 
+// partitionWrapper wraps a partition with reference counting for safe concurrent access.
+//
+// REFERENCE COUNTING LIFECYCLE:
+// Partitions are accessed concurrently by ingestion, queries, and background maintenance.
+// Reference counting ensures a partition isn't closed while in use:
+//
+//	incRef() called when:
+//	  - Storage.MustAddRows starts using the partition
+//	  - Storage.getPartitions returns all partitions for queries
+//	  - Hot partition is cached in getPartitionForWriting
+//
+//	decRef() called when:
+//	  - MustAddRows finishes with the partition
+//	  - Query finishes (putPartitions)
+//	  - Partition is being deleted
+//
+// When refCount reaches zero:
+//   - If mustDrop is set, delete the partition from disk
+//   - Close the partition (flush data, release file handles)
+//   - Close doneCh to signal any waiters
+//
+// This pattern allows safe deletion of old partitions while queries may still
+// be reading from them - the deletion is deferred until all references are released.
 type partitionWrapper struct {
-	// refCount is the number of active references to partition.
-	// When it reaches zero, then the partition is closed.
+	// refCount is the number of active references to this partition.
+	// When it reaches zero, the partition may be closed and optionally deleted.
 	refCount atomic.Int32
 
-	// mustDrop is set when the partition must be deleted after refCount reaches zero.
+	// mustDrop indicates the partition should be deleted when refCount reaches zero.
+	// Set when partition is removed due to retention or disk space limits.
 	mustDrop atomic.Bool
 
-	// day is the day for the partition in the unix timestamp divided by the number of seconds in the day.
+	// day is the partition day in Unix timestamp divided by seconds per day.
+	// Used for retention calculations and partition ordering.
 	day int64
 
-	// pt is the wrapped partition.
+	// pt is the wrapped partition containing the actual log data.
 	pt *partition
 
-	// doneCh is closed when refCount reaches zero, e.g. when the partitionWrapper is no longer accessed.
+	// doneCh is closed when refCount reaches zero, signaling the partition
+	// is no longer in use. Used by PartitionDetach to wait for safe removal.
 	doneCh chan struct{}
 }
 
@@ -598,6 +624,10 @@ func (ptw *partitionWrapper) decRef() {
 	close(ptw.doneCh)
 }
 
+// canAddAllRows checks if all rows in lr fit within this partition's day.
+// Returns false if any row has a timestamp outside this partition's time range.
+// This is used by the fast path in MustAddRows to quickly determine if all rows
+// can be added to the hot partition.
 func (ptw *partitionWrapper) canAddAllRows(lr *LogRows) bool {
 	minTimestamp := ptw.day * nsecsPerDay
 	maxTimestamp := minTimestamp + nsecsPerDay - 1
@@ -1145,13 +1175,37 @@ func (s *Storage) MustForceMerge(partitionPrefix string) {
 
 // MustAddRows adds lr to s.
 //
+// This is the primary entry point for data ingestion at the storage level.
+// The function routes rows to the appropriate per-day partition(s).
+//
+// FAST PATH OPTIMIZATION:
+// For near-real-time ingestion, most rows have timestamps close to "now" and
+// belong to the same day. The fast path exploits this:
+//  1. Check if the "hot" partition (ptwHot, where the last row was ingested) exists
+//  2. If all rows fit within the hot partition's day, add them directly
+//  3. This avoids the overhead of per-row partition lookup and timestamp validation
+//
+// SLOW PATH (rows spanning multiple days):
+// If rows don't all fit in the hot partition (e.g., backfill, delayed logs):
+//  1. Group rows by day (ts / nsecsPerDay)
+//  2. For each day, get or create the appropriate partition
+//  3. Validate timestamps against retention and backfill limits
+//  4. Add rows to each partition
+//
+// TIMESTAMP VALIDATION:
+// Rows with timestamps outside allowed ranges are dropped with a warning:
+//   - Too old: Before (now - retention) OR before (now - maxBackfillAge)
+//   - Too new: After (now + futureRetention)
+//
 // It is recommended checking whether the s is in read-only mode by calling IsReadOnly()
 // before calling MustAddRows.
 //
 // The added rows become visible for search after small duration of time.
 // Call DebugFlush if the added rows must be queried immediately (for example, in tests).
 func (s *Storage) MustAddRows(lr *LogRows) {
-	// Fast path - try adding all the rows to the hot partition
+	// ==================== FAST PATH ====================
+	// Try adding all rows to the hot partition (most common case for real-time ingestion)
+
 	s.partitionsLock.Lock()
 	ptwHot := s.ptwHot
 	if ptwHot != nil {
@@ -1160,8 +1214,9 @@ func (s *Storage) MustAddRows(lr *LogRows) {
 	s.partitionsLock.Unlock()
 
 	if ptwHot != nil {
+		// Check if all rows fit within the hot partition's day
 		if ptwHot.canAddAllRows(lr) {
-			// Common case for near-real-time ingestion: all rows belong to same day.
+			// Fast path succeeded - add rows and return
 			ptwHot.pt.mustAddRows(lr)
 			ptwHot.decRef()
 			return
@@ -1169,15 +1224,20 @@ func (s *Storage) MustAddRows(lr *LogRows) {
 		ptwHot.decRef()
 	}
 
-	// Slow path - rows cannot be added to the hot partition, so split rows among available partitions
+	// ==================== SLOW PATH ====================
+	// Rows cannot be added to the hot partition, so split rows among available partitions
+
 	now := time.Now().UnixNano()
 	minAllowedDay := s.getMinAllowedDay(now)
 	maxAllowedDay := s.getMaxAllowedDay(now)
 	minAllowedTimestamp := now - s.maxBackfillAge.Nanoseconds()
 
+	// Group rows by day
 	m := make(map[int64]*LogRows)
 	for i, ts := range lr.timestamps {
 		day := ts / nsecsPerDay
+
+		// Validate timestamp against retention (oldest allowed)
 		if day < minAllowedDay {
 			line := MarshalFieldsToJSON(nil, lr.rows[i])
 			tsf := TimeFormatter(ts)
@@ -1188,6 +1248,8 @@ func (s *Storage) MustAddRows(lr *LogRows) {
 			s.rowsDroppedTooSmallTimestamp.Add(1)
 			continue
 		}
+
+		// Validate timestamp against future retention (newest allowed)
 		if day > maxAllowedDay {
 			line := MarshalFieldsToJSON(nil, lr.rows[i])
 			tsf := TimeFormatter(ts)
@@ -1198,6 +1260,8 @@ func (s *Storage) MustAddRows(lr *LogRows) {
 			s.rowsDroppedTooBigTimestamp.Add(1)
 			continue
 		}
+
+		// Validate timestamp against backfill limit (if configured)
 		if ts < minAllowedTimestamp {
 			line := MarshalFieldsToJSON(nil, lr.rows[i])
 			tsf := TimeFormatter(ts)
@@ -1209,21 +1273,23 @@ func (s *Storage) MustAddRows(lr *LogRows) {
 			continue
 		}
 
+		// Get or create the per-day LogRows batch
 		lrPart := m[day]
 		if lrPart == nil {
-			// Build per-day batches, because each partition is day-scoped.
 			lrPart = GetLogRows(nil, nil, nil, nil, "")
 			m[day] = lrPart
 		}
 		lrPart.mustAddInternal(lr.streamIDs[i], ts, lr.rows[i], lr.streamTagsCanonicals[i])
 	}
+
+	// Add each day's rows to the appropriate partition
 	for day, lrPart := range m {
 		ptw := s.getPartitionForWriting(day)
 		if ptw != nil {
 			ptw.pt.mustAddRows(lrPart)
 			ptw.decRef()
 		} else {
-			// the lrPart must contain at least a single row, so log it.
+			// Partition couldn't be created or is detached - drop the rows
 			line := MarshalFieldsToJSON(nil, lrPart.rows[0])
 			inactivePartitionLogger.Warnf("skipping log entry because it cannot be saved into inactive per-day partition; "+
 				"see https://docs.victoriametrics.com/victorialogs/#partitions-lifecycle; log entry %s", line)
@@ -1248,24 +1314,33 @@ func (tf *TimeFormatter) String() string {
 
 // getPartitionForWriting returns the partition for the given day for writing.
 //
-// The partition is automatically created if it didn't exist.
+// PARTITION LOOKUP:
+//  1. Acquire partitionsLock
+//  2. Binary search partitions slice (sorted by day) for the target day
+//  3. If found, increment ref count and return
+//  4. If not found, create a new partition
 //
-// nil is returned in the following cases:
+// PARTITION CREATION (on-demand):
+// Partitions are created lazily when the first log for that day arrives.
+// This avoids creating empty partition directories for days with no data.
 //
-//   - When the partition is outside the configured retention.
-//   - When the partition has been detached via Storage.PartitionDetach().
-//   - When the partition directory has been manually added, but wasn't attached yet via Storage.PartitionAttach().
+// NIL RETURN CASES:
+// Returns nil if the partition cannot be used for writing:
+//   - Day is outside configured retention (already deleted)
+//   - Partition directory exists but isn't attached (was detached via API)
+//   - Partition directory was manually added but not attached
 //
 // The caller must log this case and drop pending logs for this partition.
 func (s *Storage) getPartitionForWriting(day int64) *partitionWrapper {
 	s.partitionsLock.Lock()
 	defer s.partitionsLock.Unlock()
 
-	// Search for the partition using binary search
+	// Binary search for the partition with this day
 	ptws := s.partitions
 	n := sort.Search(len(ptws), func(i int) bool {
 		return ptws[i].day >= day
 	})
+
 	var ptw *partitionWrapper
 	if n < len(ptws) {
 		ptw = ptws[n]
@@ -1273,37 +1348,39 @@ func (s *Storage) getPartitionForWriting(day int64) *partitionWrapper {
 			ptw = nil
 		}
 	}
+
 	if ptw == nil {
-		// Missing partition for the given day.
+		// Partition doesn't exist - check if it was deleted or needs creation
 		if slices.Contains(s.deletedPartitions, day) {
-			// The partition has been already deleted.
+			// Partition was already deleted due to retention - don't recreate
 			return nil
 		}
 
 		fname := getPartitionNameFromDay(day)
 		partitionPath := filepath.Join(s.path, partitionsDirname, fname)
 		if fs.IsPathExist(partitionPath) {
-			// The partition directory exists. This can happen in the following cases:
-			// - When the partition directory has been manually added, but it wasn't attached yet via Storage.PartitionAttach().
-			// - When the partition has been detached via Storage.PartitionDetach().
+			// Directory exists but partition isn't attached - can happen if:
+			// - Partition was detached via PartitionDetach() API
+			// - Directory was manually copied but not attached
 			return nil
 		}
 
-		// Create missing partition.
+		// Create new partition on-demand
 		mustCreatePartition(partitionPath)
 		pt := mustOpenPartition(s, partitionPath)
 		ptw = newPartitionWrapper(pt, day)
+
+		// Insert into sorted partitions slice at position n
 		if n == len(ptws) {
 			ptws = append(ptws, ptw)
 		} else {
-			// Insert into sorted slice at position n.
 			ptws = append(ptws[:n+1], ptws[n:]...)
 			ptws[n] = ptw
 		}
 		s.partitions = ptws
 	}
 
-	// Remember hot partition to accelerate the next ingestion call.
+	// Cache as hot partition for fast path in MustAddRows
 	s.ptwHot = ptw
 	ptw.incRef()
 
