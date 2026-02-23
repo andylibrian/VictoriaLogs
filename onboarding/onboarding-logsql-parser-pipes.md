@@ -44,7 +44,7 @@ Query execution stages exchange columnar [`DataBlock`](./glossary.md#datablock) 
 ### Where This Runs
 
 - Public API parsing starts from select handlers in [`app/vlselect/logsql/logsql.go`](../app/vlselect/logsql/logsql.go#L1149)
-- Local execution runs in [`lib/logstorage/storage_search.go`](../lib/logstorage/storage_search.go#L208) (storage internals are covered in [VictoriaLogs Storage Engine & On-Disk Format](./onboarding-storage-engine.md))
+- Local execution runs in [`lib/logstorage/storage_search.go`](../lib/logstorage/storage_search.go#L274) (storage internals are covered in [VictoriaLogs Storage Engine & On-Disk Format](./onboarding-storage-engine.md))
 - Distributed execution additionally uses [`lib/logstorage/net_query_runner.go`](../lib/logstorage/net_query_runner.go#L31)
 
 ---
@@ -53,11 +53,11 @@ Query execution stages exchange columnar [`DataBlock`](./glossary.md#datablock) 
 
 **Key Files**:
 - [`app/vlselect/logsql/logsql.go`](../app/vlselect/logsql/logsql.go#L1149) - Select endpoint query handling
-- [`lib/logstorage/parser.go`](../lib/logstorage/parser.go#L1671) - LogsQL parsing and query rewrites
-- [`lib/logstorage/pipe.go`](../lib/logstorage/pipe.go#L13) - Pipe and pipeProcessor contracts
+- [`lib/logstorage/parser.go`](../lib/logstorage/parser.go#L1806) - LogsQL parsing and query rewrites
+- [`lib/logstorage/pipe.go`](../lib/logstorage/pipe.go#L56) - Pipe and pipeProcessor contracts
 - [`app/vlstorage/main.go`](../app/vlstorage/main.go#L554) - Storage router
 - [`app/vlstorage/lastnoptimization.go`](../app/vlstorage/lastnoptimization.go#L15) - Last-N optimized execution path
-- [`lib/logstorage/storage_search.go`](../lib/logstorage/storage_search.go#L208) - Local query execution
+- [`lib/logstorage/storage_search.go`](../lib/logstorage/storage_search.go#L274) - Local query execution
 - [`lib/logstorage/net_query_runner.go`](../lib/logstorage/net_query_runner.go#L31) - Distributed query split (remote/local)
 
 ```
@@ -67,33 +67,33 @@ logsql.ProcessQueryRequest               [logsql.go:1149](../app/vlselect/logsql
     ↓
 parseCommonArgsWithConfig                [logsql.go:1362](../app/vlselect/logsql/logsql.go#L1362)
     ↓
-logstorage.ParseQueryAtTimestamp         [parser.go:1697](../lib/logstorage/parser.go#L1697)
+logstorage.ParseQueryAtTimestamp         [parser.go:1844](../lib/logstorage/parser.go#L1844)
     ↓
-parseQuery + parseFilter + parsePipes    [parser.go:1779](../lib/logstorage/parser.go#L1779), [pipe.go:115](../lib/logstorage/pipe.go#L115)
+parseQuery + parseFilter + parsePipes    [parser.go:1942](../lib/logstorage/parser.go#L1942), [pipe.go:204](../lib/logstorage/pipe.go#L204)
     ↓
-q.optimize()                             [parser.go:898](../lib/logstorage/parser.go#L898)
+q.optimize()                             [parser.go:1019](../lib/logstorage/parser.go#L1019)
     ↓
-optional AddTimeFilter / AddExtraFilters [logsql.go:1436](../app/vlselect/logsql/logsql.go#L1436), [parser.go:846](../lib/logstorage/parser.go#L846)
+optional AddTimeFilter / AddExtraFilters [logsql.go:1436](../app/vlselect/logsql/logsql.go#L1436), [parser.go:952](../lib/logstorage/parser.go#L952)
     ↓
 ca.newQueryContext(ctx)                  [logsql.go:1350](../app/vlselect/logsql/logsql.go#L1350)
     ↓
 vlstorage.RunQuery(qctx, writeBlock)     [main.go:554](../app/vlstorage/main.go#L554)
     ↓
     ├─→ [LAST-N OPTIMIZED PATH]
-    │   GetLastNResultsQuery             [parser.go:649](../lib/logstorage/parser.go#L649)
+    │   GetLastNResultsQuery             [parser.go:755](../lib/logstorage/parser.go#L755)
     │       ↓
     │   runOptimizedLastNResultsQuery    [lastnoptimization.go:15](../app/vlstorage/lastnoptimization.go#L15)
     │
     ├─→ [LOCAL MODE]
-    │   localStorage.RunQuery            [storage_search.go:208](../lib/logstorage/storage_search.go#L208)
+    │   localStorage.RunQuery            [storage_search.go:274](../lib/logstorage/storage_search.go#L274)
     │       ↓
-    │   initSubqueries                   [storage_search.go:756](../lib/logstorage/storage_search.go#L756)
+    │   initSubqueries                   [storage_search.go:880](../lib/logstorage/storage_search.go#L880)
     │       ↓
-    │   getSearchOptions                 [storage_search.go:235](../lib/logstorage/storage_search.go#L235)
+    │   getSearchOptions                 [storage_search.go:314](../lib/logstorage/storage_search.go#L314)
     │       ↓
-    │   runPipes                         [storage_search.go:269](../lib/logstorage/storage_search.go#L269)
+    │   runPipes                         [storage_search.go:371](../lib/logstorage/storage_search.go#L371)
     │       ↓
-    │   searchParallel                   [storage_search.go:1274](../lib/logstorage/storage_search.go#L1274)
+    │   searchParallel                   [storage_search.go:1412](../lib/logstorage/storage_search.go#L1412)
     │       ↓
     │   partition/part/block scan → pipe processors → writeBlock
     │
@@ -115,7 +115,7 @@ vlstorage.RunQuery(qctx, writeBlock)     [main.go:554](../app/vlstorage/main.go#
 
 ### 1. Query Model
 
-**File**: [`lib/logstorage/parser.go`](../lib/logstorage/parser.go#L367)
+**File**: [`lib/logstorage/parser.go`](../lib/logstorage/parser.go#L435)
 
 `Query` is the canonical parsed representation:
 
@@ -129,25 +129,25 @@ type Query struct {
 ```
 
 **Key Functions**:
-- [`GetConcurrency()`](../lib/logstorage/parser.go#L467) - CPU worker concurrency
-- [`GetParallelReaders(defaultParallelReaders)`](../lib/logstorage/parser.go#L447) - I/O parallelism
-- [`GetFilterTimeRange()`](../lib/logstorage/parser.go#L759) - Effective time bounds
-- [`Clone(timestamp)`](../lib/logstorage/parser.go#L625) - Re-parse clone for transformations
-- [`DropAllPipes()`](../lib/logstorage/parser.go#L527) - Keep only filter stage
+- [`GetConcurrency()`](../lib/logstorage/parser.go#L573) - CPU worker concurrency
+- [`GetParallelReaders(defaultParallelReaders)`](../lib/logstorage/parser.go#L553) - I/O parallelism
+- [`GetFilterTimeRange()`](../lib/logstorage/parser.go#L865) - Effective time bounds
+- [`Clone(timestamp)`](../lib/logstorage/parser.go#L731) - Re-parse clone for transformations
+- [`DropAllPipes()`](../lib/logstorage/parser.go#L633) - Keep only filter stage
 
-**Location**: [`lib/logstorage/parser.go:367-405`](../lib/logstorage/parser.go#L367)
+**Location**: [`lib/logstorage/parser.go:435-452`](../lib/logstorage/parser.go#L435)
 
 ---
 
 ### 2. Query Parsing
 
-**File**: [`lib/logstorage/parser.go`](../lib/logstorage/parser.go#L1671)
+**File**: [`lib/logstorage/parser.go`](../lib/logstorage/parser.go#L1806)
 
 **Key Functions**:
-- [`ParseQuery(s)`](../lib/logstorage/parser.go#L1671) - Parse at current timestamp
-- [`ParseQueryAtTimestamp(s, ts)`](../lib/logstorage/parser.go#L1697) - Parse at explicit timestamp context
-- [`parseQuery(lex)`](../lib/logstorage/parser.go#L1779) - Parse options + filter + pipes
-- [`parseQueryOptions(dstOpts, lex)`](../lib/logstorage/parser.go#L1845) - Parse `options(...)`
+- [`ParseQuery(s)`](../lib/logstorage/parser.go#L1806) - Parse at current timestamp
+- [`ParseQueryAtTimestamp(s, ts)`](../lib/logstorage/parser.go#L1844) - Parse at explicit timestamp context
+- [`parseQuery(lex)`](../lib/logstorage/parser.go#L1942) - Parse options + filter + pipes
+- [`parseQueryOptions(dstOpts, lex)`](../lib/logstorage/parser.go#L2012) - Parse `options(...)`
 
 Parsing sequence:
 
@@ -160,62 +160,62 @@ Parsing sequence:
 
 API request-level additions before execution:
 
-- `/select/logsql/query` request flow parses at explicit timestamp via [`ParseQueryAtTimestamp`](../lib/logstorage/parser.go#L1697) from [`parseCommonArgsWithConfig`](../app/vlselect/logsql/logsql.go#L1362)
-- HTTP `start`/`end` may inject global `_time` filter via [`AddTimeFilter`](../lib/logstorage/parser.go#L787) at [`logsql.go:1436`](../app/vlselect/logsql/logsql.go#L1436)
-- `extra_filters` / `extra_stream_filters` are appended via [`AddExtraFilters`](../lib/logstorage/parser.go#L846) at [`logsql.go:1450`](../app/vlselect/logsql/logsql.go#L1450)
+- `/select/logsql/query` request flow parses at explicit timestamp via [`ParseQueryAtTimestamp`](../lib/logstorage/parser.go#L1844) from [`parseCommonArgsWithConfig`](../app/vlselect/logsql/logsql.go#L1362)
+- HTTP `start`/`end` may inject global `_time` filter via [`AddTimeFilter`](../lib/logstorage/parser.go#L893) at [`logsql.go:1436`](../app/vlselect/logsql/logsql.go#L1436)
+- `extra_filters` / `extra_stream_filters` are appended via [`AddExtraFilters`](../lib/logstorage/parser.go#L952) at [`logsql.go:1450`](../app/vlselect/logsql/logsql.go#L1450)
 
 ---
 
 ### 3. Filter Parsing
 
-**File**: [`lib/logstorage/parser.go`](../lib/logstorage/parser.go#L1943)
+**File**: [`lib/logstorage/parser.go`](../lib/logstorage/parser.go#L2126)
 
 Filter parsing handles precedence and dispatch:
 
-- OR layer: [`parseFilterOr`](../lib/logstorage/parser.go#L1964)
-- AND layer: [`parseFilterAnd`](../lib/logstorage/parser.go#L1987)
-- operator/type dispatch: [`parseFilterGeneric`](../lib/logstorage/parser.go#L2010)
+- OR layer: [`parseFilterOr`](../lib/logstorage/parser.go#L2155)
+- AND layer: [`parseFilterAnd`](../lib/logstorage/parser.go#L2187)
+- operator/type dispatch: [`parseFilterGeneric`](../lib/logstorage/parser.go#L2226)
 
 **Key Functions**:
-- [`parseFilter`](../lib/logstorage/parser.go#L1943) - Root filter parse and guard rails
-- [`parseFilterPhrase`](../lib/logstorage/parser.go#L2099) - Default token/field phrase handling
-- [`parseInValues`](../lib/logstorage/parser.go#L2480) - `in(...)` literal vs subquery fallback
-- [`parseInQuery`](../lib/logstorage/parser.go#L3741) - Parse `in(subquery)` and infer value field
+- [`parseFilter`](../lib/logstorage/parser.go#L2126) - Root filter parse and guard rails
+- [`parseFilterPhrase`](../lib/logstorage/parser.go#L2315) - Default token/field phrase handling
+- [`parseInValues`](../lib/logstorage/parser.go#L2696) - `in(...)` literal vs subquery fallback
+- [`parseInQuery`](../lib/logstorage/parser.go#L3957) - Parse `in(subquery)` and infer value field
 
 Notable guard rails:
 
-- Prevents starting query filter with pipe/stats keywords unless quoted ([`parser.go:1948-1954`](../lib/logstorage/parser.go#L1948))
+- Prevents starting query filter with pipe/stats keywords unless quoted ([`parser.go:2131-2137`](../lib/logstorage/parser.go#L2131))
 - Rejects invalid syntactic forms such as missing `:` before field-specific operators
 
 ---
 
 ### 4. Pipe Parsing
 
-**File**: [`lib/logstorage/pipe.go`](../lib/logstorage/pipe.go#L13)
+**File**: [`lib/logstorage/pipe.go`](../lib/logstorage/pipe.go#L56)
 
 Pipes are parsed by name and mapped to typed implementations.
 
 **Key Functions**:
-- [`parsePipes(lex)`](../lib/logstorage/pipe.go#L115) - Parse chain `| p1 | p2 | ...`
-- [`parsePipe(lex)`](../lib/logstorage/pipe.go#L135) - Parse single pipe
-- [`initPipeParsers()`](../lib/logstorage/pipe.go#L177) - Pipe parser registry
-- [`isPipeName(s)`](../lib/logstorage/pipe.go#L242) - Pipe keyword detection
+- [`parsePipes(lex)`](../lib/logstorage/pipe.go#L204) - Parse chain `| p1 | p2 | ...`
+- [`parsePipe(lex)`](../lib/logstorage/pipe.go#L236) - Parse single pipe
+- [`initPipeParsers()`](../lib/logstorage/pipe.go#L298) - Pipe parser registry
+- [`isPipeName(s)`](../lib/logstorage/pipe.go#L383) - Pipe keyword detection
 
 Core contracts:
 
-- [`type pipe`](../lib/logstorage/pipe.go#L13) - parse/runtime metadata + processor factory
-- [`type pipeProcessor`](../lib/logstorage/pipe.go#L65) - `writeBlock()` + `flush()` runtime stage
+- [`type pipe`](../lib/logstorage/pipe.go#L56) - parse/runtime metadata + processor factory
+- [`type pipeProcessor`](../lib/logstorage/pipe.go#L147) - `writeBlock()` + `flush()` runtime stage
 
 ---
 
 ### 5. Query Rewrites & Optimizations
 
-**File**: [`lib/logstorage/parser.go`](../lib/logstorage/parser.go#L898)
+**File**: [`lib/logstorage/parser.go`](../lib/logstorage/parser.go#L1019)
 
-Rewrites are applied after parsing via [`Query.optimize()`](../lib/logstorage/parser.go#L898).
+Rewrites are applied after parsing via [`Query.optimize()`](../lib/logstorage/parser.go#L1019).
 
 **Key Function**:
-- [`optimizeNoSubqueries()`](../lib/logstorage/parser.go#L904)
+- [`optimizeNoSubqueries()`](../lib/logstorage/parser.go#L1027)
 
 Notable rewrites:
 
@@ -224,40 +224,40 @@ Notable rewrites:
 - Remove no-op star filters
 - Merge stream filters
 - Optimize offset/limit and uniq/limit pipe forms
-- Router-level fast path for eligible last-N queries via [`GetLastNResultsQuery`](../lib/logstorage/parser.go#L649) and [`runOptimizedLastNResultsQuery`](../app/vlstorage/lastnoptimization.go#L15)
+- Router-level fast path for eligible last-N queries via [`GetLastNResultsQuery`](../lib/logstorage/parser.go#L755) and [`runOptimizedLastNResultsQuery`](../app/vlstorage/lastnoptimization.go#L15)
 
 Time-filter augmentation:
 
-- [`AddTimeFilter(start, end)`](../lib/logstorage/parser.go#L787)
-- Internal injection in [`addTimeFilter(...)`](../lib/logstorage/parser.go#L806)
+- [`AddTimeFilter(start, end)`](../lib/logstorage/parser.go#L893)
+- Internal injection in [`addTimeFilterNoSubqueries(...)`](../lib/logstorage/parser.go#L899)
 
 ---
 
 ### 6. QueryContext & Subquery Initialization
 
-**File**: [`lib/logstorage/storage_search.go`](../lib/logstorage/storage_search.go#L25)
+**File**: [`lib/logstorage/storage_search.go`](../lib/logstorage/storage_search.go#L74)
 
 `QueryContext` binds query AST with runtime context, tenant scope, hidden field filters, and query stats collector.
 
 **Key Functions**:
-- [`NewQueryContext(...)`](../lib/logstorage/storage_search.go#L54)
-- [`newQueryContext(...)`](../lib/logstorage/storage_search.go#L79) - applies option override for `allow_partial_response`
-- [`initSubqueries(...)`](../lib/logstorage/storage_search.go#L756)
+- [`NewQueryContext(...)`](../lib/logstorage/storage_search.go#L110)
+- [`newQueryContext(...)`](../lib/logstorage/storage_search.go#L135) - applies option override for `allow_partial_response`
+- [`initSubqueries(...)`](../lib/logstorage/storage_search.go#L880)
 
 Subquery initialization steps:
 
-1. Resolve `in(subquery)` values ([`initFilterInValues`](../lib/logstorage/storage_search.go#L811))
-2. Build join maps for `join` pipes ([`initJoinMaps`](../lib/logstorage/storage_search.go#L869))
-3. Initialize `union` execution hooks ([`initUnionQueries`](../lib/logstorage/storage_search.go#L839))
-4. Validate/initialize `stream_context` ([`initStreamContextPipes`](../lib/logstorage/storage_search.go#L784))
+1. Resolve `in(subquery)` values ([`initFilterInValues`](../lib/logstorage/storage_search.go#L935))
+2. Build join maps for `join` pipes ([`initJoinMaps`](../lib/logstorage/storage_search.go#L993))
+3. Initialize `union` execution hooks ([`initUnionQueries`](../lib/logstorage/storage_search.go#L963))
+4. Validate/initialize `stream_context` ([`initStreamContextPipes`](../lib/logstorage/storage_search.go#L908))
 
 ---
 
 ### 7. Pipe Execution Chain
 
-**File**: [`lib/logstorage/storage_search.go`](../lib/logstorage/storage_search.go#L269)
+**File**: [`lib/logstorage/storage_search.go`](../lib/logstorage/storage_search.go#L371)
 
-Pipe execution is orchestrated by [`runPipes(...)`](../lib/logstorage/storage_search.go#L269):
+Pipe execution is orchestrated by [`runPipes(...)`](../lib/logstorage/storage_search.go#L371):
 
 1. Build processor chain in reverse order (`last pipe` created first)
 2. Execute search callback and stream blocks into the head processor
@@ -265,35 +265,35 @@ Pipe execution is orchestrated by [`runPipes(...)`](../lib/logstorage/storage_se
 4. Propagate cancellation on search/flush error
 
 **Key Mechanics**:
-- Chain construction: [`storage_search.go:283-293`](../lib/logstorage/storage_search.go#L283)
-- Search invocation: [`storage_search.go:295`](../lib/logstorage/storage_search.go#L295)
-- Flush and error handling: [`storage_search.go:301-325`](../lib/logstorage/storage_search.go#L301)
-- Query stats injection for `query_stats` pipes: [`storage_search.go:303-307`](../lib/logstorage/storage_search.go#L303)
+- Chain construction: [`storage_search.go:386-397`](../lib/logstorage/storage_search.go#L386)
+- Search invocation: [`storage_search.go:401`](../lib/logstorage/storage_search.go#L401)
+- Flush and error handling: [`storage_search.go:407-426`](../lib/logstorage/storage_search.go#L407)
+- Query stats injection for `query_stats` pipes: [`storage_search.go:410-415`](../lib/logstorage/storage_search.go#L410)
 
 ---
 
 ### 8. Storage Search Planning & Parallel Execution
 
-**File**: [`lib/logstorage/storage_search.go`](../lib/logstorage/storage_search.go#L1274)
+**File**: [`lib/logstorage/storage_search.go`](../lib/logstorage/storage_search.go#L1412)
 
-Search planning starts with [`getSearchOptions(...)`](../lib/logstorage/storage_search.go#L235), then executes with [`searchParallel(...)`](../lib/logstorage/storage_search.go#L1274).
+Search planning starts with [`getSearchOptions(...)`](../lib/logstorage/storage_search.go#L314), then executes with [`searchParallel(...)`](../lib/logstorage/storage_search.go#L1412).
 
 **Key Functions**:
-- [`Storage.RunQuery`](../lib/logstorage/storage_search.go#L208)
-- [`Storage.runQuery`](../lib/logstorage/storage_search.go#L216)
-- [`getSearchOptions`](../lib/logstorage/storage_search.go#L235)
-- [`searchParallel`](../lib/logstorage/storage_search.go#L1274)
-- [`getPartitionsForTimeRange`](../lib/logstorage/storage_search.go#L1354)
-- [`partition.search`](../lib/logstorage/storage_search.go#L1395)
-- [`part.searchByTenantIDs`](../lib/logstorage/storage_search.go#L1614)
-- [`part.searchByStreamIDs`](../lib/logstorage/storage_search.go#L1716)
+- [`Storage.RunQuery`](../lib/logstorage/storage_search.go#L274)
+- [`Storage.runQuery`](../lib/logstorage/storage_search.go#L288)
+- [`getSearchOptions`](../lib/logstorage/storage_search.go#L314)
+- [`searchParallel`](../lib/logstorage/storage_search.go#L1412)
+- [`getPartitionsForTimeRange`](../lib/logstorage/storage_search.go#L1498)
+- [`partition.search`](../lib/logstorage/storage_search.go#L1539)
+- [`part.searchByTenantIDs`](../lib/logstorage/storage_search.go#L1758)
+- [`part.searchByStreamIDs`](../lib/logstorage/storage_search.go#L1860)
 
 Execution highlights:
 
 - Partition selection uses binary search over sorted partitions
 - Work is batched by block headers and processed by worker goroutines
 - Query stats are gathered per worker and merged atomically
-- Partition search concurrency is capped by [`partitionSearchConcurrencyLimitCh`](../lib/logstorage/storage_search.go#L1391)
+- Partition search concurrency is capped by [`partitionSearchConcurrencyLimitCh`](../lib/logstorage/storage_search.go#L1535)
 
 ---
 
@@ -303,7 +303,7 @@ Execution highlights:
 
 Flow:
 
-- Select API parses and augments query (`start/end`, `extra_filters`) -> `vlstorage.RunQuery` -> [`localStorage.RunQuery`](../lib/logstorage/storage_search.go#L208)
+- Select API parses and augments query (`start/end`, `extra_filters`) -> `vlstorage.RunQuery` -> [`localStorage.RunQuery`](../lib/logstorage/storage_search.go#L274)
 - `vlstorage.RunQuery` may use last-N fast path before local/distributed dispatch ([`main.go:554`](../app/vlstorage/main.go#L554), [`lastnoptimization.go:15`](../app/vlstorage/lastnoptimization.go#L15))
 - Entire parse and pipe execution lifecycle runs in-process
 - Pipes execute directly on locally scanned blocks
@@ -316,13 +316,13 @@ Flow:
 - [`NewNetQueryRunner`](../lib/logstorage/net_query_runner.go#L31) initializes subqueries before split ([`net_query_runner.go:37`](../lib/logstorage/net_query_runner.go#L37))
 - Split logic:
   - [`splitQueryToRemoteAndLocal`](../lib/logstorage/net_query_runner.go#L72)
-  - per-pipe split contract: [`splitToRemoteAndLocal`](../lib/logstorage/pipe.go#L24)
+  - per-pipe split contract: [`splitToRemoteAndLocal`](../lib/logstorage/pipe.go#L73)
 
 Special case:
 
 - `query_stats` executes as remote + local tandem:
-  - Remote: [`pipeQueryStats`](../lib/logstorage/pipe_query_stats.go#L11)
-  - Local: [`pipeQueryStatsLocal`](../lib/logstorage/pipe_query_stats_local.go#L9)
+  - Remote: [`pipeQueryStats`](../lib/logstorage/pipe_query_stats.go#L50)
+  - Local: [`pipeQueryStatsLocal`](../lib/logstorage/pipe_query_stats_local.go#L36)
 
 ---
 
@@ -356,22 +356,22 @@ Each pipe controls remote/local split behavior, enabling efficient distributed e
 
 ## Query Options
 
-**Key File**: [`lib/logstorage/parser.go`](../lib/logstorage/parser.go#L1845)
+**Key File**: [`lib/logstorage/parser.go`](../lib/logstorage/parser.go#L2012)
 
 `options(...)` controls query runtime behavior:
 
 | Option | Parse Line | Meaning |
 |--------|------------|---------|
-| `concurrency` | [1873](../lib/logstorage/parser.go#L1873) | Max CPU-bound workers for pipe processing |
-| `parallel_readers` | [1880](../lib/logstorage/parser.go#L1880) | IO-bound readers for block scanning |
-| `ignore_global_time_filter` | [1887](../lib/logstorage/parser.go#L1887) | Skip external/global time filter injection |
-| `allow_partial_response` | [1894](../lib/logstorage/parser.go#L1894) | Allow partial results in cluster failures |
-| `time_offset` | [1901](../lib/logstorage/parser.go#L1901) | Shift query time filters and output timestamps |
+| `concurrency` | [2040](../lib/logstorage/parser.go#L2040) | Max CPU-bound workers for pipe processing |
+| `parallel_readers` | [2047](../lib/logstorage/parser.go#L2047) | IO-bound readers for block scanning |
+| `ignore_global_time_filter` | [2054](../lib/logstorage/parser.go#L2054) | Skip external/global time filter injection |
+| `allow_partial_response` | [2061](../lib/logstorage/parser.go#L2061) | Allow partial results in cluster failures |
+| `time_offset` | [2068](../lib/logstorage/parser.go#L2068) | Shift query time filters and output timestamps |
 
 Related runtime application:
 
-- `allow_partial_response` override in [`newQueryContext`](../lib/logstorage/storage_search.go#L79)
-- output timestamp offset application in [`searchParallel`](../lib/logstorage/storage_search.go#L1298)
+- `allow_partial_response` override in [`newQueryContext`](../lib/logstorage/storage_search.go#L135)
+- output timestamp offset application in [`searchParallel`](../lib/logstorage/storage_search.go#L1439)
 
 ---
 
@@ -426,37 +426,37 @@ All file and line number references must use the following format:
 **1. Section Headers - File References**
 
 ```markdown
-**File**: [`lib/logstorage/storage_search.go`](../lib/logstorage/storage_search.go#L208)
+**File**: [`lib/logstorage/storage_search.go`](../lib/logstorage/storage_search.go#L274)
 ```
 
 **2. Function References in Key Functions Lists**
 
 ```markdown
 **Key Functions**:
-- [`ParseQuery(s)`](../lib/logstorage/parser.go#L1671) - Parse query at current timestamp
-- [`runPipes(...)`](../lib/logstorage/storage_search.go#L269) - Execute pipe chain
+- [`ParseQuery(s)`](../lib/logstorage/parser.go#L1806) - Parse query at current timestamp
+- [`runPipes(...)`](../lib/logstorage/storage_search.go#L371) - Execute pipe chain
 ```
 
 **3. Flow Diagram References**
 
 ```markdown
-logstorage.ParseQuery                    [parser.go:1671](../lib/logstorage/parser.go#L1671)
+logstorage.ParseQuery                    [parser.go:1806](../lib/logstorage/parser.go#L1806)
 ```
 
 **4. Location References**
 
 ```markdown
-**Location**: [`lib/logstorage/parser.go:1779-1805`](../lib/logstorage/parser.go#L1779)
+**Location**: [`lib/logstorage/parser.go:1942-1971`](../lib/logstorage/parser.go#L1942)
 ```
 
 #### Display Text Options
 
 Choose the appropriate display text based on context:
 
-- **Full path with backticks**: `` [`lib/logstorage/parser.go`](path#L1671) `` - Use in section headers
-- **Filename only**: `[parser.go:1671](path#L1671)` - Use in flow diagrams for brevity
-- **Function signature**: `[ParseQuery(s)](path#L1671)` - Use in Key Functions lists
-- **Description**: `[Parse query at current timestamp](path#L1671)` - Use when context is clear
+- **Full path with backticks**: `` [`lib/logstorage/parser.go`](path#L1806) `` - Use in section headers
+- **Filename only**: `[parser.go:1806](path#L1806)` - Use in flow diagrams for brevity
+- **Function signature**: `[ParseQuery(s)](path#L1806)` - Use in Key Functions lists
+- **Description**: `[Parse query at current timestamp](path#L1806)` - Use when context is clear
 
 #### Line Number Selection
 
@@ -472,16 +472,16 @@ When linking to code:
 
 ✅ **Correct**:
 ```markdown
-- [`ParseQuery(s)`](../lib/logstorage/parser.go#L1671) - Parse query
-- **File**: [`storage_search.go`](../lib/logstorage/storage_search.go#L208)
-- [pipe.go:115](../lib/logstorage/pipe.go#L115)
+- [`ParseQuery(s)`](../lib/logstorage/parser.go#L1806) - Parse query
+- **File**: [`storage_search.go`](../lib/logstorage/storage_search.go#L274)
+- [pipe.go:204](../lib/logstorage/pipe.go#L204)
 ```
 
 ❌ **Incorrect**:
 ```markdown
-- `ParseQuery(s)` - Parse query (line 1671)  # Not clickable
-- **File**: `storage_search.go` (line 208)   # Not clickable
-- [pipe.go:115](../lib/logstorage/pipe.go#115)  # Missing L prefix
+- `ParseQuery(s)` - Parse query (line 1806)  # Not clickable
+- **File**: `storage_search.go` (line 274)   # Not clickable
+- [pipe.go:204](../lib/logstorage/pipe.go#204)  # Missing L prefix
 ```
 
 #### Updating File References

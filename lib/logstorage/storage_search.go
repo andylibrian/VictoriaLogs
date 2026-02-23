@@ -1,3 +1,44 @@
+// Package logstorage provides the core storage engine and query language implementation.
+//
+// This file (storage_search.go) implements the query execution engine that:
+//   - Runs parsed Queries against local storage
+//   - Initializes subqueries (in, join, union, stream_context)
+//   - Orchestrates parallel block scanning across partitions
+//   - Manages the pipe execution chain
+//
+// Query Execution Overview:
+//
+// When a query arrives via Storage.RunQuery(), the execution flow is:
+//
+//  1. Initialize subqueries - Materialize in(subquery), join maps, union hooks
+//  2. Build search options - Extract time range, stream filters, field filters
+//  3. Create pipe chain - Build processors in reverse order (tail to head)
+//  4. Search parallel - Scan matching partitions/parts/blocks with worker pool
+//  5. Stream results - Each matching block flows through the pipe chain
+//
+// Key Design Patterns:
+//
+// 1. Two-Phase Subquery Evaluation
+//   - Subqueries are materialized BEFORE the main search begins
+//   - This reduces per-row work during block scanning
+//   - Subquery results are cached to avoid redundant execution
+//
+// 2. Push-Based Block Streaming
+//   - Search workers emit matching blocks immediately to pipe processors
+//   - No intermediate buffering - results stream as they're found
+//   - Backpressure through context cancellation
+//
+// 3. Reverse Chain Assembly
+//   - Pipes are assembled from tail to head
+//   - Each pipe wraps the next pipe's processor
+//   - Allows natural flow control and early termination
+//
+// 4. Time-Range-First Pruning
+//   - Partition/part/block selection uses time bounds early
+//   - Skips irrelevant data before reading block contents
+//   - Binary search over sorted partition list
+//
+// See onboarding/onboarding-logsql-parser-pipes.md for detailed documentation.
 package logstorage
 
 import (
@@ -21,32 +62,47 @@ import (
 	"github.com/VictoriaMetrics/VictoriaLogs/lib/prefixfilter"
 )
 
-// QueryContext is used for execting the query passed to NewQueryContext()
+// QueryContext bundles all the runtime context needed for query execution.
+//
+// It's created by the HTTP handler and passed through the entire execution pipeline.
+// The context ties together:
+//   - The parsed Query AST
+//   - Tenant isolation (TenantIDs)
+//   - Cancellation via context.Context
+//   - Statistics collection (QueryStats)
+//   - Optional field hiding for security/privacy
 type QueryContext struct {
 	// Context is the context for executing the Query.
+	// Used for cancellation propagation.
 	Context context.Context
 
 	// QueryStats is query stats, which is updated after Query execution.
+	// Collects metrics like rows scanned, blocks processed, etc.
 	QueryStats *QueryStats
 
 	// TenantIDs is the list of tenant ids to Query.
+	// Multi-tenant queries pass multiple IDs; single-tenant passes one.
 	TenantIDs []TenantID
 
 	// Query is the query to execute.
+	// This is the parsed AST from the query string.
 	Query *Query
 
-	// AllowPartialResponse indicates whether to allow partial response. This flag is used only in cluster setup when vlselect queries vlstorage nodes.
+	// AllowPartialResponse indicates whether to allow partial response.
+	// This flag is used only in cluster setup when vlselect queries vlstorage nodes.
+	// If true, results from unavailable nodes are omitted rather than failing.
 	AllowPartialResponse bool
 
 	// HiddenFieldsFilters is an optional list of field filters, which must be hidden during query execution.
 	//
 	// The list may contain full field names and field prefixes ending with *.
 	// Prefix match all the fields starting with the given prefix.
+	// Used for security/privacy to hide sensitive fields.
 	HiddenFieldsFilters []string
 
 	// startTime is creation time for the QueryContext.
 	//
-	// It is used for calculating query druation.
+	// It is used for calculating query duration.
 	startTime time.Time
 }
 
@@ -205,6 +261,16 @@ func (f writeBlockResultFunc) newDataBlockWriter() WriteDataBlockFunc {
 }
 
 // RunQuery runs the given qctx and calls writeBlock for results.
+//
+// This is the main entry point for local query execution. It:
+//  1. Initializes subqueries (in, join, union, stream_context)
+//  2. Builds search options from the query
+//  3. Creates the pipe processor chain
+//  4. Scans matching blocks in parallel
+//  5. Streams results to writeBlock
+//
+// The writeBlock callback receives DataBlocks as they're produced, enabling
+// streaming responses without buffering all results in memory.
 func (s *Storage) RunQuery(qctx *QueryContext, writeBlock WriteDataBlockFunc) error {
 	writeBlockResult := writeBlock.newBlockResultWriter()
 	return s.runQuery(qctx, writeBlockResult)
@@ -213,21 +279,34 @@ func (s *Storage) RunQuery(qctx *QueryContext, writeBlock WriteDataBlockFunc) er
 // runQueryFunc must run the given qctx and pass query results to writeBlock
 type runQueryFunc func(qctx *QueryContext, writeBlock writeBlockResultFunc) error
 
+// runQuery is the internal query execution implementation.
+//
+// Execution phases:
+//  1. initSubqueries: Materialize in(subquery) values, join maps, union hooks
+//  2. getSearchOptions: Extract time range, stream filters, field projections
+//  3. runPipes: Create processor chain and execute search
 func (s *Storage) runQuery(qctx *QueryContext, writeBlock writeBlockResultFunc) error {
+	// Phase 1: Initialize subqueries before main search
+	// This materializes in(subquery), builds join maps, sets up union hooks
 	qNew, err := initSubqueries(qctx, s.runQuery, true)
 	if err != nil {
 		return err
 	}
 	q := qNew
 
+	// Phase 2: Build search options
+	// Extracts time range, stream filters, field filters from the query
 	sso := s.getSearchOptions(qctx.TenantIDs, q, qctx.HiddenFieldsFilters)
 
+	// Phase 3: Define the search function
+	// This will be called by runPipes to scan blocks
 	search := func(stopCh <-chan struct{}, writeBlockToPipes writeBlockResultFunc) error {
 		workersCount := q.GetParallelReaders(s.defaultParallelReaders)
 		s.searchParallel(workersCount, sso, qctx.QueryStats, stopCh, writeBlockToPipes)
 		return nil
 	}
 
+	// Phase 4: Execute the pipe chain
 	concurrency := q.GetConcurrency()
 	return runPipes(qctx, q.pipes, search, writeBlock, concurrency)
 }
@@ -266,20 +345,46 @@ func (s *Storage) getSearchOptions(tenantIDs []TenantID, q *Query, hiddenFieldsF
 // searchFunc must perform search and pass its results to writeBlock.
 type searchFunc func(stopCh <-chan struct{}, writeBlock writeBlockResultFunc) error
 
+// runPipes orchestrates the execution of the pipe chain.
+//
+// This is the core of pipe execution. It builds the processor chain and manages
+// the flow of data from search through all pipes to the final writeBlock.
+//
+// Algorithm:
+//  1. Create a cancellable context for the entire query
+//  2. Build processors in REVERSE order (tail pipe first)
+//     - Each processor wraps the next processor in the chain
+//     - This allows each pipe to intercept and transform data
+//  3. Execute the search function, streaming blocks to the head processor
+//  4. Flush all processors in FORWARD order to emit final results
+//  5. Propagate errors via context cancellation
+//
+// Why reverse assembly?
+//   - The last pipe needs to write to the final output (writeBlock)
+//   - Each preceding pipe wraps the next pipe's processor
+//   - This creates a natural call chain: p0.writeBlock -> p1.writeBlock -> ... -> writeBlock
+//
+// Error handling:
+//   - If search fails, cancel everything and return the error
+//   - If any flush fails, cancel remaining processors and return the error
+//   - Query stats are injected into query_stats pipes during flush
 func runPipes(qctx *QueryContext, pipes []pipe, search searchFunc, writeBlock writeBlockResultFunc, concurrency int) error {
 	ctx, topCancel := context.WithCancel(qctx.Context)
 	defer topCancel()
 
 	stopCh := ctx.Done()
 	if len(pipes) == 0 {
-		// Fast path when there are no pipes
+		// Fast path when there are no pipes - just search and write directly
 		return search(stopCh, writeBlock)
 	}
 
+	// Start with a no-op processor that writes directly to the final output
 	pp := newNoopPipeProcessor(stopCh, writeBlock)
 	cancels := make([]func(), len(pipes))
 	pps := make([]pipeProcessor, len(pipes))
 
+	// Build processors in REVERSE order (last pipe first)
+	// Each processor wraps the next processor in the chain
 	for i := len(pipes) - 1; i >= 0; i-- {
 		p := pipes[i]
 		ctxChild, cancel := context.WithCancel(ctx)
@@ -292,14 +397,17 @@ func runPipes(qctx *QueryContext, pipes []pipe, search searchFunc, writeBlock wr
 		ctx = ctxChild
 	}
 
+	// Execute the search - this streams blocks through the pipe chain
 	errSearch := search(stopCh, pp.writeBlock)
 	if errSearch != nil {
 		// Cancel the whole query in order to free up resources occupied by pipes.
 		topCancel()
 	}
 
+	// Flush all processors in FORWARD order (first pipe first)
 	var errFlush error
 	for i, pp := range pps {
+		// Inject query stats into query_stats pipes
 		switch t := pp.(type) {
 		case *pipeQueryStatsProcessor:
 			t.setQueryStats(qctx.QueryStats, qctx.QueryDurationNsecs())
@@ -753,6 +861,22 @@ func (s *Storage) runValuesWithHitsQuery(qctx *QueryContext) ([]ValueWithHits, e
 	return results, nil
 }
 
+// initSubqueries materializes all subqueries in the query before main execution.
+//
+// This is a critical two-phase evaluation pattern:
+//  1. First, all subqueries are executed to collect their results
+//  2. Then, the main query runs using the materialized subquery results
+//
+// Why materialize first?
+//   - Reduces per-row work during block scanning
+//   - Allows caching of subquery results
+//   - Enables query optimization based on known subquery results
+//
+// Subquery types handled:
+//   - in(subquery): Collects unique values for IN filter
+//   - join: Builds a hash map for join lookups
+//   - union: Sets up hooks for parallel union execution
+//   - stream_context: Validates and initializes stream context pipes
 func initSubqueries(qctx *QueryContext, runQuery runQueryFunc, keepInSubquery bool) (*Query, error) {
 	getFieldValues := func(q *Query, fieldName string) ([]string, error) {
 		qctxLocal := qctx.WithQuery(q)
@@ -1268,15 +1392,30 @@ func (db *DataBlock) initFromBlockResult(br *blockResult) {
 	}
 }
 
-// search searches for the matching rows according to sso.
+// searchParallel executes parallel block search across all matching partitions.
 //
-// It uses workersCount parallel workers for the search and calls writeBlock for each matching block.
+// This is the core search routine that scans data blocks in parallel:
+//  1. Spin up worker goroutines (one per parallel reader)
+//  2. Select partitions matching the time range
+//  3. For each partition, scan its parts concurrently
+//  4. Each worker processes blocks and streams results to writeBlock
+//
+// Concurrency model:
+//   - WorkersCount goroutines read from workCh
+//   - Each partition search is limited by partitionSearchConcurrencyLimitCh
+//   - This prevents memory explosion under high load
+//
+// Performance optimizations:
+//   - Time range pruning skips entire partitions/parts/blocks
+//   - Per-worker stats reduce lock contention
+//   - Batched work items reduce channel overhead
 func (s *Storage) searchParallel(workersCount int, sso *storageSearchOptions, qs *QueryStats, stopCh <-chan struct{}, writeBlock writeBlockResultFunc) {
 	// spin up workers
 	var wg sync.WaitGroup
 	workCh := make(chan *blockSearchWorkBatch, workersCount)
 	for workerID := range workersCount {
 		wg.Go(func() {
+			// Per-worker stats to reduce lock contention
 			qsLocal := &QueryStats{}
 			bs := getBlockSearch()
 			bm := getBitmap(0)
@@ -1293,11 +1432,14 @@ func (s *Storage) searchParallel(workersCount int, sso *storageSearchOptions, qs
 
 					rowsProcessed := bsw.bh.rowsCount
 
+					// Execute the block search
 					bs.search(qsLocal, bsw, bm)
 					if bs.br.rowsLen > 0 {
+						// Apply time offset if configured
 						if sso.timeOffset != 0 {
 							bs.subTimeOffsetToTimestamps(sso.timeOffset)
 						}
+						// Stream the matching block to the pipe chain
 						writeBlock(uint(workerID), &bs.br)
 					}
 					bsw.reset()
@@ -1312,6 +1454,7 @@ func (s *Storage) searchParallel(workersCount int, sso *storageSearchOptions, qs
 
 			putBlockSearch(bs)
 			putBitmap(bm)
+			// Merge per-worker stats into global stats
 			qs.UpdateAtomic(qsLocal)
 
 		})
@@ -1325,6 +1468,7 @@ func (s *Storage) searchParallel(workersCount int, sso *storageSearchOptions, qs
 	psfs := make([]partitionSearchFinalizer, len(ptws))
 	var wgSearchers sync.WaitGroup
 	for idx, ptw := range ptws {
+		// Limit concurrent partition searches to avoid memory explosion
 		partitionSearchConcurrencyLimitCh <- struct{}{}
 		wgSearchers.Go(func() {
 			qsLocal := &QueryStats{}
@@ -1342,7 +1486,7 @@ func (s *Storage) searchParallel(workersCount int, sso *storageSearchOptions, qs
 	close(workCh)
 	wg.Wait()
 
-	// Finalize partition search
+	// Finalize partition search (release resources)
 	for _, psf := range psfs {
 		psf()
 	}

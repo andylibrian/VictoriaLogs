@@ -1,3 +1,41 @@
+// Package logstorage provides the core storage engine and LogsQL query language implementation.
+//
+// This file (parser.go) implements the LogsQL query parser, which transforms query strings
+// into an executable AST (Abstract Syntax Tree). The parser is designed for:
+//   - Determinism: Same query always produces the same AST
+//   - Extensibility: New filter types and pipes can be added easily
+//   - Optimization: Post-parse rewrites improve query performance
+//
+// Parser Architecture Overview:
+//
+// The parser uses a recursive descent approach with a hand-written lexer. The main entry points are:
+//
+//	ParseQuery(s)                  - Parse query at current timestamp
+//	ParseQueryAtTimestamp(s, ts)   - Parse query with explicit timestamp context
+//
+// The parsing flow for a query like "error | stats count() by host":
+//
+//  1. Lexer tokenizes: [error] [|] [stats] [count() by host]
+//  2. parseQuery() orchestrates the parse
+//  3. parseFilter() builds the filter tree (error -> filterPhrase)
+//  4. parsePipes() builds the pipe chain (stats -> pipeStats)
+//  5. optimize() applies rewrites and simplifications
+//
+// Key Data Structures:
+//
+//   - Query: The top-level AST node containing filter + pipes + options
+//   - filter: Interface for all filter types (AND, OR, phrase, range, etc.)
+//   - pipe: Interface for all pipe types (stats, filter, sort, etc.)
+//   - lexer: Token stream with position tracking and backup/restore
+//
+// Why This Design?
+//
+// The two-level AST (Query -> filter + []pipe) separation allows:
+//   - Clean separation between filtering and transformation
+//   - Efficient optimization passes that can rewrite filter trees
+//   - Distributed execution where pipes can be split between remote/local
+//
+// See onboarding/onboarding-logsql-parser-pipes.md for detailed documentation.
 package logstorage
 
 import (
@@ -20,33 +58,49 @@ import (
 	"github.com/VictoriaMetrics/VictoriaLogs/lib/prefixfilter"
 )
 
+// lexer implements a hand-written tokenizer for LogsQL queries.
+//
+// The lexer maintains position state to enable:
+//   - Backup/restore for speculative parsing (try X, rollback if fails)
+//   - Error context showing where parsing failed
+//   - Nested query option stack for subqueries
+//
+// Why hand-written vs generator?
+//   - More control over error messages
+//   - Easier to implement backup/restore for speculative parsing
+//   - Better integration with compound token handling (e.g., "foo-bar" as single token)
 type lexer struct {
 	// s contains unparsed tail of sOrig
 	s string
 
-	// sOrig contains the original string
+	// sOrig contains the original string (for error context)
 	sOrig string
 
-	// token contains the current token
+	// token contains the current token (unquoted value)
 	//
-	// an empty token means the end of s
+	// An empty token means the end of s
 	token string
 
 	// rawToken contains raw token before unquoting
+	// Used to detect quoted vs unquoted tokens for keyword matching
 	rawToken string
 
 	// prevRawToken contains the previously parsed token before unquoting
+	// Used for whitespace validation between tokens
 	prevRawToken string
 
 	// isSkippedSpace is set to true if there was a whitespace before the token in s
+	// Used to enforce syntax rules like "foo:bar" vs "foo : bar"
 	isSkippedSpace bool
 
 	// currentTimestamp is the current timestamp in nanoseconds.
 	//
 	// It is used for proper initializing of _time filters with relative time ranges.
+	// For example, "_time:1h" becomes "_time:[now-1h, now]" using this timestamp.
 	currentTimestamp int64
 
 	// opts is a stack of options for nested parsed queries
+	// This allows subqueries to inherit or override parent query options
 	optss []*queryOptions
 }
 
@@ -363,44 +417,85 @@ again:
 	}
 }
 
-// Query represents LogsQL query.
+// Query represents a parsed LogsQL query - the canonical AST produced by the parser.
+//
+// A Query consists of three parts:
+//   - opts: Query options like concurrency, parallel_readers, time_offset
+//   - f: The filter tree that selects which log rows match
+//   - pipes: The transformation pipeline applied to matching rows
+//
+// Example: "error | stats count() by host" becomes:
+//   - f: &filterPhrase{phrase: "error"}  // matches rows containing "error"
+//   - pipes: [&pipeStats{byFields: ["host"], funcs: [count()]}]
+//
+// The separation of filter and pipes is crucial for:
+//   - Optimization: Filters can be pushed down to storage layer
+//   - Distribution: Pipes can be split between remote/local execution
+//   - Clarity: Clear semantic boundary between selection and transformation
 type Query struct {
+	// opts contains query-level options that control execution behavior.
+	// These can be set via "options(...)" syntax in the query.
 	opts queryOptions
 
+	// f is the root of the filter tree.
+	// Common types: *filterAnd, *filterOr, *filterPhrase, *filterTime
 	f filter
 
+	// pipes is the ordered list of transformation pipes.
+	// Pipes are applied left-to-right in the query: | p1 | p2 | p3
 	pipes []pipe
 
-	// timestamp is the timestamp context used for parsing the query.
+	// timestamp is the reference timestamp context used for parsing the query.
+	// This is used to resolve relative time expressions like "_time:1h"
+	// which become "_time:[timestamp-1h, timestamp]"
 	timestamp int64
 }
 
+// queryOptions holds optional execution parameters that can be set per-query.
+//
+// These options are specified using the "options(...)" syntax:
+//
+//   - | options(concurrency=4, parallel_readers=8) | stats count()
+//
+// The options control resource usage and behavior:
+//   - concurrency: How many CPU workers for pipe processing
+//   - parallel_readers: How many I/O workers for block scanning
+//   - ignore_global_time_filter: Skip HTTP-level time filter injection
+//   - allow_partial_response: Allow partial results in cluster failures
+//   - time_offset: Shift all timestamps for timezone adjustment
 type queryOptions struct {
 	// needPrint is set to true if the queryOptions must be printed in the queryOptions.String().
+	// This is set when any option is explicitly specified, so Query.String() includes it.
 	needPrint bool
 
 	// concurrency is the number of concurrent CPU-bound workers to use for a single query execution.
 	//
 	// By default the number of concurrent workers equals to the number of available CPU cores.
+	// Lower values reduce CPU contention; higher values don't improve CPU-bound performance.
 	concurrency uint
 
 	// parallelReaders is the number of concurrent IO-bound data readers to use for a single query execution.
 	//
 	// By default the number of parallel readers equals to concurrency.
+	// Higher values help with high-latency storage (NFS, S3) at cost of more RAM.
 	parallelReaders uint
 
 	// if ignoreGlobalTimeFilter is set, then Query.AddTimeFilter doesn't add the time filter to the query and to all its subqueries.
+	// This allows subqueries to query data outside the parent query's time range.
 	ignoreGlobalTimeFilter *bool
 
 	// allowPartialResponse allows returning partial responses in VictoriaLogs cluster setup when some of vlstorage nodes are temporarily unavailable.
+	// Trade-off: completeness vs availability during node outages.
 	allowPartialResponse *bool
 
 	// timeOffset is the number of nanoseconds to subtracts from all time filters in the query.
 	//
 	// The timeOffset is also added to the selected _time field values before being passed to query pipes.
+	// This is useful for timezone adjustment: if data is stored in UTC but you want to query in local time.
 	timeOffset int64
 
 	// timeOffsetStr is a string representation of the timeOffset.
+	// Kept for pretty-printing the query.
 	timeOffsetStr string
 }
 
@@ -444,6 +539,17 @@ func (q *Query) String() string {
 }
 
 // GetParallelReaders returns the number of parallel readers to use for executing the given query.
+//
+// The resolution order is:
+//  1. Explicit options(parallel_readers=N) in query
+//  2. options(concurrency=N) in query (parallel_readers defaults to concurrency)
+//  3. defaultParallelReaders parameter from storage config
+//  4. 2 * CPU cores as a fallback
+//
+// Why have separate concurrency and parallel_readers?
+//   - concurrency: CPU-bound work (filtering, aggregation)
+//   - parallel_readers: I/O-bound work (reading blocks from disk/network)
+//   - On high-latency storage (S3, NFS), more readers help without wasting CPU
 func (q *Query) GetParallelReaders(defaultParallelReaders int) int {
 	n := int(q.opts.parallelReaders)
 	if n <= 0 {
@@ -894,19 +1000,38 @@ func (q *Query) mustAppendPipe(s string) {
 	q.pipes = append(q.pipes, p)
 }
 
-// optimize applies various optimizations to q.
+// optimize applies various optimizations to q after parsing.
+//
+// These optimizations are applied in sequence and can significantly improve
+// query performance by simplifying the filter tree and pipe chain:
+//
+//  1. Merge leading | filter ... into root filter - eliminates unnecessary pipe
+//  2. Flatten nested AND/OR trees - simplifies filter evaluation
+//  3. Remove no-op star filters (*) - they match everything
+//  4. Merge stream filters {...}{...} into single filter
+//  5. Optimize offset/limit patterns - merge into single operation
+//  6. Optimize uniq/limit patterns - push limit into uniq
+//
+// Why optimize after parsing?
+//   - Parser stays simple and correct
+//   - Optimizations can be applied consistently regardless of query syntax
+//   - User-written queries don't need to be hand-optimized
 func (q *Query) optimize() {
 	q.visitSubqueries(func(q *Query) {
 		q.optimizeNoSubqueries()
 	})
 }
 
+// optimizeNoSubqueries applies optimizations to q without recursing into subqueries.
+// Subquery optimization is handled separately via visitSubqueries in optimize().
 func (q *Query) optimizeNoSubqueries() {
+	// Optimize offset/limit pipe patterns first
 	q.pipes = optimizeOffsetLimitPipes(q.pipes)
 	q.pipes = optimizeUniqLimitPipes(q.pipes)
 	q.pipes = optimizeFilterPipes(q.pipes)
 
 	// Merge `q | filter ...` into q.
+	// This is a common pattern from programmatically built queries.
 	if len(q.pipes) > 0 {
 		pf, ok := q.pipes[0].(*pipeFilter)
 		if ok {
@@ -916,6 +1041,7 @@ func (q *Query) optimizeNoSubqueries() {
 	}
 
 	// Optimize `q | field_names ...` by marking pipeFieldNames as first pipe.
+	// This enables field_names to operate on raw data before other transformations.
 	if len(q.pipes) > 0 {
 		pf, ok := q.pipes[0].(*pipeFieldNames)
 		if ok {
@@ -923,16 +1049,18 @@ func (q *Query) optimizeNoSubqueries() {
 		}
 	}
 
-	// flatten nested AND filters
+	// Flatten nested AND filters for simpler evaluation
 	q.f = flattenFiltersAnd(q.f)
 
-	// flatten nested OR filters
+	// Flatten nested OR filters for simpler evaluation
 	q.f = flattenFiltersOr(q.f)
 
 	// Substitute '*' prefixFilter with filterNoop in order to avoid reading _msg data.
+	// The '*' filter matches everything, so we can skip the filter entirely.
 	q.f = removeStarFilters(q.f)
 
 	// Merge multiple {...} filters into a single one.
+	// This happens when users write: {app="foo"} {env="prod"}
 	q.f = mergeFiltersStream(q.f)
 }
 
@@ -1667,7 +1795,14 @@ func getNeededColumns(pipes []pipe) *prefixfilter.Filter {
 	return &pf
 }
 
-// ParseQuery parses s.
+// ParseQuery parses s as a LogsQL query at the current timestamp.
+//
+// This is the main entry point for parsing queries when you don't need
+// a specific timestamp context. It uses time.Now() for relative time expressions.
+//
+// Example:
+//
+//	q, err := ParseQuery("error | stats count() by host")
 func ParseQuery(s string) (*Query, error) {
 	timestamp := time.Now().UnixNano()
 	return ParseQueryAtTimestamp(s, timestamp)
@@ -1693,7 +1828,19 @@ func (q *Query) HasGlobalTimeFilter() bool {
 
 // ParseQueryAtTimestamp parses s in the context of the given timestamp.
 //
-// E.g. _time:duration filters are adjusted according to the provided timestamp as _time:[timestamp-duration, duration].
+// The timestamp context is crucial for relative time expressions:
+//   - "_time:1h" becomes "_time:[timestamp-1h, timestamp]"
+//   - Relative time filters are resolved against this timestamp
+//
+// This is the primary parsing function used by the HTTP API, which passes
+// the request's "time" parameter (or "end" parameter, or current time).
+//
+// Parsing steps:
+//  1. Create lexer from query string
+//  2. Parse query (options + filter + pipes)
+//  3. Verify no unparsed tail remains
+//  4. Apply optimizations
+//  5. Initialize rate functions with time range
 func ParseQueryAtTimestamp(s string, timestamp int64) (*Query, error) {
 	lex := newLexer(s, timestamp)
 
@@ -1776,22 +1923,42 @@ func parseQueryInParens(lex *lexer) (*Query, error) {
 	return q, nil
 }
 
+// parseQuery is the internal query parser that builds a Query from lexer tokens.
+//
+// Grammar (simplified):
+//
+//	query     = [options] filter ['|' pipes]
+//	filter    = orExpr
+//	orExpr    = andExpr ('or' andExpr)*
+//	andExpr   = primary ('and' primary)*
+//	primary   = '(' filter ')' | 'not' primary | fieldFilter | phrase
+//	pipes     = pipe ('|' pipe)*
+//
+// The parser uses recursive descent with these design choices:
+//   - Options are parsed first, allowing them to affect filter parsing
+//   - Filter and pipes are separated by '|' token
+//   - Filter is required; an empty filter is a parse error
+//   - Empty pipes list is valid (returns raw filtered rows)
 func parseQuery(lex *lexer) (*Query, error) {
 	var q Query
 	if err := parseQueryOptions(&q.opts, lex); err != nil {
 		return nil, fmt.Errorf("cannot parse query options: %w; context: [%s]; see https://docs.victoriametrics.com/victorialogs/logsql/#query-options", err, lex.context())
 	}
+	// Push options onto lexer stack so nested queries can inherit them
 	lex.pushQueryOptions(&q.opts)
 	defer lex.popQueryOptions()
 
+	// Parse the main filter expression
 	f, err := parseFilter(lex, true)
 	if err != nil {
 		return nil, fmt.Errorf("%w; context: [%s]", err, lex.context())
 	}
 
+	// Apply time offset from options to the filter (for timezone adjustment)
 	q.f = updateFilterWithTimeOffset(f, q.opts.timeOffset)
 	q.timestamp = lex.currentTimestamp
 
+	// If '|' follows, parse the pipe chain
 	if lex.isKeyword("|") {
 		lex.nextToken()
 		pipes, err := parsePipes(lex)
@@ -1940,13 +2107,30 @@ func parseKeyValuePair(lex *lexer) (string, string, error) {
 	return k, v, nil
 }
 
+// parseFilter parses a filter expression from the lexer.
+//
+// Filters support three levels of precedence (highest to lowest):
+//  1. NOT - unary negation
+//  2. AND - implicit conjunction (space-separated terms)
+//  3. OR - explicit disjunction
+//
+// Example: "error or warning not info" parses as:
+//
+//	(OR
+//	  (phrase "error")
+//	  (AND (phrase "warning") (NOT (phrase "info"))))
+//
+// The allowPipeKeywords parameter controls whether pipe keywords can start a filter.
+// This prevents confusion like "stats:foo" being parsed as a filter on "stats" field
+// vs the intended stats pipe.
 func parseFilter(lex *lexer, allowPipeKeywords bool) (filter, error) {
 	if lex.isKeyword("|", ")", "") {
 		return nil, fmt.Errorf("missing query")
 	}
 
+	// Guard rail: prevent filter from starting with pipe/stats keywords
+	// This catches common mistakes like "stats count()" without the leading filter
 	if !allowPipeKeywords {
-		// Verify the first token in the filter doesn't match pipe names.
 		firstToken := strings.ToLower(lex.rawToken)
 		if firstToken == "by" || isPipeName(firstToken) || isStatsFuncName(firstToken) {
 			return nil, fmt.Errorf("query filter cannot start with pipe keyword %q; see https://docs.victoriametrics.com/victorialogs/logsql/#query-syntax; "+
@@ -1954,6 +2138,7 @@ func parseFilter(lex *lexer, allowPipeKeywords bool) (filter, error) {
 		}
 	}
 
+	// Start parsing at the OR level (lowest precedence)
 	fo, err := parseFilterOr(lex, "")
 	if err != nil {
 		return nil, err
@@ -1961,6 +2146,12 @@ func parseFilter(lex *lexer, allowPipeKeywords bool) (filter, error) {
 	return fo, nil
 }
 
+// parseFilterOr parses OR expressions: filter ('or' filter)*
+//
+// OR has the lowest precedence, so it's parsed first.
+// Multiple OR clauses are collected into a single filterOr node.
+//
+// Example: "error or warning or info" -> filterOr{filters: [error, warning, info]}
 func parseFilterOr(lex *lexer, fieldName string) (filter, error) {
 	var filters []filter
 	for {
@@ -1971,6 +2162,7 @@ func parseFilterOr(lex *lexer, fieldName string) (filter, error) {
 		filters = append(filters, f)
 		switch {
 		case lex.isKeyword("|", ")", ""):
+			// End of filter - return single filter or OR node
 			if len(filters) == 1 {
 				return filters[0], nil
 			}
@@ -1979,11 +2171,19 @@ func parseFilterOr(lex *lexer, fieldName string) (filter, error) {
 			}
 			return fo, nil
 		case lex.isKeyword("or"):
+			// Continue parsing more OR clauses
 			lex.nextToken()
 		}
 	}
 }
 
+// parseFilterAnd parses AND expressions: filter ('and' filter)*
+//
+// AND has higher precedence than OR but lower than NOT.
+// AND can be explicit ("and" keyword) or implicit (space-separated terms).
+//
+// Example: "error warning" -> filterAnd{filters: [error, warning]}
+// Example: "error and warning" -> filterAnd{filters: [error, warning]}
 func parseFilterAnd(lex *lexer, fieldName string) (filter, error) {
 	var filters []filter
 	for {
@@ -1994,6 +2194,7 @@ func parseFilterAnd(lex *lexer, fieldName string) (filter, error) {
 		filters = append(filters, f)
 		switch {
 		case lex.isKeyword("or", "|", ")", ""):
+			// End of AND chain - return single filter or AND node
 			if len(filters) == 1 {
 				return filters[0], nil
 			}
@@ -2007,6 +2208,21 @@ func parseFilterAnd(lex *lexer, fieldName string) (filter, error) {
 	}
 }
 
+// parseFilterGeneric dispatches to the appropriate filter parser based on the current token.
+//
+// This is the core filter dispatcher that handles all filter types:
+//   - Stream filters: {app="foo", env=~"prod.*"}
+//   - Wildcard: * or fieldName:*
+//   - Parentheses: (filter)
+//   - Comparisons: >, <, =, !=
+//   - Regex: ~, !~
+//   - Negation: not, !, -
+//   - Functions: contains_all(), in(), range(), ipv4_range(), etc.
+//   - Time filters: _time:[start, end]
+//   - Phrases: plain text that matches _msg field
+//
+// The fieldName parameter is used when parsing field-specific filters like "level:error".
+// When fieldName is empty, the phrase is matched against the _msg field.
 func parseFilterGeneric(lex *lexer, fieldName string) (filter, error) {
 	// Verify the previous adjacent token
 	if lex.isKeyword("(") {
