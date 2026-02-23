@@ -1,3 +1,42 @@
+// Package netinsert implements the network insertion layer for cluster mode.
+//
+// This package is responsible for:
+//  1. Buffering log rows from vlinsert into efficient batches
+//  2. Sharding rows across vlstorage nodes based on stream hash
+//  3. Compressing and sending data via HTTP to /internal/insert endpoints
+//  4. Implementing high availability through automatic re-routing on node failure
+//
+// Data Flow:
+//
+//	Log row from protocol handler
+//	    ↓
+//	AddRow(streamHash, row) - route to node based on hash
+//	    ↓
+//	storageNode.addRow(row) - serialize and buffer
+//	    ↓
+//	Buffer reaches 2MB OR 1 second timeout
+//	    ↓
+//	mustSendInsertRequest() - compress with zstd, POST to /internal/insert
+//	    ↓
+//	On failure: re-route to another available node (HA)
+//
+// Sharding Strategy (streamRowsTracker):
+//
+// The sharding uses a two-phase approach to balance locality and parallelism:
+//   - First 1000 rows per stream: Deterministic routing (streamHash % nodeCount)
+//     Small streams stay on one node for better locality
+//   - After 1000 rows: Random distribution across all nodes
+//     Large streams spread for parallel query processing
+//
+// High Availability:
+//
+// When a vlstorage node becomes unavailable:
+//  1. The node is marked disabled for 10 seconds
+//  2. Pending data is re-routed to any available node
+//  3. If ALL nodes are unavailable, data is buffered and retried every second
+//  4. On shutdown, if nodes remain unavailable, buffered data is dropped with a log message
+//
+// See onboarding/onboarding-cluster.md for cluster architecture details.
 package netinsert
 
 import (
@@ -24,56 +63,79 @@ import (
 	"github.com/VictoriaMetrics/VictoriaLogs/lib/logstorage"
 )
 
-// the maximum size of a single data block sent to storage node.
+// maxInsertBlockSize is the maximum size of a single data block sent to a storage node.
+// Blocks are flushed when they reach this size OR after 1 second (whichever comes first).
+// This balances network efficiency (larger blocks = fewer requests) with latency (smaller = faster visibility).
 const maxInsertBlockSize = 2 * 1024 * 1024
 
-// ProtocolVersion is the version of the data ingestion protocol.
-//
-// It must be changed every time the data encoding at /internal/insert HTTP endpoint is changed.
+// ProtocolVersion is the version of the binary protocol used for /internal/insert.
+// It must be incremented every time the data encoding format changes.
+// Both sender and receiver verify version compatibility to prevent silent data corruption.
 const ProtocolVersion = "v1"
 
-// Storage is a network storage for sending data to remote storage nodes in the cluster.
+// Storage manages connections to remote vlstorage nodes for data insertion.
+// It holds a collection of storageNode instances, each representing one vlstorage node.
 type Storage struct {
+	// sns is the list of storage nodes to send data to.
 	sns []*storageNode
 
+	// disableCompression controls whether data is compressed before sending.
+	// Disabling compression reduces CPU usage at the cost of higher bandwidth.
 	disableCompression bool
 
+	// srt tracks per-stream row counts for sharding decisions.
 	srt *streamRowsTracker
 
+	// pendingDataBuffers is a pool of byte buffers used for serializing data.
+	// The channel capacity is concurrency * len(addrs), acting as both a buffer pool
+	// and a concurrency limiter for in-flight requests.
 	pendingDataBuffers chan *bytesutil.ByteBuffer
 
+	// stopCh signals all goroutines to stop during shutdown.
 	stopCh chan struct{}
-	wg     sync.WaitGroup
+
+	// wg tracks background goroutines for graceful shutdown.
+	wg sync.WaitGroup
 }
 
+// storageNode represents a single vlstorage node in the cluster.
+// Each node has its own pending data buffer, HTTP client, and availability state.
 type storageNode struct {
-	// scheme is http or https scheme to communicate with addr
+	// scheme is "http" or "https" based on -storageNode.tls flag
 	scheme string
 
-	// addr is TCP address of storage node to send the ingested data to
+	// addr is the TCP address (host:port) of the vlstorage node
 	addr string
 
-	// s is a storage, which holds the given storageNode
+	// s is the parent Storage that owns this node
 	s *Storage
 
-	// c is an http client used for sending data blocks to addr.
+	// c is the HTTP client for sending data to this node.
+	// It has its own connection pool and timeout settings.
 	c *http.Client
 
-	// ac is auth config used for setting request headers such as Authorization and Host.
+	// ac is the authentication config for this node (basic auth, bearer token, TLS)
 	ac *promauth.Config
 
-	// pendingData contains pending data, which must be sent to the storage node at the addr.
-	pendingDataMu        sync.Mutex
-	pendingData          *bytesutil.ByteBuffer
+	// pendingDataMu protects pendingData and pendingDataLastFlush
+	pendingDataMu sync.Mutex
+
+	// pendingData is the buffer of serialized rows waiting to be sent.
+	// Rows are appended here until the buffer reaches maxInsertBlockSize.
+	pendingData *bytesutil.ByteBuffer
+
+	// pendingDataLastFlush tracks when data was last sent, for the 1-second timeout
 	pendingDataLastFlush time.Time
 
-	// sendErrors counts failed send attempts for this storage node.
+	// sendErrors counts failed send attempts to this node (for monitoring)
 	sendErrors *metrics.Counter
 
-	// disabledUntil contains unix timestamp until the storageNode is disabled for data writing.
+	// disabledUntil is the Unix timestamp until which this node is disabled.
+	// Nodes are disabled for 10 seconds after a failed send attempt.
 	disabledUntil atomic.Uint64
 
-	// isReachable is set to true if the given storageNode is available for data writing.
+	// isReachable indicates whether the node is currently accepting data.
+	// Exposed as the vl_insert_remote_is_reachable metric.
 	isReachable atomic.Bool
 }
 
@@ -115,6 +177,9 @@ func newStorageNode(s *Storage, addr string, ac *promauth.Config, isTLS bool) *s
 	return sn
 }
 
+// backgroundFlusher runs as a goroutine per storage node.
+// It ensures pending data is sent at least once per second, even if the buffer
+// hasn't reached maxInsertBlockSize. This bounds the latency for small streams.
 func (sn *storageNode) backgroundFlusher() {
 	t := time.NewTicker(time.Second)
 	defer t.Stop()
@@ -130,6 +195,9 @@ func (sn *storageNode) backgroundFlusher() {
 	}
 }
 
+// flushPendingData sends buffered data to the storage node if conditions are met.
+// If force is true, data is sent regardless of the 1-second minimum interval.
+// This is used during shutdown to ensure all pending data is flushed.
 func (sn *storageNode) flushPendingData(force bool) {
 	sn.pendingDataMu.Lock()
 	if !force && time.Since(sn.pendingDataLastFlush) < time.Second {
@@ -144,6 +212,8 @@ func (sn *storageNode) flushPendingData(force bool) {
 	sn.mustSendInsertRequest(pendingData)
 }
 
+// debugFlush is used for testing: it flushes pending data and triggers force_flush
+// on the remote node to make data immediately visible for queries.
 func (sn *storageNode) debugFlush() {
 	// Send pending samples to sn.
 	sn.flushPendingData(true)
@@ -154,6 +224,10 @@ func (sn *storageNode) debugFlush() {
 	}
 }
 
+// addRow serializes a log row and appends it to the pending data buffer.
+// If the buffer exceeds maxInsertBlockSize after adding the row, the buffer is
+// immediately flushed (swapped for a fresh buffer and sent).
+// Rows that individually exceed maxInsertBlockSize are dropped with a warning.
 func (sn *storageNode) addRow(r *logstorage.InsertRow) {
 	bb := bbPool.Get()
 	b := bb.B
@@ -184,6 +258,9 @@ func (sn *storageNode) addRow(r *logstorage.InsertRow) {
 
 var bbPool bytesutil.ByteBufferPool
 
+// grabPendingDataForFlushLocked atomically swaps the pending data buffer with a fresh one.
+// The old buffer is returned for sending; a new buffer is taken from the pool.
+// Must be called with pendingDataMu held.
 func (sn *storageNode) grabPendingDataForFlushLocked() *bytesutil.ByteBuffer {
 	sn.pendingDataLastFlush = time.Now()
 	pendingData := sn.pendingData
@@ -192,6 +269,16 @@ func (sn *storageNode) grabPendingDataForFlushLocked() *bytesutil.ByteBuffer {
 	return pendingData
 }
 
+// mustSendInsertRequest sends pending data to the storage node with HA fallback.
+//
+// The send attempt follows this sequence:
+//  1. Try to send to this node's primary destination
+//  2. On failure, attempt to send to ANY available node (HA re-routing)
+//  3. If all nodes are unavailable, retry every second until:
+//     - A node becomes available and accepts the data, OR
+//     - The storage is stopped (stopCh closed), in which case data is dropped
+//
+// The pendingData buffer is always returned to the pool after this function completes.
 func (sn *storageNode) mustSendInsertRequest(pendingData *bytesutil.ByteBuffer) {
 	defer func() {
 		pendingData.Reset()
@@ -221,6 +308,9 @@ func (sn *storageNode) mustSendInsertRequest(pendingData *bytesutil.ByteBuffer) 
 	}
 }
 
+// sendInsertRequest sends pending data to this storage node.
+// Returns nil on success, or an error if the node is disabled or unreachable.
+// The data is compressed with zstd (level 1) unless compression is disabled.
 func (sn *storageNode) sendInsertRequest(pendingData *bytesutil.ByteBuffer) error {
 	dataLen := pendingData.Len()
 	if dataLen == 0 {
@@ -251,6 +341,9 @@ func (sn *storageNode) sendInsertRequest(pendingData *bytesutil.ByteBuffer) erro
 	return nil
 }
 
+// doRequest sends an HTTP request to this storage node.
+// For POST requests (with body), it sets the appropriate content type and encoding headers.
+// On connection failure or non-2xx response, the node is marked as temporarily disabled.
 func (sn *storageNode) doRequest(path string, body io.Reader) error {
 	ctx, cancel := contextutil.NewStopChanContext(sn.s.stopCh)
 	defer cancel()
@@ -298,10 +391,16 @@ func (sn *storageNode) doRequest(path string, body io.Reader) error {
 	return fmt.Errorf("unexpected response status code for request to %s: %d; want 2xx; response body: %q", reqURL, resp.StatusCode, respBody)
 }
 
+// getRequestURL constructs the full URL for a request to this storage node.
+// The URL includes the protocol version as a query parameter for compatibility checking.
 func (sn *storageNode) getRequestURL(path string) string {
 	return fmt.Sprintf("%s://%s%s?version=%s", sn.scheme, sn.addr, path, url.QueryEscape(ProtocolVersion))
 }
 
+// setDisableTemporarily marks this node as unavailable for 10 seconds.
+// This prevents repeated connection attempts to a failed node, reducing log noise
+// and allowing time for the node to recover. The node's isReachable flag is also
+// cleared to reflect the unreachable state in metrics.
 func (sn *storageNode) setDisableTemporarily() {
 	// Disable sending data to this sn for 10 seconds.
 	sn.disabledUntil.Store(fasttime.UnixTimestamp() + 10)
@@ -312,13 +411,18 @@ func (sn *storageNode) setDisableTemporarily() {
 
 var zstdBufPool bytesutil.ByteBufferPool
 
-// NewStorage returns new Storage for the given addrs with the given authCfgs.
+// NewStorage creates a new Storage for distributing log rows across vlstorage nodes.
 //
-// The concurrency is the average number of concurrent connections per every addr.
+// Parameters:
+//   - addrs: List of vlstorage node addresses (host:port format)
+//   - authCfgs: Per-node authentication configuration (basic auth, bearer token, TLS)
+//   - isTLSs: Per-node TLS enablement (use HTTPS vs HTTP)
+//   - concurrency: Average number of concurrent connections per node. The total buffer
+//     pool size is concurrency * len(addrs), which limits in-flight data.
+//   - disableCompression: If true, send data uncompressed (trades bandwidth for CPU)
 //
-// If disableCompression is set, then the data is sent uncompressed to the remote storage.
-//
-// Call MustStop on the returned storage when it is no longer needed.
+// The returned Storage starts background flusher goroutines for each node.
+// Call MustStop when the Storage is no longer needed to release resources.
 func NewStorage(addrs []string, authCfgs []*promauth.Config, isTLSs []bool, concurrency int, disableCompression bool) *Storage {
 	pendingDataBuffers := make(chan *bytesutil.ByteBuffer, concurrency*len(addrs))
 	for i := 0; i < cap(pendingDataBuffers); i++ {
@@ -371,13 +475,19 @@ func (s *Storage) DebugFlush() {
 	wg.Wait()
 }
 
-// AddRow adds the given log row into s.
+// AddRow adds a log row to the appropriate storage node based on stream hash.
+// The sharding decision is made by the streamRowsTracker, which considers both
+// the stream hash and the number of rows already sent for that stream.
 func (s *Storage) AddRow(streamHash uint64, r *logstorage.InsertRow) {
 	idx := s.srt.getNodeIdx(streamHash)
 	sn := s.sns[idx]
 	sn.addRow(r)
 }
 
+// sendInsertRequestToAnyNode attempts to send pending data to any available storage node.
+// It starts from a random node to avoid thundering herd on the first node.
+// Returns true if the data was successfully sent to any node, false if all nodes are unavailable.
+// This is the HA fallback mechanism used when the primary destination fails.
 func (s *Storage) sendInsertRequestToAnyNode(pendingData *bytesutil.ByteBuffer) bool {
 	startIdx := int(fastrand.Uint32n(uint32(len(s.sns))))
 	for i := range s.sns {
@@ -396,10 +506,15 @@ func (s *Storage) sendInsertRequestToAnyNode(pendingData *bytesutil.ByteBuffer) 
 
 var errTemporarilyDisabled = fmt.Errorf("writing to the node is temporarily disabled")
 
+// streamRowsTracker implements the two-phase sharding strategy for distributing log rows.
+// It tracks the number of rows sent per stream to decide between deterministic and random routing.
 type streamRowsTracker struct {
 	mu sync.Mutex
 
-	nodesCount    int64
+	// nodesCount is the number of storage nodes (immutable after creation)
+	nodesCount int64
+
+	// rowsPerStream tracks how many rows have been sent for each stream (by hash)
 	rowsPerStream map[uint64]uint64
 }
 
@@ -410,6 +525,18 @@ func newStreamRowsTracker(nodesCount int) *streamRowsTracker {
 	}
 }
 
+// getNodeIdx determines which storage node should receive a row for the given stream.
+//
+// Two-phase sharding strategy:
+//
+//   - Phase 1 (rows 1-1000): Deterministic routing using streamHash % nodesCount.
+//     Small streams (most common case) stay on one node for data locality.
+//     Different streams have different hashes, so they spread across nodes overall.
+//
+//   - Phase 2 (rows >1000): Random distribution across all nodes.
+//     Large streams are spread for parallel query processing.
+//     Random is preferred over round-robin to avoid correlation between
+//     ingestion order and node count.
 func (srt *streamRowsTracker) getNodeIdx(streamHash uint64) uint64 {
 	if srt.nodesCount == 1 {
 		// Fast path for a single node.

@@ -1,3 +1,44 @@
+// Package netselect implements the network query layer for cluster mode.
+//
+// This package is responsible for:
+//  1. Fanning out queries to all vlstorage nodes in parallel
+//  2. Streaming results back to the frontend for merging
+//  3. Handling partial responses when some nodes are unavailable
+//  4. Managing deletion tasks across the cluster
+//
+// Query Flow:
+//
+//	Query from vlselect frontend
+//	    ↓
+//	RunQuery(qctx, writeBlock)
+//	    ↓
+//	NewNetQueryRunner - split query into remote and local pipes
+//	    ↓
+//	runQuery() - fan out to ALL vlstorage nodes in parallel
+//	    ↓
+//	Each node: POST /internal/select/query with form-encoded params
+//	    ↓
+//	Stream binary DataBlocks back (with zstd compression)
+//	    ↓
+//	writeBlock(nodeIdx, db) - merge results from all nodes
+//
+// Partial Response Support:
+//
+// When -search.allowPartialResponse is enabled:
+//   - Queries succeed as long as at least one vlstorage node responds
+//   - Results from unavailable nodes are silently omitted
+//   - Configuration errors (non-network issues) are always returned to clients
+//
+// Binary Protocol:
+//
+// Responses from /internal/select/query use a streaming binary format:
+//
+//	[8-byte length][zstd-compressed block]
+//	[8-byte length][zstd-compressed block]
+//	...
+//	[8-byte length][final block with query stats marker 0x01]
+//
+// See onboarding/onboarding-cluster.md for cluster architecture details.
 package netselect
 
 import (
@@ -26,82 +67,70 @@ import (
 	"github.com/VictoriaMetrics/VictoriaLogs/lib/logstorage"
 )
 
+// Protocol version constants for /internal/select/* endpoints.
+// These must be incremented when the request/response format changes.
+// Version mismatches between vlselect and vlstorage result in clear error messages.
 const (
-	// FieldNamesProtocolVersion is the version of the protocol used for /internal/select/field_names HTTP endpoint.
-	//
-	// It must be updated every time the protocol changes.
+	// FieldNamesProtocolVersion is for /internal/select/field_names endpoint.
 	FieldNamesProtocolVersion = "v4"
 
-	// FieldValuesProtocolVersion is the version of the protocol used for /internal/select/field_values HTTP endpoint.
-	//
-	// It must be updated every time the protocol changes.
+	// FieldValuesProtocolVersion is for /internal/select/field_values endpoint.
 	FieldValuesProtocolVersion = "v4"
 
-	// StreamFieldNamesProtocolVersion is the version of the protocol used for /internal/select/stream_field_names HTTP endpoint.
-	//
-	// It must be updated every time the protocol changes.
+	// StreamFieldNamesProtocolVersion is for /internal/select/stream_field_names endpoint.
 	StreamFieldNamesProtocolVersion = "v4"
 
-	// StreamFieldValuesProtocolVersion is the version of the protocol used for /internal/select/stream_field_values HTTP endpoint.
-	//
-	// It must be updated every time the protocol changes.
+	// StreamFieldValuesProtocolVersion is for /internal/select/stream_field_values endpoint.
 	StreamFieldValuesProtocolVersion = "v4"
 
-	// StreamsProtocolVersion is the version of the protocol used for /internal/select/streams HTTP endpoint.
-	//
-	// It must be updated every time the protocol changes.
+	// StreamsProtocolVersion is for /internal/select/streams endpoint.
 	StreamsProtocolVersion = "v4"
 
-	// StreamIDsProtocolVersion is the version of the protocol used for /internal/select/stream_ids HTTP endpoint.
-	//
-	// It must be updated every time the protocol changes.
+	// StreamIDsProtocolVersion is for /internal/select/stream_ids endpoint.
 	StreamIDsProtocolVersion = "v4"
 
-	// QueryProtocolVersion is the version of the protocol used for /internal/select/query HTTP endpoint.
-	//
-	// It must be updated every time the protocol changes.
+	// QueryProtocolVersion is for /internal/select/query endpoint.
+	// This is the main query endpoint that streams DataBlocks.
 	QueryProtocolVersion = "v4"
 
-	// DeleteRunTaskProtocolVersion is the version of the protocol used for /internal/delete/run_task HTTP endpoint.
-	//
-	// It must be updated every time the protocol changes.
+	// DeleteRunTaskProtocolVersion is for /internal/delete/run_task endpoint.
 	DeleteRunTaskProtocolVersion = "v1"
 
-	// DeleteStopTaskProtocolVersion is the version of the protocol used for /internal/delete/stop_task HTTP endpoint.
-	//
-	// It must be updated every time the protocol changes.
+	// DeleteStopTaskProtocolVersion is for /internal/delete/stop_task endpoint.
 	DeleteStopTaskProtocolVersion = "v1"
 
-	// DeleteActiveTasksProtocolVersion is the version of the protocol used for /internal/delete/active_tasks endpoint.
-	//
-	// It must be updated every time the protocol changes.
+	// DeleteActiveTasksProtocolVersion is for /internal/delete/active_tasks endpoint.
 	DeleteActiveTasksProtocolVersion = "v1"
 )
 
-// Storage is a network storage for querying remote storage nodes in the cluster.
+// Storage manages connections to remote vlstorage nodes for distributed querying.
+// It holds a collection of storageNode instances, each representing one vlstorage node.
 type Storage struct {
+	// sns is the list of storage nodes to query
 	sns []*storageNode
 
+	// disableCompression controls whether responses are expected to be compressed
 	disableCompression bool
 }
 
+// storageNode represents a single vlstorage node in the cluster for querying.
 type storageNode struct {
-	// scheme is http or https scheme to communicate with addr
+	// scheme is "http" or "https" based on -storageNode.tls flag
 	scheme string
 
-	// addr is TCP address of the storage node to query
+	// addr is the TCP address (host:port) of the vlstorage node
 	addr string
 
-	// s is a storage, which holds the given storageNode
+	// s is the parent Storage that owns this node
 	s *Storage
 
-	// c is an http client used for querying storage node at addr.
+	// c is the HTTP client for querying this node
 	c *http.Client
 
-	// ac is auth config used for setting request headers such as Authorization and Host.
+	// ac is the authentication config for this node (basic auth, bearer token, TLS)
 	ac *promauth.Config
 
-	// sendErrors counts failed send attempts for this storage node.
+	// sendErrors counts failed query attempts to this node (for monitoring)
 	sendErrors *metrics.Counter
 }
 
@@ -129,6 +158,10 @@ func newStorageNode(s *Storage, addr string, ac *promauth.Config, isTLS bool) *s
 	return sn
 }
 
+// runQuery executes a query on this storage node and streams results via processBlock.
+// The query is sent as a POST to /internal/select/query with form-encoded parameters.
+// Results are received as a stream of binary DataBlocks, decompressed, and passed to processBlock.
+// Query stats are extracted from the final block and added to qctx.QueryStats.
 func (sn *storageNode) runQuery(qctx *logstorage.QueryContext, processBlock func(db *logstorage.DataBlock)) error {
 	args := sn.getCommonArgs(QueryProtocolVersion, qctx)
 
@@ -262,6 +295,15 @@ func (sn *storageNode) getTenantIDs(ctx context.Context, start, end int64) ([]lo
 	return tenantIDs, nil
 }
 
+// getCommonArgs builds the URL form values for a query request to a storage node.
+// These arguments are shared across all /internal/select/* endpoints:
+//   - version: Protocol version for compatibility checking
+//   - tenant_ids: JSON array of tenant IDs to query (multi-tenant isolation)
+//   - query: LogsQL query string
+//   - timestamp: Reference timestamp for relative time expressions
+//   - disable_compression: Whether the sender expects uncompressed responses
+//   - allow_partial_response: Whether partial results from unavailable nodes are acceptable
+//   - hidden_fields_filters: JSON array of field patterns to hide from results
 func (sn *storageNode) getCommonArgs(version string, qctx *logstorage.QueryContext) url.Values {
 	// ATTENTION: the *ProtocolVersion consts must be incremented every time the set of common args changes or its format changes.
 
@@ -315,6 +357,9 @@ func (sn *storageNode) getResponseForPathAndArgs(ctx context.Context, path strin
 	return bb.B[bbLen:], nil
 }
 
+// getResponseBodyForPathAndArgs sends a POST request to the storage node and returns the response body.
+// On connection failure, it returns an httpserver.ErrorWithStatusCode with status 502 (Bad Gateway).
+// This error type is used by isUnavailableBackendError() to differentiate network issues from config errors.
 func (sn *storageNode) getResponseBodyForPathAndArgs(ctx context.Context, path string, args url.Values) (io.ReadCloser, string, error) {
 	reqURL := sn.getRequestURL(path)
 	reqBody := strings.NewReader(args.Encode())
@@ -357,11 +402,15 @@ func (sn *storageNode) getRequestURL(path string) string {
 	return fmt.Sprintf("%s://%s%s", sn.scheme, sn.addr, path)
 }
 
-// NewStorage returns new Storage for the given addrs and the given authCfgs.
+// NewStorage creates a new Storage for querying vlstorage nodes.
 //
-// If disableCompression is set, then uncompressed responses are received from storage nodes.
+// Parameters:
+//   - addrs: List of vlstorage node addresses (host:port format)
+//   - authCfgs: Per-node authentication configuration
+//   - isTLSs: Per-node TLS enablement (use HTTPS vs HTTP)
+//   - disableCompression: If true, expect uncompressed responses (trades bandwidth for CPU)
 //
-// Call MustStop on the returned storage when it is no longer needed.
+// Call MustStop when the Storage is no longer needed.
 func NewStorage(addrs []string, authCfgs []*promauth.Config, isTLSs []bool, disableCompression bool) *Storage {
 	s := &Storage{
 		disableCompression: disableCompression,
@@ -381,7 +430,15 @@ func (s *Storage) MustStop() {
 	s.sns = nil
 }
 
-// RunQuery runs the given qctx and calls writeBlock for the returned data blocks
+// RunQuery executes a distributed query across all vlstorage nodes.
+//
+// The query execution flow:
+//  1. Create a NetQueryRunner that splits the query into remote and local pipes
+//  2. Define a search function that fans out to all nodes via runQuery()
+//  3. Execute with the specified concurrency, which controls parallel processing
+//
+// The writeBlock callback receives DataBlocks with a node index prefix for merging.
+// Query stats are aggregated from all nodes and updated in qctx.QueryStats.
 func (s *Storage) RunQuery(qctx *logstorage.QueryContext, writeBlock logstorage.WriteDataBlockFunc) error {
 	nqr, err := logstorage.NewNetQueryRunner(qctx, s.RunQuery, writeBlock)
 	if err != nil {
@@ -397,6 +454,11 @@ func (s *Storage) RunQuery(qctx *logstorage.QueryContext, writeBlock logstorage.
 	return nqr.Run(qctx.Context, concurrency, search)
 }
 
+// runQuery fans out the query to ALL vlstorage nodes in parallel.
+// Each node's results are streamed back and passed to writeBlock with the node index.
+// Errors are collected from all nodes; the final error depends on allowPartialResponse:
+//   - If false: return the first error from any node
+//   - If true: return error only if ALL nodes fail or a config error occurs
 func (s *Storage) runQuery(stopCh <-chan struct{}, qctx *logstorage.QueryContext, writeBlock logstorage.WriteDataBlockFunc) error {
 	ctxWithCancel, cancel := contextutil.NewStopChanContext(stopCh)
 	defer cancel()
@@ -726,6 +788,9 @@ func (sn *storageNode) getPlainResponseBodyForPathAndArgs(ctx context.Context, p
 	return data, reqURL, nil
 }
 
+// handleError processes errors from individual storage node queries.
+// It increments the error counter and cancels remaining queries if the error should
+// be immediately returned to the client (i.e., not a partial response scenario).
 func (sn *storageNode) handleError(ctx context.Context, cancel func(), err error, allowPartialResponse bool) error {
 	if err == nil {
 		// Nothing to handle.
@@ -748,6 +813,15 @@ func (sn *storageNode) handleError(ctx context.Context, cancel func(), err error
 	return err
 }
 
+// getFirstError determines the final error to return from a distributed query.
+//
+// When allowPartialResponse is false: return the first non-nil error from any node.
+// This guarantees query completeness - all data must be available.
+//
+// When allowPartialResponse is true:
+//   - Return nil if at least one node responded successfully
+//   - Return the error if it's a configuration error (not network-related)
+//   - Return "all nodes unavailable" only if every node failed with network errors
 func getFirstError(errs []error, allowPartialResponse bool) error {
 	if len(errs) == 0 {
 		logger.Panicf("BUG: len(errs) must be bigger than 0")
@@ -780,6 +854,10 @@ func getFirstError(errs []error, allowPartialResponse bool) error {
 	return fmt.Errorf("all the vlstorage nodes are unavailable for querying; a sample error: %w", errs[0])
 }
 
+// isUnavailableBackendError checks if an error is due to backend unavailability.
+// Unavailable errors are wrapped in httpserver.ErrorWithStatusCode (typically 502).
+// This is used to differentiate "backend down" from "configuration error" for
+// partial response handling - we return config errors even with partial responses.
 func isUnavailableBackendError(err error) bool {
 	// It is expected that unavailable backend errors are wrapped into httpserver.ErrorWithStatusCode.
 	var es *httpserver.ErrorWithStatusCode

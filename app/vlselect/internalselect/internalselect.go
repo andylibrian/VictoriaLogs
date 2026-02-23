@@ -1,3 +1,51 @@
+// Package internalselect implements the /internal/select/* HTTP endpoints for cluster mode.
+//
+// These endpoints are the receiving side on each vlstorage node. They accept queries
+// from vlselect (frontend) nodes, execute them against local storage, and stream
+// results back in a binary format.
+//
+// Unlike public /select/* endpoints:
+//   - Request parameters are form-encoded (not URL query strings)
+//   - Responses are binary (application/octet-stream), not JSON
+//   - Protocol versions are verified for compatibility
+//   - Endpoints are concurrency-limited to prevent resource exhaustion
+//
+// Registered Endpoints:
+//
+//	/internal/select/query               - Execute LogsQL query, stream DataBlocks
+//	/internal/select/field_names         - Get field names seen in query results
+//	/internal/select/field_values        - Get unique values for a field
+//	/internal/select/stream_field_names  - Get stream field names
+//	/internal/select/stream_field_values - Get unique values for a stream field
+//	/internal/select/streams             - Get streams seen in results
+//	/internal/select/stream_ids          - Get internal stream IDs
+//	/internal/select/tenant_ids          - Get tenant IDs (returns JSON)
+//
+// Delete endpoints (enabled with -internaldelete.enable):
+//
+//	/internal/delete/run_task     - Start a deletion task
+//	/internal/delete/stop_task    - Stop a running deletion task
+//	/internal/delete/active_tasks - List active deletion tasks
+//
+// Response Format for /internal/select/query:
+//
+// The response is a stream of compressed blocks:
+//
+//	[8-byte length][zstd-compressed data]
+//	[8-byte length][zstd-compressed data]
+//	...
+//
+// Each compressed block contains:
+//
+//	[0x00 marker][DataBlock binary]   - Regular result block
+//	[0x01 marker][QueryStats binary]  - Final block with statistics
+//
+// Concurrency Control:
+//
+// Requests are limited by -internalselect.maxConcurrentRequests (default: 100).
+// Excess requests are queued until a slot becomes available or the client cancels.
+//
+// See onboarding/onboarding-cluster.md for cluster architecture details.
 package internalselect
 
 import (
@@ -24,10 +72,15 @@ import (
 	"github.com/VictoriaMetrics/VictoriaLogs/lib/logstorage"
 )
 
+// maxConcurrentRequests limits concurrent requests to /internal/select/* endpoints.
+// This prevents a single vlstorage node from being overwhelmed by parallel queries
+// from multiple vlselect frontends. Excess requests wait in a queue.
 var maxConcurrentRequests = flag.Int("internalselect.maxConcurrentRequests", 100, "The limit on the number of concurrent requests to /internal/select/* endpoints; "+
 	"other requests are put into the wait queue; see https://docs.victoriametrics.com/victorialogs/cluster/")
 
-// RequestHandler processes requests to /internal/select/*
+// RequestHandler dispatches requests to /internal/select/* and /internal/delete/* endpoints.
+// It implements concurrency limiting via a channel semaphore. Requests that exceed
+// the limit wait until a slot becomes available or the client cancels the request.
 func RequestHandler(ctx context.Context, w http.ResponseWriter, r *http.Request) {
 	startTime := time.Now()
 
@@ -59,6 +112,8 @@ var concurrencyLimitCh chan struct{}
 
 var concurrentRequestsWaitDuration = metrics.NewSummary(`vl_concurrent_internalselect_requests_wait_duration`)
 
+// requestHandler dispatches the request to the appropriate handler based on URL path.
+// It also records metrics for request count, errors, and duration.
 func requestHandler(ctx context.Context, w http.ResponseWriter, r *http.Request, startTime time.Time) {
 	path := r.URL.Path
 	rh := requestHandlers[path]
@@ -76,6 +131,8 @@ func requestHandler(ctx context.Context, w http.ResponseWriter, r *http.Request,
 	metrics.GetOrCreateSummary(fmt.Sprintf(`vl_http_request_duration_seconds{path=%q}`, path)).UpdateDuration(startTime)
 }
 
+// requestHandlers maps URL paths to their handler functions.
+// Select endpoints return binary data; delete endpoints return JSON or empty responses.
 var requestHandlers = map[string]func(ctx context.Context, w http.ResponseWriter, r *http.Request) error{
 	"/internal/select/query":               processQueryRequest,
 	"/internal/select/field_names":         processFieldNamesRequest,
@@ -91,6 +148,17 @@ var requestHandlers = map[string]func(ctx context.Context, w http.ResponseWriter
 	"/internal/delete/active_tasks": processDeleteActiveTasks,
 }
 
+// processQueryRequest executes a LogsQL query and streams binary DataBlocks to the client.
+//
+// Response streaming strategy:
+//  1. Run the query against local storage via vlstorage.RunQuery()
+//  2. For each DataBlock produced, marshal it with a 0x00 marker and buffer
+//  3. When buffer exceeds 1MB, compress with zstd and send to client
+//  4. After all results, send a final block with 0x01 marker containing QueryStats
+//
+// The streaming approach allows large result sets to be transferred without
+// loading everything into memory. Multiple workers can produce blocks in parallel;
+// their buffers are merged before sending.
 func processQueryRequest(ctx context.Context, w http.ResponseWriter, r *http.Request) error {
 	cp, err := getCommonParams(r, netselect.QueryProtocolVersion)
 	if err != nil {
@@ -403,20 +471,25 @@ func processTenantIDsRequest(ctx context.Context, w http.ResponseWriter, r *http
 	return nil
 }
 
+// commonParams holds the parsed parameters from an internal select request.
+// These parameters are common across all /internal/select/* endpoints.
 type commonParams struct {
+	// TenantIDs is the list of tenant IDs to query (multi-tenant isolation)
 	TenantIDs []logstorage.TenantID
-	Query     *logstorage.Query
 
-	// Whether to disable compression of the response sent to the vlselect.
+	// Query is the parsed LogsQL query
+	Query *logstorage.Query
+
+	// DisableCompression indicates whether the client expects uncompressed responses
 	DisableCompression bool
 
-	// Whether to allow partial response when some of vlstorage nodes are unavailable.
+	// AllowPartialResponse indicates whether partial results are acceptable
 	AllowPartialResponse bool
 
-	// Optional list of log fields or log field prefixes ending with *, which must be hidden during query execution.
+	// HiddenFieldsFilters is a list of field patterns to hide from results
 	HiddenFieldsFilters []string
 
-	// qs contains execution statistics for the Query.
+	// qs accumulates query execution statistics
 	qs logstorage.QueryStats
 }
 
@@ -428,6 +501,14 @@ func (cp *commonParams) UpdatePerQueryStatsMetrics() {
 	vlstorage.UpdatePerQueryStatsMetrics(&cp.qs)
 }
 
+// getCommonParams parses the common request parameters from an internal select request.
+// It verifies protocol version compatibility and extracts:
+//   - tenant_ids: JSON array of TenantID
+//   - query: LogsQL query string (parsed at the given timestamp)
+//   - timestamp: Reference timestamp for relative time expressions
+//   - disable_compression: Whether to skip response compression
+//   - allow_partial_response: Whether partial results are acceptable
+//   - hidden_fields_filters: JSON array of field patterns to hide
 func getCommonParams(r *http.Request, expectedProtocolVersion string) (*commonParams, error) {
 	if err := checkProtocolVersion(r, expectedProtocolVersion); err != nil {
 		return nil, err
@@ -477,6 +558,10 @@ func getCommonParams(r *http.Request, expectedProtocolVersion string) (*commonPa
 	return cp, nil
 }
 
+// checkProtocolVersion verifies that the client's protocol version matches the expected version.
+// A mismatch typically indicates that vlselect and vlstorage components are at different
+// release versions, which could cause protocol incompatibility. The error message guides
+// operators to ensure all components are at the same version.
 func checkProtocolVersion(r *http.Request, expectedProtocolVersion string) error {
 	version := r.FormValue("version")
 	if version != expectedProtocolVersion {
@@ -486,6 +571,15 @@ func checkProtocolVersion(r *http.Request, expectedProtocolVersion string) error
 	return nil
 }
 
+// writeValuesWithHits serializes a slice of ValueWithHits to binary format and writes to w.
+// The format is:
+//   - [8-byte count of entries]
+//   - [ValueWithHits #1]
+//   - [ValueWithHits #2]
+//   - ...
+//   - [QueryStats DataBlock]
+//
+// The entire payload is optionally compressed with zstd (level 1) before sending.
 func writeValuesWithHits(w http.ResponseWriter, qctx *logstorage.QueryContext, vhs []logstorage.ValueWithHits, disableCompression bool) error {
 	var b []byte
 
@@ -511,6 +605,9 @@ func writeValuesWithHits(w http.ResponseWriter, qctx *logstorage.QueryContext, v
 	return nil
 }
 
+// marshalQueryStatsBlock creates a DataBlock containing query execution statistics.
+// The block includes metrics like rows scanned, bytes read, and execution time.
+// This block is always sent as the final block in a query response (with 0x01 marker).
 func marshalQueryStatsBlock(dst []byte, qctx *logstorage.QueryContext) []byte {
 	queryDurationNsecs := qctx.QueryDurationNsecs()
 	db := qctx.QueryStats.CreateDataBlock(queryDurationNsecs)

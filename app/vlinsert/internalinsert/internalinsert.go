@@ -1,3 +1,39 @@
+// Package internalinsert implements the /internal/insert HTTP endpoint for cluster mode.
+//
+// This endpoint is the receiving side on each vlstorage node. It accepts binary-serialized
+// log rows from vlinsert (frontend) nodes and stores them in local storage.
+//
+// Protocol Details:
+//
+//   - Method: POST
+//   - URL: /internal/insert?version=v1
+//   - Content-Type: application/octet-stream
+//   - Content-Encoding: zstd (unless -insert.disableCompression is set)
+//   - Body: Concatenated binary InsertRow records (see logstorage.InsertRow.Marshal)
+//
+// Request Processing:
+//
+//  1. Verify protocol version matches netinsert.ProtocolVersion ("v1")
+//  2. Decompress the request body (zstd)
+//  3. Parse InsertRow records in a loop using InsertRow.UnmarshalInplace()
+//  4. Add each row to local storage via InsertRowProcessor
+//
+// Tenant Handling:
+//
+// The tenant ID is embedded in each serialized InsertRow record, not in HTTP headers.
+// This allows rows from multiple tenants to be batched together efficiently.
+// Request headers for tenant (AccountID, ProjectID) are ignored with a warning.
+//
+// Unsupported Options:
+//
+// The /internal/insert endpoint is a low-level binary protocol and does not support
+// the field mapping options available on public endpoints:
+//   - _time_field / VL-Time-Field header (timestamps are in the binary data)
+//   - _msg_field / VL-Msg-Field header (message fields are in the binary data)
+//   - _stream_fields / VL-Stream-Fields header (stream fields are in the binary data)
+//   - _decolorize_fields / VL-Decolorize-Fields header
+//
+// See onboarding/onboarding-cluster.md for cluster architecture details.
 package internalinsert
 
 import (
@@ -20,7 +56,17 @@ var (
 	maxRequestSize = flagutil.NewBytes("internalinsert.maxRequestSize", 64*1024*1024, "The maximum size in bytes of a single request, which can be accepted at /internal/insert HTTP endpoint")
 )
 
-// RequestHandler processes /internal/insert requests.
+// RequestHandler processes /internal/insert requests from vlinsert frontend nodes.
+//
+// This is the cluster-internal endpoint for data ingestion. It differs from public
+// /insert/* endpoints in several ways:
+//   - Uses binary protocol instead of JSON/text formats
+//   - Tenant ID is embedded in each row, not in headers
+//   - No field mapping options (data is pre-formatted by vlinsert)
+//   - Protocol version is verified for compatibility
+//
+// The handler decompresses the zstd-encoded body, parses binary InsertRow records,
+// and adds them to local storage via the InsertRowProcessor interface.
 func RequestHandler(w http.ResponseWriter, r *http.Request) {
 	startTime := time.Now()
 	if r.Method != "POST" {
@@ -93,6 +139,10 @@ func RequestHandler(w http.ResponseWriter, r *http.Request) {
 
 var unsupportedOptionsLogger = logger.WithThrottler("unsuppoted_options", 5*time.Second)
 
+// parseData deserializes binary InsertRow records from data and adds them to irp.
+// Each record is parsed using InsertRow.UnmarshalInplace(), which reads the row
+// in-place without additional allocations (the row borrows memory from data).
+// The parsed row is then added to the InsertRowProcessor for storage.
 func parseData(irp insertutil.InsertRowProcessor, data []byte) error {
 	r := logstorage.GetInsertRow()
 	defer logstorage.PutInsertRow(r)

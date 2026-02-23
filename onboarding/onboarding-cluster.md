@@ -55,7 +55,7 @@ Every vlstorage node is a fully functional single-node VictoriaLogs instance. It
 
 **Public vs Internal Select Endpoints**:
 - `/select/*` is the external query API for users and tools (JSON/[NDJSON](./glossary.md#ndjson) responses, user-facing query args). See [`app/vlselect/main.go`](../app/vlselect/main.go#L90) and [`app/vlselect/logsql/logsql.go`](../app/vlselect/logsql/logsql.go#L1149).
-- `/internal/select/*` is the cluster-internal API used by `vlselect` to query `vlstorage` (versioned form args, binary responses, optional [zstd](./glossary.md#zstd) compression). See [`app/vlstorage/netselect/netselect.go`](../app/vlstorage/netselect/netselect.go#L29) and [`app/vlselect/internalselect/internalselect.go`](../app/vlselect/internalselect/internalselect.go#L431).
+- `/internal/select/*` is the cluster-internal API used by `vlselect` to query `vlstorage` (versioned form args, binary responses, optional [zstd](./glossary.md#zstd) compression). See [`app/vlstorage/netselect/netselect.go`](../app/vlstorage/netselect/netselect.go#L73) and [`app/vlselect/internalselect/internalselect.go`](../app/vlselect/internalselect/internalselect.go#L512).
 
 ### Minimal Cluster Setup
 
@@ -71,13 +71,13 @@ vlstorage-1        vlstorage-2
 ## Complete Data Flows
 
 **Key Files**:
-- [`app/victoria-logs/main.go`](../app/victoria-logs/main.go#L31) - Entry point, request routing
-- [`app/vlstorage/main.go`](../app/vlstorage/main.go#L109) - Mode selection (local vs network storage)
+- [`app/victoria-logs/main.go`](../app/victoria-logs/main.go#L68) - Entry point, request routing
+- [`app/vlstorage/main.go`](../app/vlstorage/main.go#L179) - Mode selection (local vs network storage)
 - [`app/vlstorage/netinsert/netinsert.go`](../app/vlstorage/netinsert/netinsert.go#L36) - Network insert storage
-- [`app/vlstorage/netselect/netselect.go`](../app/vlstorage/netselect/netselect.go#L82) - Network select storage
-- [`app/vlinsert/internalinsert/internalinsert.go`](../app/vlinsert/internalinsert/internalinsert.go#L24) - Internal insert endpoint handler
-- [`app/vlselect/internalselect/internalselect.go`](../app/vlselect/internalselect/internalselect.go#L31) - Internal select endpoint handler
-- [`lib/logstorage/net_query_runner.go`](../lib/logstorage/net_query_runner.go#L12) - Distributed query splitting and execution
+- [`app/vlstorage/netselect/netselect.go`](../app/vlstorage/netselect/netselect.go#L108) - Network select storage
+- [`app/vlinsert/internalinsert/internalinsert.go`](../app/vlinsert/internalinsert/internalinsert.go#L70) - Internal insert endpoint handler
+- [`app/vlselect/internalselect/internalselect.go`](../app/vlselect/internalselect/internalselect.go#L84) - Internal select endpoint handler
+- [`lib/logstorage/net_query_runner.go`](../lib/logstorage/net_query_runner.go#L49) - Distributed query splitting and execution
 
 ### Ingestion Flow
 
@@ -86,7 +86,7 @@ Log Source (e.g. curl POST /insert/jsonline)
     ↓
 victoria-logs-prod (vlinsert + vlselect node, -storageNode=...)
     ↓
-requestHandler                               [main.go:76](../app/victoria-logs/main.go#L76)
+requestHandler                               [main.go:141](../app/victoria-logs/main.go#L141)
     ↓
 vlinsert.RequestHandler                      [main.go:38](../app/vlinsert/main.go#L38)
     ↓
@@ -98,9 +98,9 @@ lmp.AddRow(timestamp, fields, ...)           [common_params.go:254](../app/vlins
     ↓
 logRowsStorage.MustAddRows(lr)               [common_params.go:323](../app/vlinsert/insertutil/common_params.go#L323)
     ↓
-vlstorage.Storage.MustAddRows(lr)            [main.go:543](../app/vlstorage/main.go#L543)
+vlstorage.Storage.MustAddRows(lr)            [main.go:686](../app/vlstorage/main.go#L686)
     ↓
-lr.ForEachRow(netstorageInsert.AddRow)       [main.go:549](../app/vlstorage/main.go#L549)
+lr.ForEachRow(netstorageInsert.AddRow)       [main.go:692](../app/vlstorage/main.go#L692)
     ↓
 netstorageInsert.AddRow(streamHash, r)       [netinsert.go:375](../app/vlstorage/netinsert/netinsert.go#L375)
     ↓
@@ -134,7 +134,7 @@ Query Client (e.g. curl GET /select/logsql/query?query=...)
     ↓
 victoria-logs-prod (vlinsert + vlselect node, -storageNode=...)
     ↓
-requestHandler                                 [main.go:76](../app/victoria-logs/main.go#L76)
+requestHandler                                 [main.go:141](../app/victoria-logs/main.go#L141)
     ↓
 vlselect.RequestHandler                        [main.go:90](../app/vlselect/main.go#L90)
     ↓
@@ -144,16 +144,16 @@ logsql.ProcessQueryRequest                     [logsql.go:1149](../app/vlselect/
     ↓
 parseCommonArgs → logstorage.ParseQueryAtTimestamp
     ↓
-vlstorage.RunQuery(qctx, writeBlock)           [main.go:554](../app/vlstorage/main.go#L554)
+vlstorage.RunQuery(qctx, writeBlock)           [main.go:709](../app/vlstorage/main.go#L709)
     ↓
-netstorageSelect.RunQuery(qctx, writeBlock)    [netselect.go:385](../app/vlstorage/netselect/netselect.go#L385)
+netstorageSelect.RunQuery(qctx, writeBlock)    [netselect.go:442](../app/vlstorage/netselect/netselect.go#L442)
     ↓
-NewNetQueryRunner(qctx, ...)                   [net_query_runner.go:31](../lib/logstorage/net_query_runner.go#L31)
-splitQueryToRemoteAndLocal(q)                  [net_query_runner.go:72](../lib/logstorage/net_query_runner.go#L72)
+NewNetQueryRunner(qctx, ...)                   [net_query_runner.go:81](../lib/logstorage/net_query_runner.go#L81)
+splitQueryToRemoteAndLocal(q)                  [net_query_runner.go:139](../lib/logstorage/net_query_runner.go#L139)
     → qRemote = filter + remotable pipes
     → pipesLocal = remaining pipes (merge, sort, limit)
     ↓
-Fan out qRemote to ALL vlstorage nodes         [netselect.go:400](../app/vlstorage/netselect/netselect.go#L400)
+Fan out qRemote to ALL vlstorage nodes         [netselect.go:462](../app/vlstorage/netselect/netselect.go#L462)
     ↓
 POST http://storageNode-1/internal/select/query (form body includes version=v4, query, tenant_ids, ...)
 POST http://storageNode-2/internal/select/query (form body includes version=v4, query, tenant_ids, ...)
@@ -191,14 +191,14 @@ writeBlock → Stream JSON to client
 
 ### 1. Mode Selection — Single-Node vs Cluster
 
-**File**: [`app/vlstorage/main.go`](../app/vlstorage/main.go#L109)
+**File**: [`app/vlstorage/main.go`](../app/vlstorage/main.go#L179)
 
 The entire cluster vs single-node decision is made in `vlstorage.Init()` based on whether `-storageNode` is set.
 
 **Key Functions**:
-- [`Init()`](../app/vlstorage/main.go#L109) - Initializes either local or network storage
-- [`initLocalStorage()`](../app/vlstorage/main.go#L117) - Opens on-disk storage at `-storageDataPath`
-- [`initNetworkStorage()`](../app/vlstorage/main.go#L164) - Creates `netinsert.Storage` and `netselect.Storage` for remote nodes
+- [`Init()`](../app/vlstorage/main.go#L179) - Initializes either local or network storage
+- [`initLocalStorage()`](../app/vlstorage/main.go#L202) - Opens on-disk storage at `-storageDataPath`
+- [`initNetworkStorage()`](../app/vlstorage/main.go#L266) - Creates `netinsert.Storage` and `netselect.Storage` for remote nodes
 
 ```go
 func Init() {
@@ -218,7 +218,7 @@ var netstorageInsert *netinsert.Storage    // non-nil in cluster mode
 var netstorageSelect *netselect.Storage    // non-nil in cluster mode
 ```
 
-**Location**: [`app/vlstorage/main.go:99-183`](../app/vlstorage/main.go#L99)
+**Location**: [`app/vlstorage/main.go:145-285`](../app/vlstorage/main.go#L145)
 
 ---
 
@@ -324,13 +324,13 @@ pendingDataBuffers := make(chan *bytesutil.ByteBuffer, concurrency*len(addrs))
 
 ### 4. Internal Insert Endpoint
 
-**File**: [`app/vlinsert/internalinsert/internalinsert.go`](../app/vlinsert/internalinsert/internalinsert.go#L24)
+**File**: [`app/vlinsert/internalinsert/internalinsert.go`](../app/vlinsert/internalinsert/internalinsert.go#L70)
 
 The `/internal/insert` endpoint is the receiving side on each vlstorage node. It accepts binary-serialized log rows from vlinsert nodes.
 
 **Key Functions**:
-- [`RequestHandler(w, r)`](../app/vlinsert/internalinsert/internalinsert.go#L24) - Main handler
-- [`parseData(irp, data)`](../app/vlinsert/internalinsert/internalinsert.go#L96) - Deserialize rows from binary format
+- [`RequestHandler(w, r)`](../app/vlinsert/internalinsert/internalinsert.go#L70) - Main handler
+- [`parseData(irp, data)`](../app/vlinsert/internalinsert/internalinsert.go#L146) - Deserialize rows from binary format
 
 **Processing Steps**:
 1. Verify the protocol version matches `netinsert.ProtocolVersion` (`"v1"`)
@@ -354,27 +354,27 @@ func parseData(irp insertutil.InsertRowProcessor, data []byte) error {
 }
 ```
 
-**Location**: [`app/vlinsert/internalinsert/internalinsert.go:24-121`](../app/vlinsert/internalinsert/internalinsert.go#L24)
+**Location**: [`app/vlinsert/internalinsert/internalinsert.go:70-164`](../app/vlinsert/internalinsert/internalinsert.go#L70)
 
 ---
 
 ### 5. vlselect — Distributed Querying
 
-**File**: [`app/vlstorage/netselect/netselect.go`](../app/vlstorage/netselect/netselect.go#L82)
+**File**: [`app/vlstorage/netselect/netselect.go`](../app/vlstorage/netselect/netselect.go#L108)
 
 The `netselect.Storage` handles distributed querying by fanning out queries to all vlstorage nodes in parallel and merging results.
 
 This section describes the **internal** distributed query transport (`vlselect` → `/internal/select/*` on `vlstorage`). Public endpoint routing, timeouts, and user argument parsing for `/select/*` are handled in [`app/vlselect/main.go`](../app/vlselect/main.go#L138) and [`app/vlselect/logsql/logsql.go`](../app/vlselect/logsql/logsql.go#L1362).
 
 **Key Types**:
-- [`Storage`](../app/vlstorage/netselect/netselect.go#L82) - Holds storage nodes and compression config
-- [`storageNode`](../app/vlstorage/netselect/netselect.go#L88) - Represents a single vlstorage node with HTTP client
+- [`Storage`](../app/vlstorage/netselect/netselect.go#L108) - Holds storage nodes and compression config
+- [`storageNode`](../app/vlstorage/netselect/netselect.go#L117) - Represents a single vlstorage node with HTTP client
 
 **Key Functions**:
-- [`NewStorage(addrs, authCfgs, isTLSs, disableCompression)`](../app/vlstorage/netselect/netselect.go#L365) - Create network select storage
-- [`Storage.RunQuery(qctx, writeBlock)`](../app/vlstorage/netselect/netselect.go#L385) - Entry point for distributed query
-- [`Storage.runQuery(stopCh, qctx, writeBlock)`](../app/vlstorage/netselect/netselect.go#L400) - Fan-out to all storage nodes
-- [`storageNode.runQuery(qctx, processBlock)`](../app/vlstorage/netselect/netselect.go#L132) - Query a single storage node
+- [`NewStorage(addrs, authCfgs, isTLSs, disableCompression)`](../app/vlstorage/netselect/netselect.go#L414) - Create network select storage
+- [`Storage.RunQuery(qctx, writeBlock)`](../app/vlstorage/netselect/netselect.go#L442) - Entry point for distributed query
+- [`Storage.runQuery(stopCh, qctx, writeBlock)`](../app/vlstorage/netselect/netselect.go#L462) - Fan-out to all storage nodes
+- [`storageNode.runQuery(qctx, processBlock)`](../app/vlstorage/netselect/netselect.go#L165) - Query a single storage node
 
 **RunQuery** orchestrates the full distributed query:
 
@@ -427,20 +427,20 @@ func (s *Storage) GetFieldNames(qctx *logstorage.QueryContext) ([]logstorage.Val
 
 All node results are merged via `logstorage.MergeValuesWithHits()`.
 
-**Location**: [`app/vlstorage/netselect/netselect.go:82-837`](../app/vlstorage/netselect/netselect.go#L82)
+**Location**: [`app/vlstorage/netselect/netselect.go:108-865`](../app/vlstorage/netselect/netselect.go#L108)
 
 ---
 
 ### 6. Query Splitting — Remote vs Local Pipes
 
-**File**: [`lib/logstorage/net_query_runner.go`](../lib/logstorage/net_query_runner.go#L72)
+**File**: [`lib/logstorage/net_query_runner.go`](../lib/logstorage/net_query_runner.go#L139)
 
 In distributed mode, a LogsQL query is automatically split into pipes that run on storage nodes (remote) and pipes that run on the frontend after merging (local).
 
 **Key Functions**:
-- [`NewNetQueryRunner(qctx, runNetQuery, writeNetBlock)`](../lib/logstorage/net_query_runner.go#L31) - Create distributed query runner
-- [`splitQueryToRemoteAndLocal(q)`](../lib/logstorage/net_query_runner.go#L72) - Split the query
-- [`Run(ctx, concurrency, netSearch)`](../lib/logstorage/net_query_runner.go#L61) - Execute the distributed query
+- [`NewNetQueryRunner(qctx, runNetQuery, writeNetBlock)`](../lib/logstorage/net_query_runner.go#L81) - Create distributed query runner
+- [`splitQueryToRemoteAndLocal(q)`](../lib/logstorage/net_query_runner.go#L139) - Split the query
+- [`Run(ctx, concurrency, netSearch)`](../lib/logstorage/net_query_runner.go#L118) - Execute the distributed query
 
 ```go
 func splitQueryToRemoteAndLocal(q *Query) (*Query, []pipe) {
@@ -465,13 +465,13 @@ Each pipe type implements `splitToRemoteAndLocal()` to declare how it can be dis
 
 After receiving results from all storage nodes, the frontend executes `pipesLocal` via `runPipes()`, which merges and post-processes the data.
 
-**Location**: [`lib/logstorage/net_query_runner.go:12-112`](../lib/logstorage/net_query_runner.go#L12)
+**Location**: [`lib/logstorage/net_query_runner.go:49-191`](../lib/logstorage/net_query_runner.go#L49)
 
 ---
 
 ### 7. Internal Select Endpoint
 
-**File**: [`app/vlselect/internalselect/internalselect.go`](../app/vlselect/internalselect/internalselect.go#L31)
+**File**: [`app/vlselect/internalselect/internalselect.go`](../app/vlselect/internalselect/internalselect.go#L84)
 
 The `/internal/select/*` endpoints run on each vlstorage node and handle queries from vlselect frontend nodes.
 
@@ -481,9 +481,9 @@ Unlike `/select/*`, these endpoints are not client-facing:
 - They enforce protocol version compatibility between cluster components.
 
 **Key Functions**:
-- [`RequestHandler(ctx, w, r)`](../app/vlselect/internalselect/internalselect.go#L31) - Concurrency-limited dispatcher
-- [`processQueryRequest(ctx, w, r)`](../app/vlselect/internalselect/internalselect.go#L94) - Runs query and streams binary results
-- [`getCommonParams(r, version)`](../app/vlselect/internalselect/internalselect.go#L431) - Parse internal query params
+- [`RequestHandler(ctx, w, r)`](../app/vlselect/internalselect/internalselect.go#L84) - Concurrency-limited dispatcher
+- [`processQueryRequest(ctx, w, r)`](../app/vlselect/internalselect/internalselect.go#L162) - Runs query and streams binary results
+- [`getCommonParams(r, version)`](../app/vlselect/internalselect/internalselect.go#L512) - Parse internal query params
 
 **Registered Endpoints**:
 
@@ -520,13 +520,13 @@ func RequestHandler(ctx context.Context, w http.ResponseWriter, r *http.Request)
 }
 ```
 
-**Location**: [`app/vlselect/internalselect/internalselect.go:31-558`](../app/vlselect/internalselect/internalselect.go#L31)
+**Location**: [`app/vlselect/internalselect/internalselect.go:75-616`](../app/vlselect/internalselect/internalselect.go#L75)
 
 ---
 
 ### 8. Storage Router — Dual-Path Dispatch
 
-**File**: [`app/vlstorage/main.go`](../app/vlstorage/main.go#L554)
+**File**: [`app/vlstorage/main.go`](../app/vlstorage/main.go#L709)
 
 The `vlstorage` package-level functions transparently route all operations to either local storage or network storage. Every function follows the same pattern:
 
@@ -557,7 +557,7 @@ func RunQuery(qctx *logstorage.QueryContext, writeBlock logstorage.WriteDataBloc
 | `DeleteRunTask(ctx, ...)` | `localStorage.DeleteRunTask(...)` | `netstorageSelect.DeleteRunTask(...)` |
 | `GetTenantIDs(ctx, ...)` | `localStorage.GetTenantIDs(...)` | `netstorageSelect.GetTenantIDs(...)` |
 
-**Location**: [`app/vlstorage/main.go:520-665`](../app/vlstorage/main.go#L520)
+**Location**: [`app/vlstorage/main.go:640-830`](../app/vlstorage/main.go#L640)
 
 ---
 
@@ -662,13 +662,13 @@ func (sn *storageNode) setDisableTemporarily() {
 
 ### Query Path Behavior
 
-**File**: [`app/vlstorage/netselect/netselect.go`](../app/vlstorage/netselect/netselect.go#L729)
+**File**: [`app/vlstorage/netselect/netselect.go`](../app/vlstorage/netselect/netselect.go#L794)
 
 By default, queries return a **502 Bad Gateway** error if any vlstorage node is unavailable. This guarantees query completeness — all stored data is considered.
 
 **Key Functions**:
-- [`handleError(ctx, cancel, err, allowPartialResponse)`](../app/vlstorage/netselect/netselect.go#L729) - Handle per-node errors
-- [`getFirstError(errs, allowPartialResponse)`](../app/vlstorage/netselect/netselect.go#L751) - Determine final error
+- [`handleError(ctx, cancel, err, allowPartialResponse)`](../app/vlstorage/netselect/netselect.go#L794) - Handle per-node errors
+- [`getFirstError(errs, allowPartialResponse)`](../app/vlstorage/netselect/netselect.go#L825) - Determine final error
 
 ```go
 func getFirstError(errs []error, allowPartialResponse bool) error {
@@ -713,7 +713,7 @@ func isUnavailableBackendError(err error) bool {
 }
 ```
 
-**Location**: [`app/vlstorage/netselect/netselect.go:729-787`](../app/vlstorage/netselect/netselect.go#L729)
+**Location**: [`app/vlstorage/netselect/netselect.go:791-855`](../app/vlstorage/netselect/netselect.go#L791)
 
 ---
 
@@ -812,7 +812,7 @@ Exception: `/internal/select/tenant_ids` currently doesn't use protocol versioni
 | `/internal/delete/run_task` | `netselect.DeleteRunTaskProtocolVersion` | `"v1"` |
 | `/internal/select/tenant_ids` | _no version parameter_ | _n/a_ |
 
-**Location**: [`app/vlstorage/netinsert/netinsert.go:33`](../app/vlstorage/netinsert/netinsert.go#L33), [`app/vlstorage/netselect/netselect.go:29-78`](../app/vlstorage/netselect/netselect.go#L29)
+**Location**: [`app/vlstorage/netinsert/netinsert.go:33`](../app/vlstorage/netinsert/netinsert.go#L33), [`app/vlstorage/netselect/netselect.go:73-104`](../app/vlstorage/netselect/netselect.go#L73)
 
 ---
 
@@ -850,12 +850,12 @@ vlstorage nodes can disable their internal endpoints to prevent direct external 
 
 ### TLS and Authentication
 
-**File**: [`app/vlstorage/main.go`](../app/vlstorage/main.go#L185)
+**File**: [`app/vlstorage/main.go`](../app/vlstorage/main.go#L305)
 
 Per-storage-node TLS and authentication is configured via command-line flags. Each storage node can have independent auth configuration.
 
 **Key Functions**:
-- [`newAuthConfigForStorageNode(argIdx)`](../app/vlstorage/main.go#L185) - Build auth config for a specific storage node
+- [`newAuthConfigForStorageNode(argIdx)`](../app/vlstorage/main.go#L305) - Build auth config for a specific storage node
 
 The auth config supports:
 - **Basic Auth**: `-storageNode.username`, `-storageNode.password` (or file variants)
@@ -874,7 +874,7 @@ func newAuthConfigForStorageNode(argIdx int) *promauth.Config {
 
 On the vlstorage side, HTTPS is enabled via `-tls`, `-tlsCertFile`, `-tlsKeyFile`, and basic auth via `-httpAuth.username`, `-httpAuth.password`.
 
-**Location**: [`app/vlstorage/main.go:185-223`](../app/vlstorage/main.go#L185)
+**Location**: [`app/vlstorage/main.go:305-343`](../app/vlstorage/main.go#L305)
 
 ---
 
@@ -1034,27 +1034,27 @@ All file and line number references must use the following format:
 **1. Section Headers - File References**
 
 ```markdown
-**File**: [`app/vlstorage/main.go`](../app/vlstorage/main.go#L109)
+**File**: [`app/vlstorage/main.go`](../app/vlstorage/main.go#L179)
 ```
 
 **2. Function References in Key Functions Lists**
 
 ```markdown
 **Key Functions**:
-- [`Init()`](../app/vlstorage/main.go#L109) - Initializes storage mode
-- [`initNetworkStorage()`](../app/vlstorage/main.go#L164) - Creates network storage
+- [`Init()`](../app/vlstorage/main.go#L179) - Initializes storage mode
+- [`initNetworkStorage()`](../app/vlstorage/main.go#L266) - Creates network storage
 ```
 
 **3. Flow Diagram References**
 
 ```markdown
-vlstorage.RunQuery                    [main.go:554](../app/vlstorage/main.go#L554)
+vlstorage.RunQuery                    [main.go:709](../app/vlstorage/main.go#L709)
 ```
 
 **4. Location References**
 
 ```markdown
-**Location**: [`app/vlstorage/main.go:109-183`](../app/vlstorage/main.go#L109)
+**Location**: [`app/vlstorage/main.go:179-285`](../app/vlstorage/main.go#L179)
 ```
 
 #### Verification Checklist

@@ -1,3 +1,49 @@
+// Package vlstorage provides the storage abstraction layer for VictoriaLogs.
+//
+// This package implements a dual-path routing pattern: all storage operations transparently
+// route to either local storage (single-node mode) or network storage (cluster mode) based
+// on the -storageNode flag. Higher-level code (vlinsert, vlselect) doesn't need to know
+// which mode is active.
+//
+// Mode Selection:
+//
+// The -storageNode flag determines the operational mode:
+//
+//   - No -storageNode: Single-node mode. Data is stored locally at -storageDataPath.
+//     The package initializes localStorage (logstorage.Storage) which handles all
+//     persistence, indexing, and querying directly.
+//
+//   - With -storageNode: Cluster mode. The process becomes a frontend (vlinsert+vlselect).
+//     The package initializes netstorageInsert and netstorageSelect which route operations
+//     to remote vlstorage nodes via HTTP.
+//
+// Dual-Path Routing Pattern:
+//
+// Every public function (MustAddRows, RunQuery, GetFieldNames, etc.) follows this pattern:
+//
+//	func Operation(args) Result {
+//	    if localStorage != nil {
+//	        return localStorage.Operation(args)      // Single-node path
+//	    }
+//	    return netstorageSelect.Operation(args)      // Cluster path
+//	}
+//
+// This makes cluster mode completely transparent to callers. The same binary can run
+// in either mode, eliminating version mismatch issues between components.
+//
+// Storage Backend Components:
+//
+// In single-node mode:
+//   - localStorage (*logstorage.Storage): The core storage engine in lib/logstorage/.
+//     Handles partition management, merges, retention, snapshots, and query execution.
+//
+// In cluster mode:
+//   - netstorageInsert (*netinsert.Storage): Buffers and shards log rows across
+//     vlstorage nodes based on stream hash. Implements HA re-routing on node failure.
+//   - netstorageSelect (*netselect.Storage): Fans out queries to all vlstorage nodes
+//     in parallel and merges results.
+//
+// See onboarding/onboarding-cluster.md for cluster architecture details.
 package vlstorage
 
 import (
@@ -96,16 +142,40 @@ var (
 	storageNodeTLSInsecureSkipVerify = flagutil.NewArrayBool("storageNode.tlsInsecureSkipVerify", "Whether to skip tls verification when connecting to the corresponding -storageNode")
 )
 
+// localStorage holds the on-disk storage engine for single-node mode.
+// It is non-nil only when -storageNode is NOT set.
+// All data persistence, indexing, and querying happens through this instance.
 var localStorage *logstorage.Storage
+
+// localStorageMetrics holds the metrics set for local storage statistics.
+// Metrics are unregistered when the storage is stopped.
 var localStorageMetrics *metrics.Set
 
+// netstorageInsert handles network-based data insertion for cluster mode.
+// It buffers log rows and sends them to remote vlstorage nodes via /internal/insert.
+// Non-nil only when -storageNode IS set.
 var netstorageInsert *netinsert.Storage
 
+// netstorageSelect handles network-based querying for cluster mode.
+// It fans out queries to all remote vlstorage nodes via /internal/select/*.
+// Non-nil only when -storageNode IS set.
 var netstorageSelect *netselect.Storage
 
-// Init initializes vlstorage.
+// Init initializes the vlstorage package based on the configured mode.
 //
-// Stop must be called when vlstorage is no longer needed
+// This is the single decision point that determines whether VictoriaLogs runs as
+// a single-node instance or as a cluster frontend:
+//
+//   - No -storageNode: Calls initLocalStorage() to open on-disk storage.
+//     All data is persisted locally, queries run against local partitions.
+//
+//   - With -storageNode: Calls initNetworkStorage() to create network clients.
+//     Data is sharded to remote nodes, queries are distributed.
+//
+// The mode is captured in package-level variables (localStorage vs netstorageInsert/netstorageSelect)
+// which all subsequent operations check to route appropriately.
+//
+// Stop must be called when vlstorage is no longer needed to release resources.
 func Init() {
 	if len(*storageNodeAddrs) == 0 {
 		initLocalStorage()
@@ -114,6 +184,21 @@ func Init() {
 	}
 }
 
+// initLocalStorage opens the on-disk storage engine for single-node mode.
+//
+// This function:
+//  1. Validates configuration flags (retention period, disk limits)
+//  2. Creates the StorageConfig from command-line flags
+//  3. Opens the storage at -storageDataPath (creates if not exists)
+//  4. Registers metrics for monitoring storage health
+//
+// The storage engine handles:
+//   - Partition management (daily partitions for time-based data)
+//   - Data ingestion and indexing
+//   - Query execution with parallel readers
+//   - Background merges for read performance
+//   - Retention enforcement (time-based and disk-based)
+//   - Snapshot creation for backups
 func initLocalStorage() {
 	if localStorage != nil {
 		logger.Panicf("BUG: initLocalStorage() has been already called")
@@ -161,6 +246,23 @@ func initLocalStorage() {
 	metrics.RegisterSet(localStorageMetrics)
 }
 
+// initNetworkStorage creates network clients for cluster mode.
+//
+// This function initializes two network storage components:
+//
+// 1. netstorageInsert: Handles data sharding to remote vlstorage nodes.
+//   - Buffers log rows into 2MB blocks for efficient transfer
+//   - Routes rows to nodes based on stream hash
+//   - Implements HA by re-routing to healthy nodes on failure
+//   - Uses zstd compression (unless -insert.disableCompression)
+//
+// 2. netstorageSelect: Handles distributed query execution.
+//   - Fans out queries to all vlstorage nodes in parallel
+//   - Merges results using the query splitting algorithm
+//   - Supports partial responses when -search.allowPartialResponse is set
+//
+// Authentication and TLS are configured per-storage-node, allowing heterogeneous
+// clusters with different security settings per node.
 func initNetworkStorage() {
 	if netstorageInsert != nil || netstorageSelect != nil {
 		logger.Panicf("BUG: initNetworkStorage() has been already called")
@@ -182,6 +284,24 @@ func initNetworkStorage() {
 	logger.Infof("initialized all the network services")
 }
 
+// newAuthConfigForStorageNode builds the authentication and TLS configuration for a specific storage node.
+//
+// Each -storageNode can have independent auth settings via indexed flags:
+//   - -storageNode.username[0], -storageNode.password[0] for the first node
+//   - -storageNode.username[1], -storageNode.password[1] for the second node
+//   - etc.
+//
+// Supported authentication methods:
+//   - Basic auth: -storageNode.username / -storageNode.password (or file variants)
+//   - Bearer token: -storageNode.bearerToken (or file variant)
+//
+// TLS options:
+//   - -storageNode.tls: Enable HTTPS
+//   - -storageNode.tlsCAFile: Custom CA for server verification
+//   - -storageNode.tlsCertFile / -storageNode.tlsKeyFile: Client certificates for mTLS
+//   - -storageNode.tlsInsecureSkipVerify: Skip certificate verification (not recommended)
+//
+// This per-node configuration allows connecting to clusters with heterogeneous security settings.
 func newAuthConfigForStorageNode(argIdx int) *promauth.Config {
 	username := storageNodeUsername.GetOptionalArg(argIdx)
 	usernameFile := storageNodeUsernameFile.GetOptionalArg(argIdx)
@@ -517,10 +637,20 @@ func writeJSONResponse(w http.ResponseWriter, response any) {
 	w.Write(responseBody)
 }
 
-// Storage implements insertutil.LogRowsStorage interface
+// Storage implements the insertutil.LogRowsStorage interface.
+// It's a thin wrapper that delegates to either local or network storage.
+// This type exists to satisfy the interface requirement; all operations
+// are implemented as pointer receivers that check the package-level storage variables.
 type Storage struct{}
 
-// CanWriteData returns non-nil error if it cannot write data to vlstorage
+// CanWriteData returns a non-nil error if the storage cannot accept new data.
+//
+// In single-node mode, this checks if the storage has entered read-only mode
+// due to disk space constraints (when -storage.minFreeDiskSpaceBytes is exceeded).
+//
+// In cluster mode, writes are always allowed at the frontend level; individual
+// storage nodes handle their own capacity management and will return errors
+// if they cannot accept data.
 func (*Storage) CanWriteData() error {
 	if localStorage == nil {
 		// The data can be always written in non-local mode.
@@ -537,9 +667,22 @@ func (*Storage) CanWriteData() error {
 	return nil
 }
 
-// MustAddRows adds lr to vlstorage
+// MustAddRows adds the log rows in lr to the storage.
 //
-// It is advised to call CanWriteData() before calling MustAddRows()
+// This is the primary entry point for data ingestion. The routing is:
+//
+// Single-node mode: Directly calls localStorage.MustAddRows(lr), which:
+//   - Extracts rows from the LogRows buffer
+//   - Writes them to in-memory partitions
+//   - Triggers background flush to disk
+//
+// Cluster mode: Calls lr.ForEachRow(netstorageInsert.AddRow), which:
+//   - Computes the stream hash for each row
+//   - Routes to the appropriate vlstorage node based on the hash
+//   - Buffers rows until 2MB or 1 second, then sends via /internal/insert
+//
+// It is advised to call CanWriteData() before calling MustAddRows() to provide
+// early feedback to clients when the storage is in read-only mode.
 func (*Storage) MustAddRows(lr *logstorage.LogRows) {
 	if localStorage != nil {
 		// Store lr in the local storage.
@@ -550,7 +693,19 @@ func (*Storage) MustAddRows(lr *logstorage.LogRows) {
 	}
 }
 
-// RunQuery runs the given qctx and calls writeBlock for the returned data blocks
+// RunQuery executes the query in qctx and streams results via writeBlock.
+//
+// This is the primary entry point for query execution. The query is processed as follows:
+//
+//  1. Optimization check: If the query is a simple "last N results" query, use the
+//     optimized path that avoids full table scans (runOptimizedLastNResultsQuery).
+//
+// 2. Route to backend:
+//   - Single-node: localStorage.RunQuery searches partitions in parallel and streams blocks
+//   - Cluster: netstorageSelect.RunQuery fans out to all storage nodes, merges results
+//
+// The writeBlock callback receives DataBlocks as they are produced. This streaming
+// approach allows large result sets to be processed without loading everything into memory.
 func RunQuery(qctx *logstorage.QueryContext, writeBlock logstorage.WriteDataBlockFunc) error {
 	qOpt, offset, limit := qctx.Query.GetLastNResultsQuery()
 	if qOpt != nil {
@@ -564,7 +719,10 @@ func RunQuery(qctx *logstorage.QueryContext, writeBlock logstorage.WriteDataBloc
 	return netstorageSelect.RunQuery(qctx, writeBlock)
 }
 
-// GetFieldNames executes qctx and returns field names seen in results.
+// GetFieldNames executes the query and returns the set of field names seen in results.
+//
+// This is used for field discovery and autocomplete in the UI. In cluster mode,
+// results from all nodes are merged and deduplicated.
 func GetFieldNames(qctx *logstorage.QueryContext) ([]logstorage.ValueWithHits, error) {
 	if localStorage != nil {
 		return localStorage.GetFieldNames(qctx)
@@ -572,9 +730,10 @@ func GetFieldNames(qctx *logstorage.QueryContext) ([]logstorage.ValueWithHits, e
 	return netstorageSelect.GetFieldNames(qctx)
 }
 
-// GetFieldValues executes the given qctx and returns unique values for the fieldName seen in results.
+// GetFieldValues executes the query and returns unique values for the specified field.
 //
-// If limit > 0, then up to limit unique values are returned.
+// This is used for value autocomplete in the UI. If limit > 0, at most limit values are returned.
+// In cluster mode, results from all nodes are merged, deduplicated, and then limited.
 func GetFieldValues(qctx *logstorage.QueryContext, fieldName string, limit uint64) ([]logstorage.ValueWithHits, error) {
 	if localStorage != nil {
 		return localStorage.GetFieldValues(qctx, fieldName, limit)
@@ -582,7 +741,8 @@ func GetFieldValues(qctx *logstorage.QueryContext, fieldName string, limit uint6
 	return netstorageSelect.GetFieldValues(qctx, fieldName, limit)
 }
 
-// GetStreamFieldNames executes the given qctx and returns stream field names seen in results.
+// GetStreamFieldNames executes the query and returns stream field names seen in results.
+// Stream fields are the indexed fields that define a log stream (e.g., host, app, level).
 func GetStreamFieldNames(qctx *logstorage.QueryContext) ([]logstorage.ValueWithHits, error) {
 	if localStorage != nil {
 		return localStorage.GetStreamFieldNames(qctx)
@@ -590,9 +750,8 @@ func GetStreamFieldNames(qctx *logstorage.QueryContext) ([]logstorage.ValueWithH
 	return netstorageSelect.GetStreamFieldNames(qctx)
 }
 
-// GetStreamFieldValues executes the given qctx and returns stream field values for the given fieldName seen in results.
-//
-// If limit > 0, then up to limit unique stream field values are returned.
+// GetStreamFieldValues executes the query and returns stream field values for the given field.
+// Useful for discovering available values for stream field filters (e.g., all hosts, all apps).
 func GetStreamFieldValues(qctx *logstorage.QueryContext, fieldName string, limit uint64) ([]logstorage.ValueWithHits, error) {
 	if localStorage != nil {
 		return localStorage.GetStreamFieldValues(qctx, fieldName, limit)
@@ -600,9 +759,8 @@ func GetStreamFieldValues(qctx *logstorage.QueryContext, fieldName string, limit
 	return netstorageSelect.GetStreamFieldValues(qctx, fieldName, limit)
 }
 
-// GetStreams executes the given qctx and returns streams seen in query results.
-//
-// If limit > 0, then up to limit unique streams are returned.
+// GetStreams executes the query and returns stream identifiers seen in results.
+// A stream is uniquely identified by its set of stream field values (e.g., host=app1,level=error).
 func GetStreams(qctx *logstorage.QueryContext, limit uint64) ([]logstorage.ValueWithHits, error) {
 	if localStorage != nil {
 		return localStorage.GetStreams(qctx, limit)
@@ -610,9 +768,8 @@ func GetStreams(qctx *logstorage.QueryContext, limit uint64) ([]logstorage.Value
 	return netstorageSelect.GetStreams(qctx, limit)
 }
 
-// GetStreamIDs executes the given qctx and returns streamIDs seen in query results.
-//
-// If limit > 0, then up to limit unique streamIDs are returned.
+// GetStreamIDs executes the query and returns internal stream IDs seen in results.
+// Stream IDs are 128-bit identifiers used internally for stream tracking.
 func GetStreamIDs(qctx *logstorage.QueryContext, limit uint64) ([]logstorage.ValueWithHits, error) {
 	if localStorage != nil {
 		return localStorage.GetStreamIDs(qctx, limit)
@@ -620,9 +777,14 @@ func GetStreamIDs(qctx *logstorage.QueryContext, limit uint64) ([]logstorage.Val
 	return netstorageSelect.GetStreamIDs(qctx, limit)
 }
 
-// DeleteRunTask starts deletion of logs for the given filter f for the given tenantIDs.
+// DeleteRunTask starts an asynchronous deletion task for logs matching the filter.
 //
-// The taskID and timestamp are tracked in the list of tasks returned by DeleteActiveTasks().
+// The task runs in the background and deletes log entries that match the filter
+// for the specified tenant IDs. The taskID and timestamp are tracked for status
+// queries via DeleteActiveTasks().
+//
+// In cluster mode, the task is started on ALL vlstorage nodes. Each node deletes
+// its local portion of the matching data.
 func DeleteRunTask(ctx context.Context, taskID string, timestamp int64, tenantIDs []logstorage.TenantID, f *logstorage.Filter) error {
 	logger.Infof("starting deleting logs for task_id=%q, filter=%q, tenantIDs=%s", taskID, f, tenantIDs)
 
@@ -632,7 +794,8 @@ func DeleteRunTask(ctx context.Context, taskID string, timestamp int64, tenantID
 	return netstorageSelect.DeleteRunTask(ctx, taskID, timestamp, tenantIDs, f)
 }
 
-// DeleteStopTask stops delete task with the given taskID.
+// DeleteStopTask stops a running deletion task with the given taskID.
+// The task may have already deleted some data; this only prevents further deletion.
 func DeleteStopTask(ctx context.Context, taskID string) error {
 	logger.Infof("stopping delete task with task_id=%q", taskID)
 
@@ -648,7 +811,8 @@ func DeleteStopTask(ctx context.Context, taskID string) error {
 	return err
 }
 
-// DeleteActiveTasks returns a list of active deletion tasks started via DeleteRunTask().
+// DeleteActiveTasks returns a list of all active (running) deletion tasks.
+// In cluster mode, tasks from all vlstorage nodes are merged and deduplicated by taskID.
 func DeleteActiveTasks(ctx context.Context) ([]*logstorage.DeleteTask, error) {
 	if localStorage != nil {
 		return localStorage.DeleteActiveTasks(ctx)
@@ -656,7 +820,8 @@ func DeleteActiveTasks(ctx context.Context) ([]*logstorage.DeleteTask, error) {
 	return netstorageSelect.DeleteActiveTasks(ctx)
 }
 
-// GetTenantIDs returns tenantIDs from the storage by the given start and end.
+// GetTenantIDs returns all tenant IDs that have data within the specified time range.
+// This is used for multi-tenant cluster management and administrative queries.
 func GetTenantIDs(ctx context.Context, start, end int64) ([]logstorage.TenantID, error) {
 	if localStorage != nil {
 		return localStorage.GetTenantIDs(ctx, start, end)
@@ -664,6 +829,14 @@ func GetTenantIDs(ctx context.Context, start, end int64) ([]logstorage.TenantID,
 	return netstorageSelect.GetTenantIDs(ctx, start, end)
 }
 
+// writeStorageMetrics writes Prometheus-formatted metrics for the storage to w.
+// These metrics expose storage health, performance, and capacity information:
+//   - Disk usage: free/total/max space, read-only status
+//   - Merge activity: active merges, rows merged, parts created
+//   - Storage structure: rows, parts, blocks in memory and on disk
+//   - Data size: compressed and uncompressed sizes by layer (inmemory, small, big)
+//   - Time range: min/max timestamps in storage
+//   - Dropped rows: counts for rows rejected due to timestamp constraints
 func writeStorageMetrics(w io.Writer, strg *logstorage.Storage) {
 	var ss logstorage.StorageStats
 	strg.UpdateStats(&ss)
