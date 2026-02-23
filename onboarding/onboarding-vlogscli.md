@@ -37,29 +37,29 @@ This document provides a comprehensive overview of [vlogscli](./glossary.md#vlog
 
 | File | Lines | Purpose |
 |------|-------|---------|
-| [`main.go`](../app/vlogscli/main.go#L58) | 528 | Entry point, REPL loop, query execution, HTTP client, history |
-| [`json_prettifier.go`](../app/vlogscli/json_prettifier.go#L43) | 244 | Streaming JSON-to-format conversion with 4 output modes |
-| [`less_wrapper.go`](../app/vlogscli/less_wrapper.go#L20) | 122 | Terminal detection, `less` paging, signal management |
+| [`main.go`](../app/vlogscli/main.go#L101) | 719 | Entry point, REPL loop, query execution, HTTP client, history |
+| [`json_prettifier.go`](../app/vlogscli/json_prettifier.go#L35) | 409 | Streaming JSON-to-format conversion with 4 output modes |
+| [`less_wrapper.go`](../app/vlogscli/less_wrapper.go#L65) | 216 | Terminal detection, `less` paging, signal management |
 
 ---
 
 ## Complete Data Flow
 
 **Key Files**:
-- [`app/vlogscli/main.go`](../app/vlogscli/main.go#L58) - REPL and HTTP execution
-- [`app/vlogscli/json_prettifier.go`](../app/vlogscli/json_prettifier.go#L56) - Output formatting
-- [`app/vlogscli/less_wrapper.go`](../app/vlogscli/less_wrapper.go#L20) - Paging
+- [`app/vlogscli/main.go`](../app/vlogscli/main.go#L101) - REPL and HTTP execution
+- [`app/vlogscli/json_prettifier.go`](../app/vlogscli/json_prettifier.go#L113) - Output formatting
+- [`app/vlogscli/less_wrapper.go`](../app/vlogscli/less_wrapper.go#L65) - Paging
 
 ```
 User types query + ";"
     ↓
-runReadlineLoop()                        [main.go:98](../app/vlogscli/main.go#L98)
+runReadlineLoop()                        [main.go:176](../app/vlogscli/main.go#L176)
     ↓
 Multi-line accumulation (no ";" → continue)
     ↓
-executeQuery(ctx, rl, qStr, ...)         [main.go:317](../app/vlogscli/main.go#L317)
+executeQuery(ctx, rl, qStr, ...)         [main.go:451](../app/vlogscli/main.go#L451)
     ↓
-logstorage.ParseQuery(qStr)             [main.go:381](../app/vlogscli/main.go#L381)
+logstorage.ParseQuery(qStr)             [main.go:546](../app/vlogscli/main.go#L546)
     ↓
 POST http://victorialogs:9428/select/logsql/query
     Content-Type: application/x-www-form-urlencoded
@@ -67,7 +67,7 @@ POST http://victorialogs:9428/select/logsql/query
     ↓
 HTTP response (streaming [NDJSON](./glossary.md#ndjson))
     ↓
-newJSONPrettifier(resp.Body, outputMode) [json_prettifier.go:56](../app/vlogscli/json_prettifier.go#L56)
+newJSONPrettifier(resp.Body, outputMode) [json_prettifier.go:113](../app/vlogscli/json_prettifier.go#L113)
     ↓
     ┌─ Background goroutine ─────────────────────────────────┐
     │  prettifyJSONLines()                                    │
@@ -81,7 +81,7 @@ newJSONPrettifier(resp.Body, outputMode) [json_prettifier.go:56](../app/vlogscli
     │  bw.Flush()  → immediate display                       │
     └─────────────────────────────────────────────────────────┘
     ↓  (io.Pipe connects prettifier to pager)
-readWithLess(jp, disableColors, wrapLongLines)  [less_wrapper.go:20](../app/vlogscli/less_wrapper.go#L20)
+readWithLess(jp, disableColors, wrapLongLines)  [less_wrapper.go:65](../app/vlogscli/less_wrapper.go#L65)
     ↓
     ├─ [TERMINAL]
     │   less -F -X [-R] [-S]
@@ -98,13 +98,13 @@ readWithLess(jp, disableColors, wrapLongLines)  [less_wrapper.go:20](../app/vlog
 
 ### 1. Entry Point & Initialization
 
-**File**: [`app/vlogscli/main.go`](../app/vlogscli/main.go#L58)
+**File**: [`app/vlogscli/main.go`](../app/vlogscli/main.go#L101)
 
 **Key Functions**:
-- [`main()`](../app/vlogscli/main.go#L58) - Entry point
-- [`newHTTPClient()`](../app/vlogscli/main.go#L448) - Create HTTP client with auth
-- [`newAuthConfig()`](../app/vlogscli/main.go#L458) - Build authentication configuration
-- [`parseHeaders(a)`](../app/vlogscli/main.go#L500) - Parse custom HTTP headers
+- [`main()`](../app/vlogscli/main.go#L101) - Entry point
+- [`newHTTPClient()`](../app/vlogscli/main.go#L625) - Create HTTP client with auth
+- [`newAuthConfig()`](../app/vlogscli/main.go#L639) - Build authentication configuration
+- [`parseHeaders(a)`](../app/vlogscli/main.go#L687) - Parse custom HTTP headers
 
 ```go
 func main() {
@@ -138,20 +138,20 @@ func main() {
 
 The prompt is `;> ` — the semicolon reminds users that queries must end with `;` to execute.
 
-**Location**: [`app/vlogscli/main.go:58-96`](../app/vlogscli/main.go#L58)
+**Location**: [`app/vlogscli/main.go:101-161`](../app/vlogscli/main.go#L101)
 
 ---
 
 ### 2. REPL Loop
 
-**File**: [`app/vlogscli/main.go`](../app/vlogscli/main.go#L98)
+**File**: [`app/vlogscli/main.go`](../app/vlogscli/main.go#L176)
 
 **Key Functions**:
-- [`runReadlineLoop(rl, incompleteLine)`](../app/vlogscli/main.go#L98) - Main REPL loop
-- [`pushToHistory(rl, historyLines, s)`](../app/vlogscli/main.go#L232) - Save query to history
-- [`loadFromHistory(filePath)`](../app/vlogscli/main.go#L247) - Load history from disk
-- [`mustSaveToHistory(filePath, lines)`](../app/vlogscli/main.go#L272) - Persist history to disk
-- [`printCommandsHelp(w)`](../app/vlogscli/main.go#L300) - Display command reference
+- [`runReadlineLoop(rl, incompleteLine)`](../app/vlogscli/main.go#L176) - Main REPL loop
+- [`pushToHistory(rl, historyLines, s)`](../app/vlogscli/main.go#L337) - Save query to history
+- [`loadFromHistory(filePath)`](../app/vlogscli/main.go#L365) - Load history from disk
+- [`mustSaveToHistory(filePath, lines)`](../app/vlogscli/main.go#L393) - Persist history to disk
+- [`printCommandsHelp(w)`](../app/vlogscli/main.go#L427) - Display command reference
 
 #### Multi-line query handling
 
@@ -217,17 +217,17 @@ cancel()
 - **Persistence**: Saved to disk after every query via `fs.MustWriteSync()`
 - **Default path**: `vlogscli-history` in the current directory
 
-**Location**: [`app/vlogscli/main.go:98-280`](../app/vlogscli/main.go#L98)
+**Location**: [`app/vlogscli/main.go:176-427`](../app/vlogscli/main.go#L176)
 
 ---
 
 ### 3. Query Execution
 
-**File**: [`app/vlogscli/main.go`](../app/vlogscli/main.go#L317)
+**File**: [`app/vlogscli/main.go`](../app/vlogscli/main.go#L451)
 
 **Key Functions**:
-- [`executeQuery(ctx, output, qStr, outputMode, disableColors, wrapLongLines)`](../app/vlogscli/main.go#L317) - Route to query or tail
-- [`getQueryResponse(ctx, output, qStr, outputMode, qURL)`](../app/vlogscli/main.go#L378) - Send HTTP request and wrap response
+- [`executeQuery(ctx, output, qStr, outputMode, disableColors, wrapLongLines)`](../app/vlogscli/main.go#L451) - Route to query or tail
+- [`getQueryResponse(ctx, output, qStr, outputMode, qURL)`](../app/vlogscli/main.go#L541) - Send HTTP request and wrap response
 
 #### Request pipeline
 
@@ -272,22 +272,22 @@ func getQueryResponse(ctx context.Context, output io.Writer, qStr string, output
 - The `VL-Request-Duration-Seconds` response header is used when available, giving the server-side execution time instead of the round-trip time.
 - The response is an NDJSON stream (one JSON object per line), which the `jsonPrettifier` consumes incrementally.
 
-**Location**: [`app/vlogscli/main.go:317-446`](../app/vlogscli/main.go#L317)
+**Location**: [`app/vlogscli/main.go:451-621`](../app/vlogscli/main.go#L451)
 
 ---
 
 ### 4. Output Formatting (JSON Prettifier)
 
-**File**: [`app/vlogscli/json_prettifier.go`](../app/vlogscli/json_prettifier.go#L43)
+**File**: [`app/vlogscli/json_prettifier.go`](../app/vlogscli/json_prettifier.go#L35)
 
 **Key Functions**:
-- [`newJSONPrettifier(r, outputMode)`](../app/vlogscli/json_prettifier.go#L56) - Create streaming formatter
-- [`prettifyJSONLines()`](../app/vlogscli/json_prettifier.go#L87) - Background formatting loop
-- [`readNextJSONObject(d)`](../app/vlogscli/json_prettifier.go#L119) - Parse one JSON object from stream
-- [`getOutputFormatter(outputMode)`](../app/vlogscli/json_prettifier.go#L24) - Select formatter function
-- [`writeJSONObject(w, fields, isMultiline)`](../app/vlogscli/json_prettifier.go#L191) - JSON output
-- [`writeLogfmtObject(w, fields)`](../app/vlogscli/json_prettifier.go#L165) - Logfmt output
-- [`writeCompactObject(w, fields)`](../app/vlogscli/json_prettifier.go#L171) - Compact output
+- [`newJSONPrettifier(r, outputMode)`](../app/vlogscli/json_prettifier.go#L113) - Create streaming formatter
+- [`prettifyJSONLines()`](../app/vlogscli/json_prettifier.go#L163) - Background formatting loop
+- [`readNextJSONObject(d)`](../app/vlogscli/json_prettifier.go#L221) - Parse one JSON object from stream
+- [`getOutputFormatter(outputMode)`](../app/vlogscli/json_prettifier.go#L52) - Select formatter function
+- [`writeJSONObject(w, fields, isMultiline)`](../app/vlogscli/json_prettifier.go#L340) - JSON output
+- [`writeLogfmtObject(w, fields)`](../app/vlogscli/json_prettifier.go#L281) - Logfmt output
+- [`writeCompactObject(w, fields)`](../app/vlogscli/json_prettifier.go#L301) - Compact output
 
 #### Streaming architecture
 
@@ -351,20 +351,20 @@ _msg="request completed" _time=2026-02-14T10:30:00Z level=info
 
 #### JSON object parsing
 
-[`readNextJSONObject()`](../app/vlogscli/json_prettifier.go#L119) uses `json.Decoder` token-level parsing to read one JSON object at a time without unmarshaling into a `map`. It only handles string values (which is all VictoriaLogs returns in query results). This is more efficient than full `json.Unmarshal`.
+[`readNextJSONObject()`](../app/vlogscli/json_prettifier.go#L221) uses `json.Decoder` token-level parsing to read one JSON object at a time without unmarshaling into a `map`. It only handles string values (which is all VictoriaLogs returns in query results). This is more efficient than full `json.Unmarshal`.
 
-**Location**: [`app/vlogscli/json_prettifier.go:43-244`](../app/vlogscli/json_prettifier.go#L43)
+**Location**: [`app/vlogscli/json_prettifier.go:35-409`](../app/vlogscli/json_prettifier.go#L35)
 
 ---
 
 ### 5. Paging with Less
 
-**File**: [`app/vlogscli/less_wrapper.go`](../app/vlogscli/less_wrapper.go#L20)
+**File**: [`app/vlogscli/less_wrapper.go`](../app/vlogscli/less_wrapper.go#L65)
 
 **Key Functions**:
-- [`readWithLess(r, disableColors, wrapLongLines)`](../app/vlogscli/less_wrapper.go#L20) - Pipe output through `less`
-- [`isTerminal()`](../app/vlogscli/less_wrapper.go#L16) - Check if stdout/stderr are TTYs
-- [`ignoreSignals(sigs)`](../app/vlogscli/less_wrapper.go#L103) - Suppress signals in parent process
+- [`readWithLess(r, disableColors, wrapLongLines)`](../app/vlogscli/less_wrapper.go#L65) - Pipe output through `less`
+- [`isTerminal()`](../app/vlogscli/less_wrapper.go#L44) - Check if stdout/stderr are TTYs
+- [`ignoreSignals(sigs)`](../app/vlogscli/less_wrapper.go#L194) - Suppress signals in parent process
 
 #### Terminal vs non-terminal
 
@@ -410,17 +410,17 @@ p, _ := os.StartProcess(path, opts, &os.ProcAttr{
 
 A background goroutine waits for `less` to exit and closes the pipe reader, which unblocks the `io.Copy` that feeds data to `less`.
 
-**Location**: [`app/vlogscli/less_wrapper.go:16-121`](../app/vlogscli/less_wrapper.go#L16)
+**Location**: [`app/vlogscli/less_wrapper.go:44-216`](../app/vlogscli/less_wrapper.go#L44)
 
 ---
 
 ### 6. Live Tailing
 
-**File**: [`app/vlogscli/main.go`](../app/vlogscli/main.go#L337)
+**File**: [`app/vlogscli/main.go`](../app/vlogscli/main.go#L482)
 
 **Key Functions**:
-- [`tailQuery(ctx, output, qStr, outputMode)`](../app/vlogscli/main.go#L337) - Execute live tail query
-- [`getTailURL()`](../app/vlogscli/main.go#L362) - Determine tail endpoint URL
+- [`tailQuery(ctx, output, qStr, outputMode)`](../app/vlogscli/main.go#L482) - Execute live tail query
+- [`getTailURL()`](../app/vlogscli/main.go#L514) - Determine tail endpoint URL
 
 Live tailing uses VictoriaLogs' `/select/logsql/tail` endpoint, which streams new log entries as they arrive.
 
@@ -442,17 +442,17 @@ func tailQuery(ctx context.Context, output io.Writer, qStr string, outputMode ou
 - **Auto URL detection**: If `-tail.url` is not set, replaces `/query` with `/tail` in the datasource URL.
 - **Cancellation**: User presses Ctrl+C to stop tailing (via context cancellation).
 
-**Location**: [`app/vlogscli/main.go:337-376`](../app/vlogscli/main.go#L337)
+**Location**: [`app/vlogscli/main.go:482-529`](../app/vlogscli/main.go#L482)
 
 ---
 
 ### 7. Connection & Authentication
 
-**File**: [`app/vlogscli/main.go`](../app/vlogscli/main.go#L448)
+**File**: [`app/vlogscli/main.go`](../app/vlogscli/main.go#L625)
 
 **Key Functions**:
-- [`newHTTPClient()`](../app/vlogscli/main.go#L448) - Create HTTP client with auth transport
-- [`newAuthConfig()`](../app/vlogscli/main.go#L458) - Build auth config from flags
+- [`newHTTPClient()`](../app/vlogscli/main.go#L625) - Create HTTP client with auth transport
+- [`newAuthConfig()`](../app/vlogscli/main.go#L639) - Build auth config from flags
 
 vlogscli uses the same `promauth` library as vlagent and the VictoriaLogs server for authentication.
 
@@ -480,7 +480,7 @@ Supported authentication methods:
 
 Multi-tenancy is handled via `AccountID` and `ProjectID` HTTP headers, set from the `-accountID` and `-projectID` flags.
 
-**Location**: [`app/vlogscli/main.go:448-498`](../app/vlogscli/main.go#L448)
+**Location**: [`app/vlogscli/main.go:625-702`](../app/vlogscli/main.go#L625)
 
 ---
 
@@ -622,26 +622,26 @@ All file and line number references must use the following format:
 **1. Section Headers - File References**
 
 ```markdown
-**File**: [`app/vlogscli/main.go`](../app/vlogscli/main.go#L58)
+**File**: [`app/vlogscli/main.go`](../app/vlogscli/main.go#L101)
 ```
 
 **2. Function References in Key Functions Lists**
 
 ```markdown
 **Key Functions**:
-- [`runReadlineLoop(rl, incompleteLine)`](../app/vlogscli/main.go#L98) - Main REPL loop
+- [`runReadlineLoop(rl, incompleteLine)`](../app/vlogscli/main.go#L176) - Main REPL loop
 ```
 
 **3. Flow Diagram References**
 
 ```markdown
-runReadlineLoop()                        [main.go:98](../app/vlogscli/main.go#L98)
+runReadlineLoop()                        [main.go:176](../app/vlogscli/main.go#L176)
 ```
 
 **4. Location References**
 
 ```markdown
-**Location**: [`app/vlogscli/main.go:98-280`](../app/vlogscli/main.go#L98)
+**Location**: [`app/vlogscli/main.go:176-427`](../app/vlogscli/main.go#L176)
 ```
 
 #### Line Number Selection
