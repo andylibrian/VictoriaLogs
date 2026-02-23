@@ -1,3 +1,42 @@
+// Package logstorage provides the core storage engine for VictoriaLogs.
+//
+// ============== Bloom Filter Overview ==============
+//
+// Bloom filters are probabilistic data structures that allow quick checks
+// for "definitely not present" vs "possibly present". In VictoriaLogs,
+// they're used to skip reading column values when the search terms
+// definitely don't exist in that column.
+//
+// ============== How Bloom Filters Work ==============
+//
+// A bloom filter is a bit array where:
+//   - Each token is hashed multiple times (bloomFilterHashesCount = 6)
+//   - Each hash result sets one bit in the array
+//   - To check: hash the query term, verify all bits are set
+//
+// PROPERTIES:
+//   - No false negatives: if bloom says "not present", it's definitely not there
+//   - Possible false positives: if bloom says "present", might not be
+//   - Compact: 16 bits per token (bloomFilterBitsPerItem)
+//
+// ============== Usage in Queries ==============
+//
+// When querying with a text filter like `_msg:contains("error")`:
+//  1. Tokenize "error" and compute bloom hashes
+//  2. Check block's bloom filter for these hashes
+//  3. If any hash missing → skip the block entirely
+//  4. If all hashes present → read and check actual values
+//
+// This dramatically reduces I/O for selective queries.
+//
+// ============== Column-Specific Bloom Filters ==============
+//
+// Each non-dict column in a block has its own bloom filter:
+//   - _msg column: stored in message_bloom.bin
+//   - Other columns: stored in sharded bloom.binN files
+//
+// Dictionary-encoded columns don't need bloom filters because
+// all unique values are stored in the columnHeader itself.
 package logstorage
 
 import (
@@ -12,20 +51,24 @@ import (
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/slicesutil"
 )
 
-// Bloom filter sizing constants used by logstorage.
+// Bloom filter configuration constants.
 //
-// They balance false-positive probability and per-block memory footprint.
-// The filter remains exact for "definitely missing" checks and may return
-// false positives for "possibly present" checks, which are then verified
-// against actual encoded values.
+// These values were chosen to balance:
+//   - False positive rate (~1-2%)
+//   - Memory/disk overhead
+//   - Hash computation time
 
-// bloomFilterHashesCount is the number of different hashes to use for bloom filter.
+// bloomFilterHashesCount is the number of hash functions used.
+// Higher values reduce false positives but increase computation time.
+// 6 hashes gives ~1.5% false positive rate with 16 bits per item.
 const bloomFilterHashesCount = 6
 
-// bloomFilterBitsPerItem is the number of bits to use per each token.
+// bloomFilterBitsPerItem is the number of bits allocated per token.
+// 16 bits = 2 bytes per token, giving ~1.5% false positive rate with 6 hashes.
 const bloomFilterBitsPerItem = 16
 
-// bloomFilterMarshalTokens appends marshaled bloom filter for tokens to dst and returns the result.
+// bloomFilterMarshalTokens creates and marshals a bloom filter for the given tokens.
+// This is the main entry point for creating bloom filters during block writes.
 func bloomFilterMarshalTokens(dst []byte, tokens []string) []byte {
 	bf := getBloomFilter()
 	bf.mustInitTokens(tokens)
@@ -34,7 +77,8 @@ func bloomFilterMarshalTokens(dst []byte, tokens []string) []byte {
 	return dst
 }
 
-// bloomFilterMarshalHashes appends marshaled bloom filter for hashes to dst and returns the result.
+// bloomFilterMarshalHashes creates and marshals a bloom filter from pre-computed hashes.
+// Used when hashes are already available (e.g., during merge operations).
 func bloomFilterMarshalHashes(dst []byte, hashes []uint64) []byte {
 	bf := getBloomFilter()
 	bf.mustInitHashes(hashes)
@@ -43,21 +87,26 @@ func bloomFilterMarshalHashes(dst []byte, hashes []uint64) []byte {
 	return dst
 }
 
-// bloomFilter stores a bitset represented as 64-bit words.
-//
-// Each indexed bit corresponds to one of the derived token hashes.
+// bloomFilter is a bit-set based probabilistic membership filter.
+// It uses a slice of uint64 words for efficient bit operations.
 type bloomFilter struct {
+	// bits is the underlying bit array, stored as 64-bit words.
+	// Each word holds 64 bits. Bit N of the logical array is at:
+	//   word index = N / 64, bit position = N % 64
 	bits []uint64
 }
 
+// reset clears the bloom filter for reuse.
+// IMPORTANT: Must clear bits to prevent false positives from stale data.
 func (bf *bloomFilter) reset() {
-	// Clear bits before reusing the slice, since the pool can hand bf to
-	// unrelated queries and stale set bits would produce false positives.
+	// Clear bits before reusing - pooled filters may have stale data
+	// that would cause false positives if not cleared
 	clear(bf.bits)
 	bf.bits = bf.bits[:0]
 }
 
-// marshal appends marshaled bf to dst and returns the result.
+// marshal appends the bloom filter bits to dst as a byte slice.
+// Each uint64 word is written as 8 bytes in little-endian order.
 func (bf *bloomFilter) marshal(dst []byte) []byte {
 	bits := bf.bits
 	for _, word := range bits {
@@ -66,7 +115,8 @@ func (bf *bloomFilter) marshal(dst []byte) []byte {
 	return dst
 }
 
-// unmarshal unmarshals bf from src.
+// unmarshal reads a bloom filter from a byte slice.
+// The slice must have a length that's a multiple of 8.
 func (bf *bloomFilter) unmarshal(src []byte) error {
 	if len(src)%8 != 0 {
 		return fmt.Errorf("cannot unmarshal bloomFilter from src with size not multiple by 8; len(src)=%d", len(src))
@@ -82,9 +132,10 @@ func (bf *bloomFilter) unmarshal(src []byte) error {
 	return nil
 }
 
-// mustInitTokens initializes bf with the given tokens
+// mustInitTokens initializes the bloom filter with the given string tokens.
+// The filter size is calculated based on the number of tokens.
 func (bf *bloomFilter) mustInitTokens(tokens []string) {
-	// Allocate just enough words to keep bloomFilterBitsPerItem per token.
+	// Calculate size: bloomFilterBitsPerItem bits per token, rounded up to 64-bit words
 	bitsCount := len(tokens) * bloomFilterBitsPerItem
 	wordsCount := (bitsCount + 63) / 64
 	bits := slicesutil.SetLength(bf.bits, wordsCount)
@@ -92,10 +143,10 @@ func (bf *bloomFilter) mustInitTokens(tokens []string) {
 	bf.bits = bits
 }
 
-// mustInitHashes initializes bf with the given hashes
+// mustInitHashes initializes the bloom filter with pre-computed hash values.
+// Used when the hashes have already been computed elsewhere.
 func (bf *bloomFilter) mustInitHashes(hashes []uint64) {
-	// The same sizing rule as mustInitTokens(), but caller already provides
-	// precomputed token hashes.
+	// Same sizing as mustInitTokens, but caller provides hashes directly
 	bitsCount := len(hashes) * bloomFilterBitsPerItem
 	wordsCount := (bitsCount + 63) / 64
 	bits := slicesutil.SetLength(bf.bits, wordsCount)
@@ -103,45 +154,47 @@ func (bf *bloomFilter) mustInitHashes(hashes []uint64) {
 	bf.bits = bits
 }
 
-// bloomFilterAddTokens adds the given tokens to the bloom filter bits
+// bloomFilterAddTokens adds tokens to the bloom filter by hashing each one.
 func bloomFilterAddTokens(bits []uint64, tokens []string) {
 	hashesCount := len(tokens) * bloomFilterHashesCount
 	a := encoding.GetUint64s(hashesCount)
-	// Expand each logical token into bloomFilterHashesCount probe hashes.
+	// Generate bloomFilterHashesCount hashes per token
 	a.A = appendTokensHashes(a.A[:0], tokens)
 	initBloomFilter(bits, a.A)
 	encoding.PutUint64s(a)
 }
 
-// bloomFilterAddHashes adds the given hashes to the bloom filter bits.
+// bloomFilterAddHashes adds pre-computed hashes to the bloom filter.
+// Each hash is re-hashed bloomFilterHashesCount times for the bloom probe sequence.
 func bloomFilterAddHashes(bits, hashes []uint64) {
 	hashesCount := len(hashes) * bloomFilterHashesCount
 	a := encoding.GetUint64s(hashesCount)
-	// Re-hash every incoming hash in the same way as appendTokensHashes(),
-	// so caller and filter generation use identical probe positions.
+	// Re-hash each input hash to generate probe positions
 	a.A = appendHashesHashes(a.A[:0], hashes)
 	initBloomFilter(bits, a.A)
 	encoding.PutUint64s(a)
 }
 
+// initBloomFilter sets bits in the filter for each hash value.
+// Each hash maps to one bit position in the filter.
 func initBloomFilter(bits, hashes []uint64) {
 	maxBits := uint64(len(bits)) * 64
 	for _, h := range hashes {
 		idx := h % maxBits
-		i := idx / 64
-		j := idx % 64
+		i := idx / 64 // word index
+		j := idx % 64 // bit position within word
 		mask := uint64(1) << j
 		w := bits[i]
 		if (w & mask) == 0 {
-			// Avoid rewriting already-set bits to keep writes minimal.
+			// Only write if bit not already set (avoids memory write traffic)
 			bits[i] = w | mask
 		}
 	}
 }
 
-// appendTokensHashes appends hashes for the given tokens to dst and returns the result.
-//
-// The appended hashes can be then passed to bloomFilter.containsAll().
+// appendTokensHashes generates bloom filter hashes for a list of tokens.
+// Each token produces bloomFilterHashesCount hash values.
+// The returned hashes can be passed to bloomFilter.containsAll().
 func appendTokensHashes(dst []uint64, tokens []string) []uint64 {
 	dstLen := len(dst)
 	hashesCount := len(tokens) * bloomFilterHashesCount
@@ -149,11 +202,11 @@ func appendTokensHashes(dst []uint64, tokens []string) []uint64 {
 	dst = slicesutil.SetLength(dst, dstLen+hashesCount)
 	dst = dst[:dstLen]
 
+	// Use a buffer for efficient hash generation
 	var buf [8]byte
 	hp := (*uint64)(unsafe.Pointer(&buf[0]))
 	for _, token := range tokens {
-		// Seed with token hash and derive k probes by hashing incremented seeds.
-		// This avoids re-allocations and keeps probe generation deterministic.
+		// Seed with the token's hash, then generate k probes by incrementing
 		*hp = xxhash.Sum64(bytesutil.ToUnsafeBytes(token))
 		for i := 0; i < bloomFilterHashesCount; i++ {
 			h := xxhash.Sum64(buf[:])
@@ -164,12 +217,8 @@ func appendTokensHashes(dst []uint64, tokens []string) []uint64 {
 	return dst
 }
 
-// appendHashesHashes appends hashes for the given hashes to dst and returns the result.
-//
-// The hashes must be generated from tokens by tokenizeHashes().
-// See also appendTokensHashes().
-//
-// The appended hashes can be then passed to bloomFilter.containsAll().
+// appendHashesHashes generates bloom filter hashes from pre-computed hashes.
+// This is used during merge when hashes have already been computed.
 func appendHashesHashes(dst, hashes []uint64) []uint64 {
 	dstLen := len(dst)
 	hashesCount := len(hashes) * bloomFilterHashesCount
@@ -180,8 +229,7 @@ func appendHashesHashes(dst, hashes []uint64) []uint64 {
 	var buf [8]byte
 	hp := (*uint64)(unsafe.Pointer(&buf[0]))
 	for _, h := range hashes {
-		// Use the provided hash as the seed and derive k probes exactly like
-		// appendTokensHashes(), so both code paths stay compatible.
+		// Use the provided hash as seed, generate k probes
 		*hp = h
 		for i := 0; i < bloomFilterHashesCount; i++ {
 			h := xxhash.Sum64(buf[:])
@@ -192,12 +240,14 @@ func appendHashesHashes(dst, hashes []uint64) []uint64 {
 	return dst
 }
 
-// containsAll returns true if bf contains all the given tokens hashes generated by appendTokensHashes or appendHashesHashes
+// containsAll checks if all the given hashes are present in the bloom filter.
+// Returns true if all hashes are present (or might be present - false positives possible).
+// Returns false if any hash is definitely not present (no false negatives).
 func (bf *bloomFilter) containsAll(hashes []uint64) bool {
 	bits := bf.bits
 	if len(bits) == 0 {
-		// Empty bloom filter means "cannot rule out", which keeps compatibility
-		// with empty/legacy blocks.
+		// Empty bloom filter means "cannot rule out" - return true
+		// to maintain compatibility with empty/legacy blocks
 		return true
 	}
 	maxBits := uint64(len(bits)) * 64
@@ -208,10 +258,11 @@ func (bf *bloomFilter) containsAll(hashes []uint64) bool {
 		mask := uint64(1) << j
 		w := bits[i]
 		if (w & mask) == 0 {
-			// The token is missing
+			// Bit not set - the token is definitely not present
 			return false
 		}
 	}
+	// All bits set - tokens might be present (check actual values)
 	return true
 }
 

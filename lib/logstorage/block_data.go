@@ -1,3 +1,39 @@
+// Package logstorage provides the core storage engine for VictoriaLogs.
+//
+// ============== Block Data Overview ==============
+//
+// blockData is the packed, serialized form of a block used during merge operations.
+// It represents block data in a form that can be:
+//   - Written to output without re-compression (fast path)
+//   - Unmarshaled and merged with other data (when needed)
+//
+// ============== Why blockData Exists ==============
+//
+// During merge, most source blocks are already well-formed and can be
+// copied directly to output. blockData allows us to:
+//  1. Keep compressed data in its packed form
+//  2. Avoid decompression/recompression when possible
+//  3. Only unpack when merging is necessary
+//
+// ============== Fast Path vs Slow Path ==============
+//
+// FAST PATH (block can be written as-is):
+//   - Block is full (uncompressedSize >= maxUncompressedBlockSize)
+//   - No pending rows from previous blocks
+//   - No row filtering needed
+//     → Write blockData directly without unpacking
+//
+// SLOW PATH (block needs merging):
+//   - Block is small and can be combined with pending rows
+//   - Row filtering is needed
+//     → Unmarshal to rows, filter/merge, re-encode
+//
+// ============== Memory Management ==============
+//
+// blockData uses an arena for string/byte storage. This allows:
+//   - Efficient copying during merge operations
+//   - Bulk deallocation when the arena is reset
+//   - Avoidance of many small allocations
 package logstorage
 
 import (
@@ -9,42 +45,57 @@ import (
 
 // blockData contains packed data for a single block.
 //
-// The main purpose of this struct is to reduce the work needed during background merge of parts.
-// If the block is full, then the blockData can be written to the destination part
-// without the need to unpack it.
+// This is the "serialized" form of a block, ready for I/O operations.
+// Unlike the in-memory block struct, blockData keeps data in encoded form
+// to avoid unnecessary compression/decompression cycles.
+//
+// USAGE DURING MERGE:
+//   - Source parts read blocks as blockData
+//   - If fast path: blockData written directly to output
+//   - If slow path: unmarshaled to rows, merged, re-encoded
+//
+// The main benefit is avoiding decode/encode when a block is already
+// optimal (full size, no filtering needed).
 type blockData struct {
-	// streamID is id of the stream for the data
+	// streamID identifies which stream this block belongs to.
+	// All rows in a block are from the same stream.
 	streamID streamID
 
-	// uncompressedSizeBytes is the original (uncompressed) size of log entries stored in the block
+	// uncompressedSizeBytes is the original log entry size.
+	// Used to decide when to flush accumulated rows.
 	uncompressedSizeBytes uint64
 
-	// rowsCount is the number of log entries in the block
+	// rowsCount is the number of log entries in this block.
 	rowsCount uint64
 
-	// timestampsData contains the encoded timestamps data for the block
+	// timestampsData contains encoded timestamps for all rows.
+	// Encoding is delta-based for better compression.
 	timestampsData timestampsData
 
-	// columnsData contains packed per-column data
+	// columnsData contains per-column encoded data.
+	// Each entry has the column name, encoding type, and data.
 	columnsData []columnData
 
-	// constColumns contains data for const columns across the block
+	// constColumns contains fields with identical values across all rows.
+	// These are stored once in the block header rather than per-row.
 	constColumns []Field
 }
 
-// reset resets bd for subsequent reuse
+// reset clears all fields for reuse.
 func (bd *blockData) reset() {
 	bd.streamID.reset()
 	bd.uncompressedSizeBytes = 0
 	bd.rowsCount = 0
 	bd.timestampsData.reset()
 
+	// Clear column data
 	cds := bd.columnsData
 	for i := range cds {
 		cds[i].reset()
 	}
 	bd.columnsData = cds[:0]
 
+	// Clear const columns
 	ccs := bd.constColumns
 	for i := range ccs {
 		ccs[i].Reset()
@@ -52,14 +103,14 @@ func (bd *blockData) reset() {
 	bd.constColumns = ccs[:0]
 }
 
+// resizeColumnsData grows or shrinks the columnsData slice.
 func (bd *blockData) resizeColumnsData(columnsDataLen int) []columnData {
 	bd.columnsData = slicesutil.SetLength(bd.columnsData, columnsDataLen)
 	return bd.columnsData
 }
 
-// copyFrom copies src to bd.
-//
-// bd is valid until a.reset() is called.
+// copyFrom deep-copies src into bd using arena a for allocations.
+// The copied data is valid until a.reset() is called.
 func (bd *blockData) copyFrom(a *arena, src *blockData) {
 	bd.reset()
 
@@ -68,6 +119,7 @@ func (bd *blockData) copyFrom(a *arena, src *blockData) {
 	bd.rowsCount = src.rowsCount
 	bd.timestampsData.copyFrom(a, &src.timestampsData)
 
+	// Copy each column's data
 	cdsSrc := src.columnsData
 	cds := bd.resizeColumnsData(len(cdsSrc))
 	for i := range cds {
@@ -75,13 +127,14 @@ func (bd *blockData) copyFrom(a *arena, src *blockData) {
 	}
 	bd.columnsData = cds
 
+	// Copy const columns
 	bd.constColumns = appendFields(a, bd.constColumns[:0], src.constColumns)
 }
 
-// unmarshalRows appends unmarshaled from bd log entries to dst.
-//
-// The unmarshaled log entries are valid until sbu and vd are reset.
+// unmarshalRows decodes the blockData into row format for filtering/merging.
+// The decoded rows are valid until sbu and vd are reset.
 func (bd *blockData) unmarshalRows(dst *rows, sbu *stringsBlockUnmarshaler, vd *valuesDecoder) error {
+	// Use a temporary block for unmarshaling
 	b := getBlock()
 	defer putBlock(b)
 
@@ -92,7 +145,8 @@ func (bd *blockData) unmarshalRows(dst *rows, sbu *stringsBlockUnmarshaler, vd *
 	return nil
 }
 
-// mustWriteTo writes bd to sw and updates bh accordingly
+// mustWriteTo writes the blockData to the output stream and updates bh.
+// This is used when writing blocks directly without re-encoding.
 func (bd *blockData) mustWriteTo(bh *blockHeader, sw *streamWriters) {
 	bh.reset()
 
@@ -119,9 +173,9 @@ func (bd *blockData) mustWriteTo(bh *blockHeader, sw *streamWriters) {
 	putColumnsHeader(csh)
 }
 
-// mustReadFrom reads block data associated with bh from sr to bd.
-//
-// The bd is valid until a.reset() is called.
+// mustReadFrom reads block data from sr into bd using arena a for allocations.
+// This is used when reading blocks from a source part during merge.
+// The data is valid until a.reset() is called.
 func (bd *blockData) mustReadFrom(a *arena, bh *blockHeader, sr *streamReaders) {
 	bd.reset()
 
@@ -129,10 +183,10 @@ func (bd *blockData) mustReadFrom(a *arena, bh *blockHeader, sr *streamReaders) 
 	bd.uncompressedSizeBytes = bh.uncompressedSizeBytes
 	bd.rowsCount = bh.rowsCount
 
-	// Read timestamps
+	// Read timestamps from the timestamps file
 	bd.timestampsData.mustReadFrom(a, &bh.timestampsHeader, sr)
 
-	// Read columns
+	// Read columns header (contains per-column metadata)
 	if bh.columnsHeaderOffset != sr.columnsHeaderReader.bytesRead {
 		logger.Panicf("FATAL: %s: unexpected columnsHeaderOffset=%d; must equal to the number of bytes read: %d",
 			sr.columnsHeaderReader.Path(), bh.columnsHeaderOffset, sr.columnsHeaderReader.bytesRead)
@@ -145,6 +199,7 @@ func (bd *blockData) mustReadFrom(a *arena, bh *blockHeader, sr *streamReaders) 
 	bb.B = bytesutil.ResizeNoCopyMayOverallocate(bb.B, int(columnsHeaderSize))
 	sr.columnsHeaderReader.MustReadFull(bb.B)
 
+	// Unmarshal columns header
 	csh := getColumnsHeader()
 	if err := csh.unmarshalInplace(bb.B, sr.partFormatVersion); err != nil {
 		logger.Panicf("FATAL: %s: cannot unmarshal columnsHeader: %s", sr.columnsHeaderReader.Path(), err)
@@ -153,6 +208,7 @@ func (bd *blockData) mustReadFrom(a *arena, bh *blockHeader, sr *streamReaders) 
 		readColumnNamesFromColumnsHeaderIndex(bh, sr, csh)
 	}
 
+	// Read each column's data
 	chs := csh.columnHeaders
 	cds := bd.resizeColumnsData(len(chs))
 	for i := range chs {
@@ -163,6 +219,7 @@ func (bd *blockData) mustReadFrom(a *arena, bh *blockHeader, sr *streamReaders) 
 	longTermBufPool.Put(bb)
 }
 
+// readColumnNamesFromColumnsHeaderIndex reads the column name index and resolves names.
 func readColumnNamesFromColumnsHeaderIndex(bh *blockHeader, sr *streamReaders, csh *columnsHeader) {
 	bb := longTermBufPool.Get()
 	defer longTermBufPool.Put(bb)

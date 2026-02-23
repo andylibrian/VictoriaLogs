@@ -1,3 +1,42 @@
+// Package logstorage provides the core storage engine for VictoriaLogs.
+//
+// ============== Block Stream Merge Overview ==============
+//
+// Block stream merging is the core operation for combining multiple parts
+// into a single, more compact part. It's used during:
+//   - Background compaction (merging small parts into larger ones)
+//   - Forced merge operations (user-requested compaction)
+//   - Delete operations (re-writing parts without deleted rows)
+//
+// ============== Merge Algorithm ==============
+//
+// The merge uses a min-heap to efficiently combine sorted block streams:
+//
+//  1. Initialize heap with first block from each source reader
+//  2. Pop minimum block (by streamID, then timestamp)
+//  3. Either write directly (if full and no merge needed) or accumulate
+//  4. Refill heap with next block from same reader
+//  5. Repeat until all readers exhausted
+//  6. Flush any remaining accumulated rows
+//
+// ============== Optimization: Direct Block Copy ==============
+//
+// When a block from the source is already full and there's no accumulated
+// data for that stream, the block can be copied directly without
+// decompression/recompression. This is a major performance win.
+//
+// ============== Row Filtering ==============
+//
+// The merge can optionally drop rows matching a filter. This is used for:
+//   - Implementing delete operations
+//   - Rewriting parts while applying delete-task row filters
+//
+// ============== Memory Management ==============
+//
+// The merger maintains limited in-memory state:
+//   - A heap of one block per source part
+//   - Accumulated rows for the current stream (up to maxUncompressedBlockSize)
+//   - One buffered blockData for fast-path writes
 package logstorage
 
 import (
@@ -13,99 +52,127 @@ import (
 	"github.com/VictoriaMetrics/VictoriaLogs/lib/prefixfilter"
 )
 
-// block stream merge combines multiple sorted block readers into one sorted
-// output stream while optionally dropping rows by filter.
-
-// mustMergeBlockStreams merges bsrs to bsw and updates ph accordingly.
+// mustMergeBlockStreams merges multiple sorted block streams into one output stream.
 //
-// if dropFilter is non-nil, then rows matching dropFilter are dropped during the merge.
+// This is the core merge function used by all compaction operations.
+// It reads blocks from all source readers, combines them maintaining sort order,
+// and writes the merged result to the output writer.
 //
-// Finalize() is guaranteed to be called on bsw before returning from the func.
-// MustClose() is guatanteed to be called on bsrs before returning from the func.
+// MERGE STRATEGY:
+//  1. Use a min-heap ordered by (streamID, minTimestamp)
+//  2. Pop minimum block from heap
+//  3. Decide: direct copy vs. decompress + merge
+//  4. If reader has more blocks, push next block to heap
+//  5. Flush accumulated rows when block fills up
+//
+// STOPPING EARLY:
+// If stopCh is closed, the merge stops and returns without error.
+// This allows graceful shutdown of long-running merges.
+// Partial output is discarded (the destination part is not used).
+//
+// FILTERING:
+// If dropFilter is non-nil, rows matching the filter are dropped during merge.
+// This implements log deletion without random-access modifications.
 func mustMergeBlockStreams(ph *partHeader, idb *indexdb, bsw *blockStreamWriter, bsrs []*blockStreamReader, dropFilter *partitionSearchOptions, stopCh <-chan struct{}) {
 	bsm := getBlockStreamMerger()
 	bsm.mustInit(idb, bsw, bsrs, dropFilter)
+
+	// Main merge loop: process blocks in sorted order
 	for len(bsm.readersHeap) > 0 {
 		if needStop(stopCh) {
 			break
 		}
-		// readersHeap[0] always contains the smallest next block by (streamID, minTimestamp).
+
+		// readersHeap[0] always has the minimum block by (streamID, minTimestamp)
 		bsr := bsm.readersHeap[0]
 		bsm.mustWriteBlock(&bsr.blockData)
+
 		if bsr.NextBlock() {
-			// Reader still has data, so restore heap ordering from root.
+			// Reader still has data - restore heap ordering from root
 			heap.Fix(&bsm.readersHeap, 0)
 		} else {
-			// Reader is exhausted.
+			// Reader exhausted - remove from heap
 			heap.Pop(&bsm.readersHeap)
 		}
 	}
-	// Flush pending rows/buffered block after input exhaustion or stop.
+
+	// Flush any remaining accumulated rows
 	bsm.mustFlushRows()
 	putBlockStreamMerger(bsm)
 
+	// Finalize output and close input readers
 	bsw.Finalize(ph)
 	mustCloseBlockStreamReaders(bsrs)
 }
 
-// blockStreamMerger merges block streams
+// blockStreamMerger coordinates the merging of multiple block streams.
+//
+// It maintains state for:
+//   - A min-heap of source readers (for sorted merge)
+//   - Accumulated rows for the current stream (pending output)
+//   - Optional filtering to drop matching rows
+//
+// The merger processes blocks one at a time, deciding whether to:
+//   - Copy directly (if block is full and no pending data)
+//   - Merge into accumulated rows (if there's pending data)
+//   - Flush accumulated rows (when block fills or stream changes)
 type blockStreamMerger struct {
-	// idb is indexdb for the current partition.
-	//
-	// It is used for filling up streamBuf and streamIDBuf.
+	// idb is the partition's index database.
+	// Used to look up stream tags for filtering operations.
 	idb *indexdb
 
-	// bsw is the block stream writer to write the merged blocks to.
+	// bsw is the output writer for merged blocks.
 	bsw *blockStreamWriter
 
-	// bsrs contains the original readers passed to mustInit().
-	// They are used by ReadersPaths()
+	// bsrs holds the original readers for error reporting.
 	bsrs []*blockStreamReader
 
-	// dropFilter is an optional filter for dropping matching rows during the merge.
+	// dropFilter optionally filters out matching rows during merge.
+	// When non-nil, rows that match the filter are not written to output.
 	dropFilter *partitionSearchOptions
 
-	// dropFilterFields contains the list of fields needed by dropFilter.
+	// dropFilterFields caches the set of fields needed by dropFilter.
+	// This avoids loading unnecessary column data during filtering.
 	dropFilterFields prefixfilter.Filter
 
-	// readersHeap contains a heap of readers to read blocks to merge.
+	// readersHeap is a min-heap of source readers.
+	// The heap is ordered by (streamID, minTimestamp) of the current block.
 	readersHeap blockStreamReadersHeap
 
-	// streamID is the stream ID for the pending data.
+	// streamID is the stream for currently accumulated rows.
+	// When streamID changes, we flush pending rows.
 	streamID streamID
 
-	// streamBuf is _stream field value for the current stream.
-	//
-	// It is used when dropFilter is set.
+	// streamBuf caches the _stream field value for the current stream.
+	// Used by dropFilter to evaluate stream-level filters.
 	streamBuf []byte
 
-	// streamIDBuf is _stream_id field value for the current stream.
-	//
-	// It is used when dropFilter is set.
+	// streamIDBuf caches the _stream_id field value for the current stream.
+	// Used by dropFilter to evaluate stream ID filters.
 	streamIDBuf []byte
 
-	// sbu is the unmarshaler for strings in rows and rowsTmp.
+	// sbu and vd are reused for unmarshaling column data.
 	sbu *stringsBlockUnmarshaler
+	vd  *valuesDecoder
 
-	// vd is the decoder for unmarshaled strings.
-	vd *valuesDecoder
-
-	// bd is the pending blockData.
-	// bd is unpacked into rows when needed.
+	// bd is a buffered blockData for fast-path writes.
+	// When a source block is full and there's no pending data,
+	// we can write it directly without decompression.
 	bd blockData
 
-	// a holds bd data.
+	// a holds arena-allocated data for bd.
 	a arena
 
-	// rows is pending log entries.
+	// rows holds accumulated log entries for the current stream.
+	// These will be written as a new block when size limit is reached.
 	rows rows
 
-	// rowsTmp is temporary storage for log entries during merge.
+	// rowsTmp is temporary storage for merge operations.
+	// Used to merge existing rows with new rows from a source block.
 	rowsTmp rows
 
-	// uncompressedRowsSizeBytes is the current size of uncompressed rows.
-	//
-	// It is used for flushing rows to blocks when their size reaches maxUncompressedBlockSize
+	// uncompressedRowsSizeBytes tracks the size of accumulated rows.
+	// Used to flush when approaching maxUncompressedBlockSize.
 	uncompressedRowsSizeBytes uint64
 }
 

@@ -347,7 +347,7 @@ type rowsBufferShard struct {
 
 ### 5. In-Memory Parts
 
-**Key File**: [`lib/logstorage/inmemory_part.go`](../lib/logstorage/inmemory_part.go#L14)
+**Key File**: [`lib/logstorage/inmemory_part.go`](../lib/logstorage/inmemory_part.go#L61)
 
 When the `rowsBuffer` flushes, rows are converted into a searchable **in-memory part**. This is the first point where data becomes queryable.
 
@@ -355,38 +355,38 @@ When the `rowsBuffer` flushes, rows are converted into a searchable **in-memory 
 
 ```go
 type inmemoryPart struct {
-    ph partHeader                      // part metadata                     [L16]
+    ph partHeader                      // part metadata                     [L64]
 
-    columnNames        chunkedbuffer.Buffer  // column name ↔ ID mapping   [L18]
-    columnIdxs         chunkedbuffer.Buffer  // column → shard mapping      [L19]
-    metaindex          chunkedbuffer.Buffer  // compressed indexBlockHeaders [L20]
-    index              chunkedbuffer.Buffer  // compressed blockHeaders     [L21]
-    columnsHeaderIndex chunkedbuffer.Buffer  // column header references    [L22]
-    columnsHeader      chunkedbuffer.Buffer  // per-block column metadata   [L23]
-    timestamps         chunkedbuffer.Buffer  // encoded timestamps          [L24]
+    columnNames        chunkedbuffer.Buffer  // column name ↔ ID mapping   [L67]
+    columnIdxs         chunkedbuffer.Buffer  // column → shard mapping      [L68]
+    metaindex          chunkedbuffer.Buffer  // compressed indexBlockHeaders [L69]
+    index              chunkedbuffer.Buffer  // compressed blockHeaders     [L70]
+    columnsHeaderIndex chunkedbuffer.Buffer  // column header references    [L71]
+    columnsHeader      chunkedbuffer.Buffer  // per-block column metadata   [L72]
+    timestamps         chunkedbuffer.Buffer  // encoded timestamps          [L73]
 
-    messageBloomValues bloomValuesBuffer  // bloom+values for _msg column  [L26]
-    fieldBloomValues   bloomValuesBuffer  // bloom+values for other columns [L27]
+    messageBloomValues bloomValuesBuffer  // bloom+values for _msg column  [L76]
+    fieldBloomValues   bloomValuesBuffer  // bloom+values for other columns [L77]
 }
 ```
 
 #### Creating an In-Memory Part
 
-[`inmemoryPart.mustInitFromRows(lr)`](../lib/logstorage/inmemory_part.go#L71):
+[`inmemoryPart.mustInitFromRows(lr)`](../lib/logstorage/inmemory_part.go#L148):
 
-1. **Sort rows** by streamID, then by timestamp within each stream — [L74](../lib/logstorage/inmemory_part.go#L74)
-2. **Sort fields** within each row — [L75](../lib/logstorage/inmemory_part.go#L75)
-3. **Write blocks** via `blockStreamWriter`: iterate rows, flush a block when the uncompressed size reaches `maxUncompressedBlockSize` (2MB) or the streamID changes — [L85-102](../lib/logstorage/inmemory_part.go#L85)
-4. **Finalize** the writer to populate `partHeader` stats — [L105](../lib/logstorage/inmemory_part.go#L105)
+1. **Sort rows** by streamID, then by timestamp within each stream — [L153](../lib/logstorage/inmemory_part.go#L153)
+2. **Sort fields** within each row — [L154](../lib/logstorage/inmemory_part.go#L154)
+3. **Write blocks** via `blockStreamWriter`: iterate rows, flush a block when the uncompressed size reaches `maxUncompressedBlockSize` (2MB) or the streamID changes — [L169-193](../lib/logstorage/inmemory_part.go#L169)
+4. **Finalize** the writer to populate `partHeader` stats — [L197](../lib/logstorage/inmemory_part.go#L197)
 
 #### Flushing to Disk
 
-[`inmemoryPart.MustStoreToDisk(path)`](../lib/logstorage/inmemory_part.go#L110):
+[`inmemoryPart.MustStoreToDisk(path)`](../lib/logstorage/inmemory_part.go#L216):
 
-1. Create the part directory — [L111](../lib/logstorage/inmemory_part.go#L111)
-2. Write all buffers to their respective files **in parallel** using `ParallelStreamWriter` — [L123-142](../lib/logstorage/inmemory_part.go#L123)
-3. Write `metadata.json` — [L144](../lib/logstorage/inmemory_part.go#L144)
-4. Sync the directory and its parent — [L148](../lib/logstorage/inmemory_part.go#L148)
+1. Create the part directory — [L217](../lib/logstorage/inmemory_part.go#L217)
+2. Write all buffers to their respective files **in parallel** using `ParallelStreamWriter` — [L230-255](../lib/logstorage/inmemory_part.go#L230)
+3. Write `metadata.json` — [L260](../lib/logstorage/inmemory_part.go#L260)
+4. Sync the directory and its parent — [L264](../lib/logstorage/inmemory_part.go#L264)
 
 #### The Flush Pipeline
 
@@ -394,7 +394,7 @@ type inmemoryPart struct {
 
 1. Acquire concurrency semaphore — [L807](../lib/logstorage/datadb.go#L807)
 2. Create `inmemoryPart` from log rows — [L808-809](../lib/logstorage/datadb.go#L808)
-3. Open it as a searchable `part` via [`mustOpenInmemoryPart()`](../lib/logstorage/part.go#L63) — [L810](../lib/logstorage/datadb.go#L810)
+3. Open it as a searchable `part` via [`mustOpenInmemoryPart()`](../lib/logstorage/part.go#L175) — [L810](../lib/logstorage/datadb.go#L810)
 4. Release concurrency semaphore — [L811](../lib/logstorage/datadb.go#L811)
 5. Wrap in `partWrapper` with a `flushDeadline` — [L813-814](../lib/logstorage/datadb.go#L813)
 6. Add to `ddb.inmemoryParts` list and start in-memory merger — [L816-818](../lib/logstorage/datadb.go#L816)
@@ -403,7 +403,7 @@ type inmemoryPart struct {
 
 ### 6. File-Backed Parts
 
-**Key File**: [`lib/logstorage/part.go`](../lib/logstorage/part.go#L15)
+**Key File**: [`lib/logstorage/part.go`](../lib/logstorage/part.go#L56)
 
 A `part` is the searchable representation of a set of blocks, either in-memory or file-backed.
 
@@ -411,38 +411,38 @@ A `part` is the searchable representation of a set of blocks, either in-memory o
 
 ```go
 type part struct {
-    pt   *partition                       // parent partition              [L17]
-    path string                           // empty for in-memory parts     [L22]
-    ph   partHeader                       // part metadata                 [L25]
+    pt   *partition                       // parent partition              [L80]
+    path string                           // empty for in-memory parts     [L85]
+    ph   partHeader                       // part metadata                 [L90]
 
-    columnNameIDs map[string]uint64       // name → internal ID            [L29]
-    columnNames   []string                // internal ID → name            [L33]
-    columnIdxs    map[string]uint64       // name → bloom/values shard idx [L36]
+    columnNameIDs map[string]uint64       // name → internal ID            [L96]
+    columnNames   []string                // internal ID → name            [L100]
+    columnIdxs    map[string]uint64       // name → bloom/values shard idx [L107]
 
-    indexBlockHeaders []indexBlockHeader   // metaindex entries             [L39]
+    indexBlockHeaders []indexBlockHeader   // metaindex entries             [L113]
 
     // File handles for random access reads
-    indexFile              fs.MustReadAtCloser  // [L41]
-    columnsHeaderIndexFile fs.MustReadAtCloser  // [L42]
-    columnsHeaderFile      fs.MustReadAtCloser  // [L43]
-    timestampsFile         fs.MustReadAtCloser  // [L44]
+    indexFile              fs.MustReadAtCloser  // [L120]
+    columnsHeaderIndexFile fs.MustReadAtCloser  // [L121]
+    columnsHeaderFile      fs.MustReadAtCloser  // [L122]
+    timestampsFile         fs.MustReadAtCloser  // [L123]
 
-    messageBloomValues bloomValuesReaderAt      // bloom+values for _msg   [L46]
-    bloomValuesShards  []bloomValuesReaderAt    // bloom+values for others  [L49]
+    messageBloomValues bloomValuesReaderAt      // bloom+values for _msg   [L130]
+    bloomValuesShards  []bloomValuesReaderAt    // bloom+values for others  [L141]
 }
 ```
 
 #### Opening a File Part
 
-[`mustOpenFilePart(pt, path)`](../lib/logstorage/part.go#L106):
+[`mustOpenFilePart(pt, path)`](../lib/logstorage/part.go#L239):
 
-1. Read `metadata.json` into `partHeader` — [L110](../lib/logstorage/part.go#L110)
-2. Read `column_names.bin` to build name↔ID mappings — [L121-124](../lib/logstorage/part.go#L121)
-3. Read `column_idxs.bin` for bloom/values shard routing — [L126-129](../lib/logstorage/part.go#L126)
-4. Read `metaindex.bin` (ZSTD-compressed) into `indexBlockHeaders` — [L132-137](../lib/logstorage/part.go#L132)
-5. Open random-access file handles for `index.bin`, `columns_header_index.bin`, `columns_header.bin`, `timestamps.bin` — [L140-145](../lib/logstorage/part.go#L140)
-6. Open `message_bloom.bin` and `message_values.bin` for the `_msg` column — [L148-152](../lib/logstorage/part.go#L148)
-7. Open sharded `bloom.binN` and `values.binN` files for other columns — [L161-170](../lib/logstorage/part.go#L161)
+1. Read `metadata.json` into `partHeader` — [L243](../lib/logstorage/part.go#L243)
+2. Read `column_names.bin` to build name↔ID mappings — [L257-259](../lib/logstorage/part.go#L257)
+3. Read `column_idxs.bin` for bloom/values shard routing — [L265-267](../lib/logstorage/part.go#L265)
+4. Read `metaindex.bin` (ZSTD-compressed) into `indexBlockHeaders` — [L272-276](../lib/logstorage/part.go#L272)
+5. Open random-access file handles for `index.bin`, `columns_header_index.bin`, `columns_header.bin`, `timestamps.bin` — [L280-285](../lib/logstorage/part.go#L280)
+6. Open `message_bloom.bin` and `message_values.bin` for the `_msg` column — [L289-293](../lib/logstorage/part.go#L289)
+7. Open sharded `bloom.binN` and `values.binN` files for other columns — [L305-314](../lib/logstorage/part.go#L305)
 
 #### partHeader (metadata.json)
 
@@ -463,11 +463,11 @@ type partHeader struct {
 
 #### Bloom/Values Shard Routing
 
-[`part.getBloomValuesFileForColumnName(name)`](../lib/logstorage/part.go#L202):
-- Empty name (the `_msg` column) → uses `messageBloomValues` — [L203-204](../lib/logstorage/part.go#L203)
-- FormatVersion < 1 → uses legacy `oldBloomValues` files — [L207-209](../lib/logstorage/part.go#L207)
-- FormatVersion 1..2 → hash-based shard selection via xxhash — [L210-217](../lib/logstorage/part.go#L210)
-- FormatVersion >= 3 → uses `columnIdxs` map for deterministic shard assignment — [L220-224](../lib/logstorage/part.go#L220)
+[`part.getBloomValuesFileForColumnName(name)`](../lib/logstorage/part.go#L365):
+- Empty name (the `_msg` column) → uses `messageBloomValues` — [L367-368](../lib/logstorage/part.go#L367)
+- FormatVersion < 1 → uses legacy `oldBloomValues` files — [L372-373](../lib/logstorage/part.go#L372)
+- FormatVersion 1..2 → hash-based shard selection via xxhash — [L378-385](../lib/logstorage/part.go#L378)
+- FormatVersion >= 3 → uses `columnIdxs` map for deterministic shard assignment — [L391-395](../lib/logstorage/part.go#L391)
 
 ---
 
@@ -506,18 +506,18 @@ If all values in a column are identical and fit within [`maxConstColumnValueSize
 
 #### blockData (Packed Block)
 
-**Key File**: [`lib/logstorage/block_data.go`](../lib/logstorage/block_data.go#L15)
+**Key File**: [`lib/logstorage/block_data.go`](../lib/logstorage/block_data.go#L59)
 
 `blockData` is the packed, serialized form of a block used for I/O and merging:
 
 ```go
 type blockData struct {
-    streamID              streamID          // stream this block belongs to  [L17]
-    uncompressedSizeBytes uint64            // original entry size           [L20]
-    rowsCount             uint64            // number of entries             [L23]
-    timestampsData        timestampsData    // encoded timestamps            [L26]
-    columnsData           []columnData      // packed per-column data        [L29]
-    constColumns          []Field           // constant-value columns        [L32]
+    streamID              streamID          // stream this block belongs to  [L62]
+    uncompressedSizeBytes uint64            // original entry size           [L66]
+    rowsCount             uint64            // number of entries             [L69]
+    timestampsData        timestampsData    // encoded timestamps            [L73]
+    columnsData           []columnData      // packed per-column data        [L77]
+    constColumns          []Field           // constant-value columns        [L81]
 }
 ```
 
@@ -673,20 +673,20 @@ Dictionary encoding is tried **first** because it provides the highest speedup d
 
 ### 9. Bloom Filters
 
-**Key File**: [`lib/logstorage/bloomfilter.go`](../lib/logstorage/bloomfilter.go#L16)
+**Key File**: [`lib/logstorage/bloomfilter.go`](../lib/logstorage/bloomfilter.go#L64)
 
 Each non-dict column in a block has an associated bloom filter for fast token matching.
 
 #### Constants
 
-- [`bloomFilterHashesCount = 6`](../lib/logstorage/bloomfilter.go#L16) — number of hash functions
-- [`bloomFilterBitsPerItem = 16`](../lib/logstorage/bloomfilter.go#L19) — bits allocated per token
+- [`bloomFilterHashesCount = 6`](../lib/logstorage/bloomfilter.go#L64) — number of hash functions
+- [`bloomFilterBitsPerItem = 16`](../lib/logstorage/bloomfilter.go#L68) — bits allocated per token
 
 #### bloomFilter Struct
 
 ```go
 type bloomFilter struct {
-    bits []uint64  // bit array stored as 64-bit words  [L40]
+    bits []uint64  // bit array stored as 64-bit words  [L96]
 }
 ```
 
@@ -694,12 +694,12 @@ type bloomFilter struct {
 
 | Function | Line | Description |
 |----------|------|-------------|
-| [`bloomFilterMarshalTokens(dst, tokens)`](../lib/logstorage/bloomfilter.go#L22) | 22 | Creates and marshals bloom filter for string tokens |
-| [`bloomFilterMarshalHashes(dst, hashes)`](../lib/logstorage/bloomfilter.go#L31) | 31 | Creates and marshals bloom filter for pre-hashed values |
-| [`mustInitTokens(tokens)`](../lib/logstorage/bloomfilter.go#L74) | 74 | Initializes bloom filter from tokens |
-| [`containsAll(hashes)`](../lib/logstorage/bloomfilter.go#L173) | 173 | Checks if all hash values are present (used at query time) |
-| [`appendTokensHashes(dst, tokens)`](../lib/logstorage/bloomfilter.go#L126) | 126 | Generates bloom filter hashes using xxhash |
-| [`initBloomFilter(bits, hashes)`](../lib/logstorage/bloomfilter.go#L109) | 109 | Sets bits in the filter |
+| [`bloomFilterMarshalTokens(dst, tokens)`](../lib/logstorage/bloomfilter.go#L72) | 72 | Creates and marshals bloom filter for string tokens |
+| [`bloomFilterMarshalHashes(dst, hashes)`](../lib/logstorage/bloomfilter.go#L82) | 82 | Creates and marshals bloom filter for pre-hashed values |
+| [`mustInitTokens(tokens)`](../lib/logstorage/bloomfilter.go#L137) | 137 | Initializes bloom filter from tokens |
+| [`containsAll(hashes)`](../lib/logstorage/bloomfilter.go#L246) | 246 | Checks if all hash values are present (used at query time) |
+| [`appendTokensHashes(dst, tokens)`](../lib/logstorage/bloomfilter.go#L198) | 198 | Generates bloom filter hashes using xxhash |
+| [`initBloomFilter(bits, hashes)`](../lib/logstorage/bloomfilter.go#L180) | 180 | Sets bits in the filter |
 
 #### How Bloom Filters are Used
 
@@ -795,11 +795,11 @@ Storage.MustAddRows(lr *LogRows)                    [storage.go:1139]
                             └── shard.flushLocked()   [datadb.go:791]
                                 └── ddb.mustFlushLogRows(lr) [datadb.go:806]
                                     │
-                                    ├── inmemoryPart.mustInitFromRows(lr) [inmemory_part.go:71]
+                                    ├── inmemoryPart.mustInitFromRows(lr) [inmemory_part.go:148]
                                     │   ├── Sort by streamID + timestamp
                                     │   └── Write blocks via blockStreamWriter
                                     │
-                                    ├── mustOpenInmemoryPart(pt, mp) [part.go:63]
+                                    ├── mustOpenInmemoryPart(pt, mp) [part.go:175]
                                     │   (data is now searchable!)
                                     │
                                     └── Add to ddb.inmemoryParts     [datadb.go:817]
@@ -854,23 +854,23 @@ Key constants:
 
 ### Block Stream Merge Strategy
 
-**Key File**: [`lib/logstorage/block_stream_merger.go`](../lib/logstorage/block_stream_merger.go#L22)
+**Key File**: [`lib/logstorage/block_stream_merger.go`](../lib/logstorage/block_stream_merger.go#L76)
 
-[`mustMergeBlockStreams()`](../lib/logstorage/block_stream_merger.go#L22) uses a min-heap of readers ordered by (streamID, minTimestamp):
+[`mustMergeBlockStreams()`](../lib/logstorage/block_stream_merger.go#L76) uses a min-heap of readers ordered by (streamID, minTimestamp):
 
-1. Initialize heap from all source readers — [L25](../lib/logstorage/block_stream_merger.go#L25)
-2. Pop minimum block, write via `mustWriteBlock()` — [L29-30](../lib/logstorage/block_stream_merger.go#L29)
-3. If the reader has more blocks, re-heap; otherwise remove it — [L31-35](../lib/logstorage/block_stream_merger.go#L31)
-4. Finalize — [L37-41](../lib/logstorage/block_stream_merger.go#L37)
+1. Initialize heap from all source readers — [L77](../lib/logstorage/block_stream_merger.go#L77)
+2. Pop minimum block, write via `mustWriteBlock()` — [L87-88](../lib/logstorage/block_stream_merger.go#L87)
+3. If the reader has more blocks, re-heap; otherwise remove it — [L90-95](../lib/logstorage/block_stream_merger.go#L90)
+4. Finalize — [L104-105](../lib/logstorage/block_stream_merger.go#L104)
 
-[`blockStreamMerger.mustWriteBlock(bd)`](../lib/logstorage/block_stream_merger.go#L183) decides how to handle each incoming block:
+[`blockStreamMerger.mustWriteBlock(bd)`](../lib/logstorage/block_stream_merger.go#L260) decides how to handle each incoming block:
 
 | Condition | Action | Line |
 |-----------|--------|------|
-| Different streamID | Flush pending rows, start new stream | [L186-191](../lib/logstorage/block_stream_merger.go#L186) |
-| Same stream, bsm empty, block is full | **Fast path**: write directly without re-compression | [L192-194](../lib/logstorage/block_stream_merger.go#L192) |
-| Same stream, combined too big | Flush pending, then process new block | [L195-199](../lib/logstorage/block_stream_merger.go#L195) |
-| Same stream, fits | Merge rows together | [L200-204](../lib/logstorage/block_stream_merger.go#L200) |
+| Different streamID | Flush pending rows, start new stream | [L263-268](../lib/logstorage/block_stream_merger.go#L263) |
+| Same stream, bsm empty, block is full | **Fast path**: write directly without re-compression | [L269-271](../lib/logstorage/block_stream_merger.go#L269) |
+| Same stream, combined too big | Flush pending, then process new block | [L272-276](../lib/logstorage/block_stream_merger.go#L272) |
+| Same stream, fits | Merge rows together | [L277-280](../lib/logstorage/block_stream_merger.go#L277) |
 
 The **fast path** (writing full blocks without re-compression) is critical for merge performance — it avoids redundant decode/encode cycles for blocks that are already well-formed.
 
@@ -1025,7 +1025,7 @@ The `streamIDCache` ([`storage.go:198`](../lib/logstorage/storage.go#L198)) reme
 
 ### 8. Parallel File I/O for High-Latency Storage
 
-File operations (opening/closing parts, flushing to disk) use parallel I/O where possible. For example, [`mustClosePart()`](../lib/logstorage/part.go#L176) closes all file handles in parallel via `fs.MustCloseParallel()`, and [`MustStoreToDisk()`](../lib/logstorage/inmemory_part.go#L110) writes all files in parallel via `ParallelStreamWriter`. This is particularly important for NFS and Ceph storage backends.
+File operations (opening/closing parts, flushing to disk) use parallel I/O where possible. For example, [`mustClosePart()`](../lib/logstorage/part.go#L325) closes all file handles in parallel via `fs.MustCloseParallel()`, and [`MustStoreToDisk()`](../lib/logstorage/inmemory_part.go#L216) writes all files in parallel via `ParallelStreamWriter`. This is particularly important for NFS and Ceph storage backends.
 
 ---
 
