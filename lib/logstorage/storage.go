@@ -259,7 +259,14 @@ func (s *Storage) PartitionAttach(name string) error {
 // The name must have the YYYYMMDD format.
 //
 // The detached partition can be attached again via PartitionAttach() call.
+//
+// IMPORTANT: This function BLOCKS until all active readers/writers finish.
+// The blocking behavior is intentional - it guarantees the partition is in a
+// consistent state before it can be moved, backed up, or deleted externally.
+// This is essential for safe backup/restore workflows.
 func (s *Storage) PartitionDetach(name string) error {
+	// Use a closure to keep the lock scope minimal - we only need the lock
+	// while modifying the partition list, not while waiting for refs to drop.
 	ptw := func() *partitionWrapper {
 		s.partitionsLock.Lock()
 		defer s.partitionsLock.Unlock()
@@ -270,9 +277,11 @@ func (s *Storage) PartitionDetach(name string) error {
 			}
 
 			// Found the partition to detach. Detach it.
+			// Remove from the slice - this prevents new references from being taken
 			s.partitions = append(s.partitions[:i], s.partitions[i+1:]...)
 			if ptw == s.ptwHot {
 				// Force re-selection of hot partition on next write.
+				// If we don't clear this, future writes would try to use the detached partition.
 				s.ptwHot = nil
 			}
 			return ptw
@@ -286,8 +295,13 @@ func (s *Storage) PartitionDetach(name string) error {
 
 	partitionPath := ptw.pt.path
 	// Drop storage-owned ref. Remaining readers/writers keep their refs.
+	// After this call, refCount will eventually reach 0 when all active
+	// operations complete, triggering doneCh close.
 	ptw.decRef()
 
+	// BLOCKING: Wait until all concurrent readers/writers finish.
+	// This is crucial for safety - the caller can be certain the partition
+	// is quiesced before they touch its files on disk.
 	logger.Infof("waiting until the partition %q isn't accessed", name)
 	<-ptw.doneCh
 
@@ -564,6 +578,16 @@ func (s *Storage) EnableLogNewStreams(seconds int) {
 //
 // This pattern allows safe deletion of old partitions while queries may still
 // be reading from them - the deletion is deferred until all references are released.
+//
+// WHY THIS DESIGN?
+// The alternative would be to use a global lock during partition operations, but that
+// would serialize all queries and ingestion, killing performance. Reference counting
+// allows fine-grained concurrency: many readers can access different partitions
+// simultaneously, and cleanup happens automatically when safe.
+//
+// The doneCh channel is crucial for PartitionDetach - it provides a way to block
+// until the partition is truly quiesced, which is required for safe backup/restore
+// operations where we need to guarantee no concurrent access.
 type partitionWrapper struct {
 	// refCount is the number of active references to this partition.
 	// When it reaches zero, the partition may be closed and optionally deleted.
@@ -600,27 +624,38 @@ func (ptw *partitionWrapper) incRef() {
 }
 
 func (ptw *partitionWrapper) decRef() {
+	// Atomically decrement and get the new value.
+	// If n > 0, other goroutines still hold references - nothing to clean up yet.
+	// This check avoids the expensive close/delete operations in the common case
+	// where the partition is still being actively used.
 	n := ptw.refCount.Add(-1)
 	if n > 0 {
 		// Other goroutines still hold this partition.
 		return
 	}
 
+	// At this point, refCount == 0, meaning this is the last reference.
+	// We can safely perform cleanup without racing with other goroutines.
+
+	// Check if partition should be deleted from disk (set during retention cleanup or detach)
 	deletePath := ""
 	if ptw.mustDrop.Load() {
 		deletePath = ptw.pt.path
 	}
 
 	// Close pw.pt, since nobody refers to it.
+	// This flushes any pending data and releases file handles.
 	mustClosePartition(ptw.pt)
 	ptw.pt = nil
 
 	// Delete partition if needed.
+	// Done after close to ensure file handles are released first.
 	if deletePath != "" {
 		mustDeletePartition(deletePath)
 	}
 
 	// signal that the ptw is no longer accessed.
+	// This unblocks anyone waiting on <-ptw.doneCh (e.g., PartitionDetach)
 	close(ptw.doneCh)
 }
 
@@ -813,6 +848,8 @@ func (s *Storage) runSnapshotsMaxAgeWatcher() {
 }
 
 func (s *Storage) watchRetention() {
+	// Use jittered interval to avoid synchronized load spikes across multiple
+	// VictoriaLogs instances checking retention at the same time
 	d := timeutil.AddJitterToDuration(time.Hour)
 	ticker := time.NewTicker(d)
 	defer ticker.Stop()
@@ -825,18 +862,27 @@ func (s *Storage) watchRetention() {
 
 		// Delete outdated partitions.
 		// s.partitions are sorted by day, so the partitions, which can become outdated, are located at the beginning of the list
+		// WHY sorted by day? This allows O(k) deletion of expired partitions where k = number expired.
+		// Without sorting, we'd need to scan the entire list each time.
 		ptws := s.partitions
 		for i, ptw := range ptws {
 			if ptw.day < minAllowedDay {
+				// This partition is expired - keep scanning for more expired ones
 				continue
 			}
 
-			// ptws are sorted by time, so just drop all the partitions until i.
+			// Found the first non-expired partition.
+			// All partitions before index i are expired and should be deleted.
 			ptwsToDelete = ptws[:i]
 			s.partitions = ptws[i:]
+
+			// Track deleted days to prevent re-creation.
+			// This guards against late-arriving data re-creating a partition
+			// that was already deleted due to retention.
 			s.updateDeletedPartitionsLocked(ptwsToDelete)
 
 			// Remove reference to deleted partitions from s.ptwHot
+			// If the hot partition was deleted, force re-selection on next write
 			if slices.Contains(ptwsToDelete, s.ptwHot) {
 				s.ptwHot = nil
 			}
@@ -846,11 +892,16 @@ func (s *Storage) watchRetention() {
 
 		s.partitionsLock.Unlock()
 
+		// Delete partitions outside the lock to avoid blocking other operations.
+		// The partitions have already been removed from s.partitions, so new
+		// operations won't try to access them.
 		for i, ptw := range ptwsToDelete {
 			logger.Infof("the partition %s is scheduled to be deleted because it is outside the -retentionPeriod=%dd", ptw.pt.path, durationToDays(s.retention))
+			// Mark for deletion - actual deletion happens when refCount reaches 0
 			ptw.mustDrop.Store(true)
+			// Decrement our reference - this triggers cleanup when safe
 			ptw.decRef()
-			ptwsToDelete[i] = nil
+			ptwsToDelete[i] = nil // help GC
 		}
 
 		select {
@@ -1197,6 +1248,12 @@ func (s *Storage) MustForceMerge(partitionPrefix string) {
 //   - Too old: Before (now - retention) OR before (now - maxBackfillAge)
 //   - Too new: After (now + futureRetention)
 //
+// WHY DROP INSTEAD OF ERROR? The ingestion API is designed for high throughput.
+// Returning an error would require the client to handle partial failures and retry,
+// which is complex and slow. Dropping with a logged warning is simpler and allows
+// the rest of the batch to succeed. Clients that need guaranteed delivery should
+// implement their own validation before calling MustAddRows.
+//
 // It is recommended checking whether the s is in read-only mode by calling IsReadOnly()
 // before calling MustAddRows.
 //
@@ -1205,6 +1262,10 @@ func (s *Storage) MustForceMerge(partitionPrefix string) {
 func (s *Storage) MustAddRows(lr *LogRows) {
 	// ==================== FAST PATH ====================
 	// Try adding all rows to the hot partition (most common case for real-time ingestion)
+	//
+	// WHY THIS MATTERS: In a typical real-time logging scenario, 99%+ of logs have
+	// timestamps within the last few seconds. The fast path handles this case in O(1)
+	// without any timestamp parsing or partition lookup.
 
 	s.partitionsLock.Lock()
 	ptwHot := s.ptwHot
@@ -1226,6 +1287,11 @@ func (s *Storage) MustAddRows(lr *LogRows) {
 
 	// ==================== SLOW PATH ====================
 	// Rows cannot be added to the hot partition, so split rows among available partitions
+	//
+	// This happens when:
+	// - Batch contains rows from multiple days (e.g., during backfill)
+	// - Hot partition doesn't exist yet (first write after startup)
+	// - Hot partition was just detached/deleted
 
 	now := time.Now().UnixNano()
 	minAllowedDay := s.getMinAllowedDay(now)
@@ -1233,6 +1299,8 @@ func (s *Storage) MustAddRows(lr *LogRows) {
 	minAllowedTimestamp := now - s.maxBackfillAge.Nanoseconds()
 
 	// Group rows by day
+	// WHY group by day? Each partition represents one day, so we need to route
+	// each row to its correct partition. Grouping minimizes partition lock/unlock cycles.
 	m := make(map[int64]*LogRows)
 	for i, ts := range lr.timestamps {
 		day := ts / nsecsPerDay
@@ -1262,6 +1330,9 @@ func (s *Storage) MustAddRows(lr *LogRows) {
 		}
 
 		// Validate timestamp against backfill limit (if configured)
+		// WHY separate from retention? -maxBackfillAge is meant to prevent accidental
+		// backfill of very old data, while -retentionPeriod is about data lifecycle.
+		// A cluster might have 30d retention but want to reject logs older than 7d.
 		if ts < minAllowedTimestamp {
 			line := MarshalFieldsToJSON(nil, lr.rows[i])
 			tsf := TimeFormatter(ts)
@@ -1290,6 +1361,10 @@ func (s *Storage) MustAddRows(lr *LogRows) {
 			ptw.decRef()
 		} else {
 			// Partition couldn't be created or is detached - drop the rows
+			// WHY nil return? This happens when:
+			// - Day is in deletedPartitions (retention already deleted it)
+			// - Directory exists but isn't attached (was manually placed or detached)
+			// In both cases, we shouldn't silently create data that won't be queryable.
 			line := MarshalFieldsToJSON(nil, lrPart.rows[0])
 			inactivePartitionLogger.Warnf("skipping log entry because it cannot be saved into inactive per-day partition; "+
 				"see https://docs.victoriametrics.com/victorialogs/#partitions-lifecycle; log entry %s", line)

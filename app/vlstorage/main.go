@@ -360,6 +360,23 @@ func Stop() {
 }
 
 // RequestHandler is a storage request handler.
+//
+// This is the central dispatcher for all internal storage operations. Each endpoint
+// is handled by a dedicated process* function that:
+//   - Checks authentication (if an authKey is configured)
+//   - Validates the request parameters
+//   - Calls the appropriate Storage method
+//   - Returns the response
+//
+// IMPORTANT: Partition management endpoints only work in local storage mode.
+// In cluster mode (with -storageNode), these endpoints return false and the request
+// is passed to the next handler in the chain. This is because individual vlstorage
+// nodes manage their own partitions independently.
+//
+// WHY THIS DESIGN? Having all partition management in one place makes it easy to:
+// - Apply consistent authentication
+// - Log all management operations
+// - Understand the full API surface at a glance
 func RequestHandler(w http.ResponseWriter, r *http.Request) bool {
 	path := r.URL.Path
 	switch path {
@@ -413,6 +430,9 @@ func processLogNewStreams(w http.ResponseWriter, r *http.Request) bool {
 func processForceMerge(w http.ResponseWriter, r *http.Request) bool {
 	if localStorage == nil {
 		// Force merge isn't supported by non-local storage
+		// In cluster mode, each vlstorage node manages its own merges independently.
+		// Forcing a merge from a frontend would require broadcasting to all nodes,
+		// which isn't currently implemented.
 		return false
 	}
 
@@ -421,6 +441,10 @@ func processForceMerge(w http.ResponseWriter, r *http.Request) bool {
 	}
 
 	// Run force merge in background
+	// WHY BACKGROUND? Force merge can take minutes to hours for large partitions.
+	// Running it synchronously would tie up an HTTP connection and risk timeouts.
+	// The goroutine pattern allows the caller to get an immediate 200 OK and
+	// monitor progress through logs or metrics.
 	partitionPrefix := r.FormValue("partition_prefix")
 	go func() {
 		activeForceMerges.Inc()
@@ -520,17 +544,25 @@ func processPartitionSnapshotCreate(w http.ResponseWriter, r *http.Request) bool
 	partitionPrefix := r.FormValue("partition_prefix")
 	if partitionPrefix == "" {
 		// Fall back to the deprecated argument.
+		// WHY BACKWARD COMPAT? The API originally used "name" but was changed to
+		// "partition_prefix" to better reflect its pattern-matching behavior.
+		// Supporting both ensures existing scripts continue to work.
 		partitionPrefix = r.FormValue("name")
 	}
 
 	snapshotPaths := localStorage.PartitionSnapshotMustCreate(partitionPrefix)
 	if snapshotPaths == nil {
 		// This is needed in order to return `[]` instead of `null` to the client.
+		// WHY? JSON conventions differ on whether nil slice should be null or [].
+		// Returning [] is more consistent and easier for clients to handle.
 		snapshotPaths = []string{}
 	}
 
 	// Verify whether the client already closed the connection.
 	// In this case it is better to drop the created snapshot, since the client isn't interested in it.
+	// WHY THIS MATTERS: Snapshot creation is expensive (flushes all in-memory data, creates hard links).
+	// If the client disconnected (e.g., due to timeout or cancellation), the snapshot is orphaned -
+	// it exists on disk but no one has its path. Cleaning up immediately prevents disk space waste.
 	if err := r.Context().Err(); err != nil {
 		for _, snapshotPath := range snapshotPaths {
 			logger.Infof("deleting already created snapshot at %s because the client canceled the request", snapshotPath)

@@ -432,14 +432,24 @@ func (ddb *datadb) mustFlushInmemoryPartsToFiles(isFinal bool) {
 
 // mustMergePartsToFiles merges the given in-memory parts to file-based parts.
 // Uses parallel merging for efficiency.
+//
+// WHY PARALLEL? When many in-memory parts need flushing (e.g., after high-throughput
+// ingestion), processing them one at a time would be slow. Parallel merging uses
+// all available CPUs to speed up the flush process.
 func (ddb *datadb) mustMergePartsToFiles(pws []*partWrapper) {
 	wg := getWaitGroup()
 	for len(pws) > 0 {
+		// Select optimal set of parts to merge together
+		// This uses the same algorithm as background merges (see appendPartsToMerge)
 		pwsToMerge, pwsRemaining := getPartsForOptimalMerge(pws)
+
+		// Acquire a slot in the concurrency limiter
+		// This blocks if all CPU slots are in use, preventing resource exhaustion
 		inmemoryPartsConcurrencyCh <- struct{}{}
 
 		wg.Go(func() {
 			ddb.mustMergeParts(pwsToMerge, true)
+			// Release the concurrency slot when done
 			<-inmemoryPartsConcurrencyCh
 		})
 
@@ -621,6 +631,13 @@ func (ddb *datadb) mustMergeParts(pws []*partWrapper, isFinal bool) {
 //  7. Atomically swap old parts with new part
 //
 // Returns false if merge was interrupted or couldn't complete.
+//
+// WHY ATOMIC SWAP? During a merge, we're reading from old parts and writing to a new part.
+// If we crash mid-merge, we need to ensure either:
+// - The old parts are still valid (merge didn't complete)
+// - The new part is complete and old parts can be deleted
+// The atomic swap (under partsLock) guarantees we never have a state where both
+// old and new are partially visible.
 func (ddb *datadb) mustMergePartsInternal(pws []*partWrapper, isFinal bool, dropFilter *partitionSearchOptions, stopCh <-chan struct{}) bool {
 	if len(pws) == 0 {
 		// Nothing to merge.
@@ -1525,6 +1542,32 @@ func mustRemoveUnusedDirs(path string, partNames []string) {
 
 // appendPartsToMerge finds optimal parts to merge from src,
 // appends them to dst and returns the result.
+//
+// THE OPTIMAL MERGE PROBLEM:
+// We want to minimize write amplification while reducing part count.
+// Write amplification occurs when the same data is rewritten multiple times.
+// If we always merge 2 parts of size 1MB into a 2MB part, then merge that with
+// another 2MB part to get 4MB, etc., data gets rewritten many times.
+//
+// THE SOLUTION (minMergeMultiplier):
+// We only merge parts if the output will be at least minMergeMultiplier (1.7x)
+// larger than the largest input. This ensures each piece of data is rewritten
+// at most O(log_{1.7}(total_size)) times.
+//
+// THE ALGORITHM:
+//  1. Filter out parts that are too large to fit in the output size limit
+//  2. Sort remaining parts by size (smallest first)
+//  3. Exhaustively search for the combination of 2-15 consecutive parts
+//     that gives the best merge ratio (output_size / largest_input_size)
+//  4. Only merge if the ratio exceeds minMergeMultiplier
+//
+// WHY CONSECUTIVE? After sorting by size, consecutive parts have similar sizes.
+// Merging similarly-sized parts is more efficient than merging a tiny part with
+// a huge one (which would rewrite the huge part for little benefit).
+//
+// WHY EXHAUSTIVE SEARCH? With typical part counts (< 100), the O(N^2) search
+// is fast enough, and it finds the globally optimal merge. This is better than
+// a greedy algorithm that might make locally optimal but globally suboptimal choices.
 func appendPartsToMerge(dst, src []*partWrapper, maxOutBytes uint64) []*partWrapper {
 	if len(src) < 2 {
 		// There is no need in merging zero or one part :)

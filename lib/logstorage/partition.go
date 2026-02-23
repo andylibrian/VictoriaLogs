@@ -349,11 +349,15 @@ func (pt *partition) mustAddRows(lr *LogRows) {
 
 	// pendingRows tracks indices into lr for rows that MIGHT need stream registration.
 	// We'll refine this list through multiple cache checks.
+	// WHY track indices instead of streamIDs directly? Because we need to access
+	// the full row data (streamTagsCanonicals, rows) for registration later.
 	var pendingRows []int
 	streamIDs := lr.streamIDs
 
 	// First pass: identify rows with streams not in the in-memory cache.
 	// This is fast (O(1) cache lookup) and filters out most rows.
+	// WHY two passes? The first pass is cheap (in-memory cache check) and eliminates
+	// most rows. Only rows that pass this check go through the expensive indexdb lookup.
 	for i := range lr.timestamps {
 		streamID := &streamIDs[i]
 		if pt.hasStreamIDInCache(streamID) {
@@ -362,6 +366,8 @@ func (pt *partition) mustAddRows(lr *LogRows) {
 		}
 		// Batch consecutive rows with the same streamID
 		// (they'll be handled together in the sorted pass)
+		// WHY only add first occurrence? After sorting, we'll process unique streamIDs.
+		// Adding duplicates here would just mean more work to deduplicate later.
 		if len(pendingRows) == 0 || !streamIDs[pendingRows[len(pendingRows)-1]].equal(streamID) {
 			pendingRows = append(pendingRows, i)
 		}
@@ -374,6 +380,9 @@ func (pt *partition) mustAddRows(lr *LogRows) {
 
 		// Sort by streamID to group lookups for the same stream together.
 		// This is more efficient than random access patterns.
+		// WHY sort? When we query indexdb for stream existence, consecutive queries
+		// for the same streamID are wasteful. Sorting ensures we only check each unique
+		// streamID once, and also improves cache locality for the indexdb lookups.
 		sort.Slice(pendingRows, func(i, j int) bool {
 			return streamIDs[pendingRows[i]].less(&streamIDs[pendingRows[j]])
 		})
