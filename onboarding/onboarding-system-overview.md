@@ -48,16 +48,16 @@ The top-level glue code lives in the `app/` tree, while durable data structures 
 
 | Component | Responsibility | Key Entry Points |
 |----------|----------------|------------------|
-| `app/victoria-logs` | Single-node binary: wires insert, select, storage in one process | [`main()`](../app/victoria-logs/main.go#L31), [`requestHandler`](../app/victoria-logs/main.go#L76) |
-| `app/vlinsert` | Public HTTP ingestion router (`/insert/*`) and syslog listener bootstrap | [`RequestHandler`](../app/vlinsert/main.go#L38), [`insertHandler`](../app/vlinsert/main.go#L62), [`Init`](../app/vlinsert/main.go#L28) |
-| `app/vlselect` | Public query API, tailing, concurrency/timeout controls, VMUI | [`RequestHandler`](../app/vlselect/main.go#L90), [`selectHandler`](../app/vlselect/main.go#L138), [`processSelectRequest`](../app/vlselect/main.go#L286) |
-| `app/vlstorage` | Storage facade: local disk mode or network fanout mode | [`Init`](../app/vlstorage/main.go#L109), [`RunQuery`](../app/vlstorage/main.go#L554), [`Storage.MustAddRows`](../app/vlstorage/main.go#L543) |
-| `app/vlstorage/netinsert` | Sends batched insert blocks to storage nodes | [`ProtocolVersion`](../app/vlstorage/netinsert/netinsert.go#L33), [`Storage.AddRow`](../app/vlstorage/netinsert/netinsert.go#L375) |
-| `app/vlstorage/netselect` | Fans out queries to storage nodes and merges responses | [`QueryProtocolVersion`](../app/vlstorage/netselect/netselect.go#L63), [`Storage.RunQuery`](../app/vlstorage/netselect/netselect.go#L385) |
-| `app/vlinsert/internalinsert` | Handler for `/internal/insert` on storage nodes | [`RequestHandler`](../app/vlinsert/internalinsert/internalinsert.go#L24) |
-| `app/vlselect/internalselect` | Handlers for `/internal/select/*` and `/internal/delete/*` on storage nodes | [`RequestHandler`](../app/vlselect/internalselect/internalselect.go#L31), [`requestHandlers` map](../app/vlselect/internalselect/internalselect.go#L79) |
-| `app/vlinsert/insertutil` | Shared ingestion params, normalization, buffering, storage interface | [`GetCommonParams`](../app/vlinsert/insertutil/common_params.go#L50), [`LogRowsStorage`](../app/vlinsert/insertutil/common_params.go#L175), [`SetLogRowsStorage`](../app/vlinsert/insertutil/common_params.go#L188) |
-| `lib/logstorage` | Local storage engine + query engine | [`Storage`](../lib/logstorage/storage.go#L115), [`MustOpenStorage`](../lib/logstorage/storage.go#L618), [`Storage.MustAddRows`](../lib/logstorage/storage.go#L1139), [`Storage.RunQuery`](../lib/logstorage/storage_search.go#L208) |
+| `app/victoria-logs` | Single-node binary: wires insert, select, storage in one process | [`main()`](../app/victoria-logs/main.go#L68), [`requestHandler`](../app/victoria-logs/main.go#L141) |
+| `app/vlinsert` | Public HTTP ingestion router (`/insert/*`) and syslog listener bootstrap | [`RequestHandler`](../app/vlinsert/main.go#L91), [`insertHandler`](../app/vlinsert/main.go#L119), [`Init`](../app/vlinsert/main.go#L76) |
+| `app/vlselect` | Public query API, tailing, concurrency/timeout controls, VMUI | [`RequestHandler`](../app/vlselect/main.go#L189), [`selectHandler`](../app/vlselect/main.go#L254), [`processSelectRequest`](../app/vlselect/main.go#L428) |
+| `app/vlstorage` | Storage facade: local disk mode or network fanout mode | [`Init`](../app/vlstorage/main.go#L179), [`RunQuery`](../app/vlstorage/main.go#L741), [`Storage.MustAddRows`](../app/vlstorage/main.go#L718) |
+| `app/vlstorage/netinsert` | Sends batched insert blocks to storage nodes | [`ProtocolVersion`](../app/vlstorage/netinsert/netinsert.go#L74), [`Storage.AddRow`](../app/vlstorage/netinsert/netinsert.go#L481) |
+| `app/vlstorage/netselect` | Fans out queries to storage nodes and merges responses | [`QueryProtocolVersion`](../app/vlstorage/netselect/netselect.go#L94), [`Storage.RunQuery`](../app/vlstorage/netselect/netselect.go#L442) |
+| `app/vlinsert/internalinsert` | Handler for `/internal/insert` on storage nodes | [`RequestHandler`](../app/vlinsert/internalinsert/internalinsert.go#L70) |
+| `app/vlselect/internalselect` | Handlers for `/internal/select/*` and `/internal/delete/*` on storage nodes | [`RequestHandler`](../app/vlselect/internalselect/internalselect.go#L84), [`requestHandlers` map](../app/vlselect/internalselect/internalselect.go#L136) |
+| `app/vlinsert/insertutil` | Shared ingestion params, normalization, buffering, storage interface | [`GetCommonParams`](../app/vlinsert/insertutil/common_params.go#L121), [`LogRowsStorage`](../app/vlinsert/insertutil/common_params.go#L254), [`SetLogRowsStorage`](../app/vlinsert/insertutil/common_params.go#L272) |
+| `lib/logstorage` | Local storage engine + query engine | [`Storage`](../lib/logstorage/storage.go#L115), [`MustOpenStorage`](../lib/logstorage/storage.go#L691), [`Storage.MustAddRows`](../lib/logstorage/storage.go#L1262), [`Storage.RunQuery`](../lib/logstorage/storage_search.go#L274) |
 
 ---
 
@@ -77,10 +77,10 @@ HTTP
 
 Boot wiring:
 
-- [`vlstorage.Init()`](../app/victoria-logs/main.go#L46)
-- [`vlselect.Init()`](../app/victoria-logs/main.go#L47)
-- [`insertutil.SetLogRowsStorage(&vlstorage.Storage{})`](../app/victoria-logs/main.go#L49)
-- [`vlinsert.Init()`](../app/victoria-logs/main.go#L50)
+- [`vlstorage.Init()`](../app/victoria-logs/main.go#L86)
+- [`vlselect.Init()`](../app/victoria-logs/main.go#L88)
+- [`insertutil.SetLogRowsStorage(&vlstorage.Storage{})`](../app/victoria-logs/main.go#L93)
+- [`vlinsert.Init()`](../app/victoria-logs/main.go#L95)
 
 ### Cluster
 
@@ -88,16 +88,16 @@ Frontend nodes:
 
 - `vlinsert` receives `/insert/*` and forwards via `netinsert` to `/internal/insert` (unless disabled by `-insert.disable`)
 - `vlselect` receives `/select/*` and forwards via `netselect` to `/internal/select/*` (unless disabled by `-select.disable`)
-- Syslog ingestion is listener-based (`-syslog.listenAddr.*`) and initialized by [`vlinsert.Init`](../app/vlinsert/main.go#L28), not routed via `/insert/*`.
+- Syslog ingestion is listener-based (`-syslog.listenAddr.*`) and initialized by [`vlinsert.Init`](../app/vlinsert/main.go#L76), not routed via `/insert/*`.
 
 Storage nodes:
 
-- Serve `/internal/insert` via [`internalinsert.RequestHandler`](../app/vlinsert/internalinsert/internalinsert.go#L24) (disabled by `-internalinsert.disable` or `-insert.disable`)
-- Serve `/internal/select/*` via [`internalselect.RequestHandler`](../app/vlselect/internalselect/internalselect.go#L31) (disabled by `-internalselect.disable` or `-select.disable`)
-- Serve `/internal/delete/*` via [`internalselect.RequestHandler`](../app/vlselect/internalselect/internalselect.go#L31) only when `-internaldelete.enable` is set
+- Serve `/internal/insert` via [`internalinsert.RequestHandler`](../app/vlinsert/internalinsert/internalinsert.go#L70) (disabled by `-internalinsert.disable` or `-insert.disable`)
+- Serve `/internal/select/*` via [`internalselect.RequestHandler`](../app/vlselect/internalselect/internalselect.go#L84) (disabled by `-internalselect.disable` or `-select.disable`)
+- Serve `/internal/delete/*` via [`internalselect.RequestHandler`](../app/vlselect/internalselect/internalselect.go#L84) only when `-internaldelete.enable` is set
 - Execute against local `lib/logstorage`
 
-`vlstorage` picks mode by `-storageNode` presence in [`Init`](../app/vlstorage/main.go#L109) and branches to local/network setup in [`initLocalStorage`](../app/vlstorage/main.go#L117) and [`initNetworkStorage`](../app/vlstorage/main.go#L164).
+`vlstorage` picks mode by `-storageNode` presence in [`Init`](../app/vlstorage/main.go#L179) and branches to local/network setup in [`initLocalStorage`](../app/vlstorage/main.go#L202) and [`initNetworkStorage`](../app/vlstorage/main.go#L266).
 
 ---
 
@@ -105,15 +105,15 @@ Storage nodes:
 
 In `victoria-logs`:
 
-1. Parse flags and init logging/build info in [`main`](../app/victoria-logs/main.go#L31).
-2. Initialize storage/select/insert subsystems in order ([`main.go#L46-L50`](../app/victoria-logs/main.go#L46)).
-3. Start shared HTTP server ([`httpserver.Serve`](../app/victoria-logs/main.go#L52)).
-4. On shutdown signal, stop HTTP server first, then stop insert/select/storage ([`main.go#L62-L71`](../app/victoria-logs/main.go#L62)).
+1. Parse flags and init logging/build info in [`main`](../app/victoria-logs/main.go#L68).
+2. Initialize storage/select/insert subsystems in order ([`main.go#L86-L95`](../app/victoria-logs/main.go#L86)).
+3. Start shared HTTP server ([`httpserver.Serve`](../app/victoria-logs/main.go#L99)).
+4. On shutdown signal, stop HTTP server first, then stop insert/select/storage ([`main.go#L110-L123`](../app/victoria-logs/main.go#L110)).
 
 In `vlstorage` stop path:
 
-- Local mode closes storage via [`localStorage.MustClose()`](../app/vlstorage/main.go#L231), which stops background workers and closes partitions in [`Storage.MustClose`](../lib/logstorage/storage.go#L1075).
-- Network mode stops remote insert/select clients via [`netstorageInsert.MustStop()`](../app/vlstorage/main.go#L234) and [`netstorageSelect.MustStop()`](../app/vlstorage/main.go#L237).
+- Local mode closes storage via [`localStorage.MustClose()`](../app/vlstorage/main.go#L351), which stops background workers and closes partitions in [`Storage.MustClose`](../lib/logstorage/storage.go#L1170).
+- Network mode stops remote insert/select clients via [`netstorageInsert.MustStop()`](../app/vlstorage/main.go#L354) and [`netstorageSelect.MustStop()`](../app/vlstorage/main.go#L357).
 
 ---
 
@@ -121,27 +121,27 @@ In `vlstorage` stop path:
 
 Top-level router in single-node:
 
-- [`victoria-logs.requestHandler`](../app/victoria-logs/main.go#L76) delegates in order:
-1. [`vlinsert.RequestHandler`](../app/victoria-logs/main.go#L93)
-2. [`vlselect.RequestHandler`](../app/victoria-logs/main.go#L96)
-3. [`vlstorage.RequestHandler`](../app/victoria-logs/main.go#L99)
+- [`victoria-logs.requestHandler`](../app/victoria-logs/main.go#L141) delegates in order:
+1. [`vlinsert.RequestHandler`](../app/victoria-logs/main.go#L158)
+2. [`vlselect.RequestHandler`](../app/victoria-logs/main.go#L161)
+3. [`vlstorage.RequestHandler`](../app/victoria-logs/main.go#L164)
 
 Public ingestion routing:
 
-- [`vlinsert.RequestHandler`](../app/vlinsert/main.go#L38) handles `/insert/*` and `/internal/insert`.
-- Syslog listeners are started separately in [`vlinsert.Init`](../app/vlinsert/main.go#L28) via [`syslog.MustInit`](../app/vlinsert/main.go#L29).
-- Protocol-specific dispatch is in [`insertHandler`](../app/vlinsert/main.go#L62).
+- [`vlinsert.RequestHandler`](../app/vlinsert/main.go#L91) handles `/insert/*` and `/internal/insert`.
+- Syslog listeners are started separately in [`vlinsert.Init`](../app/vlinsert/main.go#L76) via [`syslog.MustInit`](../app/vlinsert/main.go#L77).
+- Protocol-specific dispatch is in [`insertHandler`](../app/vlinsert/main.go#L119).
 
 Public query routing:
 
-- [`vlselect.RequestHandler`](../app/vlselect/main.go#L90) handles `/select/*`, `/delete/*`, `/internal/select/*`, `/internal/delete/*`.
-- `/internal/delete/*` requires [`-internaldelete.enable`](../app/vlselect/main.go#L36); otherwise requests are rejected by [`vlselect.RequestHandler`](../app/vlselect/main.go#L112).
-- `/select/buildinfo`, `/select/vmui*`, and `/select/logsql/tail` are handled directly in [`selectHandler`](../app/vlselect/main.go#L138).
-- Most `/select/logsql/*` and `/select/tenant_ids` endpoint dispatch is in [`processSelectRequest`](../app/vlselect/main.go#L286).
+- [`vlselect.RequestHandler`](../app/vlselect/main.go#L189) handles `/select/*`, `/delete/*`, `/internal/select/*`, `/internal/delete/*`.
+- `/internal/delete/*` requires [`-internaldelete.enable`](../app/vlselect/main.go#L91); otherwise requests are rejected by [`vlselect.RequestHandler`](../app/vlselect/main.go#L212).
+- `/select/buildinfo`, `/select/vmui*`, and `/select/logsql/tail` are handled directly in [`selectHandler`](../app/vlselect/main.go#L254).
+- Most `/select/logsql/*` and `/select/tenant_ids` endpoint dispatch is in [`processSelectRequest`](../app/vlselect/main.go#L428).
 
 Storage internal ops routing:
 
-- [`vlstorage.RequestHandler`](../app/vlstorage/main.go#L243) handles maintenance endpoints (`/internal/force_merge`, `/internal/partition/*`, etc.).
+- [`vlstorage.RequestHandler`](../app/vlstorage/main.go#L380) handles maintenance endpoints (`/internal/force_merge`, `/internal/partition/*`, etc.).
 
 ---
 
@@ -151,25 +151,25 @@ Storage internal ops routing:
 
 High-level path:
 
-1. Public insert endpoint handled in [`app/vlinsert/main.go`](../app/vlinsert/main.go#L38).
-2. Common params parsed in [`GetCommonParams`](../app/vlinsert/insertutil/common_params.go#L50).
-3. Buffered ingestion pipeline via [`CommonParams.NewLogMessageProcessor`](../app/vlinsert/insertutil/common_params.go#L348).
-4. Data sink resolved through `insertutil.LogRowsStorage` interface ([`common_params.go#L175`](../app/vlinsert/insertutil/common_params.go#L175)):
-   - Local single-node path: [`vlstorage.Storage.MustAddRows`](../app/vlstorage/main.go#L543) -> [`logstorage.Storage.MustAddRows`](../lib/logstorage/storage.go#L1139).
-   - Cluster frontend path: [`netinsert.Storage.AddRow`](../app/vlstorage/netinsert/netinsert.go#L375) -> `/internal/insert`.
-5. Storage-node ingress validates protocol in [`internalinsert.RequestHandler`](../app/vlinsert/internalinsert/internalinsert.go#L30).
+1. Public insert endpoint handled in [`app/vlinsert/main.go`](../app/vlinsert/main.go#L91).
+2. Common params parsed in [`GetCommonParams`](../app/vlinsert/insertutil/common_params.go#L121).
+3. Buffered ingestion pipeline via [`CommonParams.NewLogMessageProcessor`](../app/vlinsert/insertutil/common_params.go#L575).
+4. Data sink resolved through `insertutil.LogRowsStorage` interface ([`common_params.go#L254`](../app/vlinsert/insertutil/common_params.go#L254)):
+   - Local single-node path: [`vlstorage.Storage.MustAddRows`](../app/vlstorage/main.go#L718) -> [`logstorage.Storage.MustAddRows`](../lib/logstorage/storage.go#L1262).
+   - Cluster frontend path: [`netinsert.Storage.AddRow`](../app/vlstorage/netinsert/netinsert.go#L481) -> `/internal/insert`.
+5. Storage-node ingress validates protocol in [`internalinsert.RequestHandler`](../app/vlinsert/internalinsert/internalinsert.go#L77).
 
 ### Read Path (Select)
 
 High-level path:
 
-1. Public select endpoint handled in [`vlselect.RequestHandler`](../app/vlselect/main.go#L90).
-2. Query request parsed/executed through [`logsql.ProcessQueryRequest`](../app/vlselect/logsql/logsql.go#L1149), [`parseCommonArgs`](../app/vlselect/logsql/logsql.go#L1358), and [`newQueryContext`](../app/vlselect/logsql/logsql.go#L1350).
-3. Storage facade execution via [`vlstorage.RunQuery`](../app/vlstorage/main.go#L554).
+1. Public select endpoint handled in [`vlselect.RequestHandler`](../app/vlselect/main.go#L189).
+2. Query request parsed/executed through [`logsql.ProcessQueryRequest`](../app/vlselect/logsql/logsql.go#L1323), [`parseCommonArgs`](../app/vlselect/logsql/logsql.go#L1566), and [`newQueryContext`](../app/vlselect/logsql/logsql.go#L1548).
+3. Storage facade execution via [`vlstorage.RunQuery`](../app/vlstorage/main.go#L741).
 4. Execution mode split:
-   - Local mode: [`logstorage.Storage.RunQuery`](../lib/logstorage/storage_search.go#L208).
-   - Cluster mode: [`netselect.Storage.RunQuery`](../app/vlstorage/netselect/netselect.go#L385) -> `/internal/select/query`.
-5. Storage-node internal select handler starts in [`internalselect.processQueryRequest`](../app/vlselect/internalselect/internalselect.go#L94).
+   - Local mode: [`logstorage.Storage.RunQuery`](../lib/logstorage/storage_search.go#L274).
+   - Cluster mode: [`netselect.Storage.RunQuery`](../app/vlstorage/netselect/netselect.go#L442) -> `/internal/select/query`.
+5. Storage-node internal select handler starts in [`internalselect.processQueryRequest`](../app/vlselect/internalselect/internalselect.go#L162).
 
 ---
 
@@ -177,11 +177,11 @@ High-level path:
 
 | Internal API | Version Source | Enforced At |
 |--------------|----------------|-------------|
-| `/internal/insert` | [`netinsert.ProtocolVersion = "v1"`](../app/vlstorage/netinsert/netinsert.go#L33) | [`internalinsert.RequestHandler` version check](../app/vlinsert/internalinsert/internalinsert.go#L30) |
-| `/internal/select/query` | [`netselect.QueryProtocolVersion = "v4"`](../app/vlstorage/netselect/netselect.go#L63) | [`internalselect.processQueryRequest`](../app/vlselect/internalselect/internalselect.go#L95) |
-| `/internal/select/{field_names,field_values,streams,...}` | [`netselect` protocol constants](../app/vlstorage/netselect/netselect.go#L29) | corresponding `getCommonParams(...version)` calls in [`internalselect`](../app/vlselect/internalselect/internalselect.go#L185) |
-| `/internal/select/tenant_ids` | no dedicated protocol constant (`netselect` sends only `start`/`end`) in [`storageNode.getTenantIDs`](../app/vlstorage/netselect/netselect.go#L248) | no `checkProtocolVersion` in [`internalselect.processTenantIDsRequest`](../app/vlselect/internalselect/internalselect.go#L377) |
-| `/internal/delete/*` | [`Delete*ProtocolVersion = "v1"`](../app/vlstorage/netselect/netselect.go#L65) | internal delete handlers in [`internalselect`](../app/vlselect/internalselect/internalselect.go#L89) |
+| `/internal/insert` | [`netinsert.ProtocolVersion = "v1"`](../app/vlstorage/netinsert/netinsert.go#L74) | [`internalinsert.RequestHandler` version check](../app/vlinsert/internalinsert/internalinsert.go#L77) |
+| `/internal/select/query` | [`netselect.QueryProtocolVersion = "v4"`](../app/vlstorage/netselect/netselect.go#L94) | [`internalselect.processQueryRequest`](../app/vlselect/internalselect/internalselect.go#L163) |
+| `/internal/select/{field_names,field_values,streams,...}` | [`netselect` protocol constants](../app/vlstorage/netselect/netselect.go#L73) | corresponding `getCommonParams(...version)` calls in [`internalselect`](../app/vlselect/internalselect/internalselect.go#L254) |
+| `/internal/select/tenant_ids` | no dedicated protocol constant (`netselect` sends only `start`/`end`) in [`storageNode.getTenantIDs`](../app/vlstorage/netselect/netselect.go#L281) | no `checkProtocolVersion` in [`internalselect.processTenantIDsRequest`](../app/vlselect/internalselect/internalselect.go#L445) |
+| `/internal/delete/*` | [`Delete*ProtocolVersion = "v1"`](../app/vlstorage/netselect/netselect.go#L97) | internal delete handlers in [`internalselect`](../app/vlselect/internalselect/internalselect.go#L146) |
 
 Any wire format change must bump the corresponding protocol constant and both sender and receiver.
 
@@ -192,38 +192,38 @@ Any wire format change must bump the corresponding protocol constant and both se
 ### Tenant Propagation
 
 - Tenant identity is extracted from HTTP headers by [`GetTenantIDFromRequest`](../lib/logstorage/tenant_id.go#L73).
-- Ingestion common params include `TenantID` in [`CommonParams`](../app/vlinsert/insertutil/common_params.go#L30).
-- `/internal/insert` ignores non-zero tenant headers and resets tenant to zero tenant in [`internalinsert.RequestHandler`](../app/vlinsert/internalinsert/internalinsert.go#L48).
-- Query execution carries tenant scope through [`QueryContext.TenantIDs`](../lib/logstorage/storage_search.go#L32).
+- Ingestion common params include `TenantID` in [`CommonParams`](../app/vlinsert/insertutil/common_params.go#L74).
+- `/internal/insert` ignores non-zero tenant headers and resets tenant to zero tenant in [`internalinsert.RequestHandler`](../app/vlinsert/internalinsert/internalinsert.go#L94).
+- Query execution carries tenant scope through [`QueryContext.TenantIDs`](../lib/logstorage/storage_search.go#L85).
 
 ### Flow Control and Backpressure
 
 - Query concurrency at public API:
-  - Configured by [`-search.maxConcurrentRequests`](../app/vlselect/main.go#L25).
-  - Enforced in [`incRequestConcurrency`](../app/vlselect/main.go#L246).
+  - Configured by [`-search.maxConcurrentRequests`](../app/vlselect/main.go#L69).
+  - Enforced in [`incRequestConcurrency`](../app/vlselect/main.go#L375).
 - Query concurrency at storage-node internal API:
-  - Configured by [`-internalselect.maxConcurrentRequests`](../app/vlselect/internalselect/internalselect.go#L27).
-  - Enforced by channel gate in [`internalselect.RequestHandler`](../app/vlselect/internalselect/internalselect.go#L35).
+  - Configured by [`-internalselect.maxConcurrentRequests`](../app/vlselect/internalselect/internalselect.go#L78).
+  - Enforced by channel gate in [`internalselect.RequestHandler`](../app/vlselect/internalselect/internalselect.go#L88).
 - Ingest write protection:
-  - Local read-only check in [`vlstorage.Storage.CanWriteData`](../app/vlstorage/main.go#L524).
-  - `insertutil` calls storage gate via [`CanWriteData`](../app/vlinsert/insertutil/common_params.go#L193).
+  - Local read-only check in [`vlstorage.Storage.CanWriteData`](../app/vlstorage/main.go#L686).
+  - `insertutil` calls storage gate via [`CanWriteData`](../app/vlinsert/insertutil/common_params.go#L278).
 - Cluster insert retry/reroute:
-  - Node-local send path in [`mustSendInsertRequest`](../app/vlstorage/netinsert/netinsert.go#L195).
-  - Reroute fallback in [`sendInsertRequestToAnyNode`](../app/vlstorage/netinsert/netinsert.go#L381).
-  - If all storage nodes stay unavailable until shutdown, pending buffered data can be dropped in [`mustSendInsertRequest`](../app/vlstorage/netinsert/netinsert.go#L214).
+  - Node-local send path in [`mustSendInsertRequest`](../app/vlstorage/netinsert/netinsert.go#L282).
+  - Reroute fallback in [`sendInsertRequestToAnyNode`](../app/vlstorage/netinsert/netinsert.go#L491).
+  - If all storage nodes stay unavailable until shutdown, pending buffered data can be dropped in [`mustSendInsertRequest`](../app/vlstorage/netinsert/netinsert.go#L303).
 
 ### Timeouts and Partial Responses
 
-- `/select/logsql/tail` bypasses both per-request timeout and public query concurrency limit in [`selectHandler`](../app/vlselect/main.go#L183).
-- Per-request timeout creation in [`context.WithTimeout` usage](../app/vlselect/main.go#L198).
-- Query-context-level partial response flag in [`QueryContext.AllowPartialResponse`](../lib/logstorage/storage_search.go#L38).
-- Query options may override this behavior in [`newQueryContext`](../lib/logstorage/storage_search.go#L80).
-- Cluster query fanout applies `allowPartialResponse` when handling node errors in [`netselect.runQuery`](../app/vlstorage/netselect/netselect.go#L415).
+- `/select/logsql/tail` bypasses both per-request timeout and public query concurrency limit in [`selectHandler`](../app/vlselect/main.go#L297).
+- Per-request timeout creation in [`context.WithTimeout` usage](../app/vlselect/main.go#L310).
+- Query-context-level partial response flag in [`QueryContext.AllowPartialResponse`](../lib/logstorage/storage_search.go#L94).
+- Query options may override this behavior in [`newQueryContext`](../lib/logstorage/storage_search.go#L135).
+- Cluster query fanout applies `allowPartialResponse` when handling node errors in [`netselect.runQuery`](../app/vlstorage/netselect/netselect.go#L462).
 
 ### Observability and Metrics
 
-- Public select concurrency gauges/counters live in [`app/vlselect/main.go`](../app/vlselect/main.go#L73).
-- Storage health/size/read-only gauges are written in [`writeStorageMetrics`](../app/vlstorage/main.go#L667).
+- Public select concurrency gauges/counters live in [`app/vlselect/main.go`](../app/vlselect/main.go#L151).
+- Storage health/size/read-only gauges are written in [`writeStorageMetrics`](../app/vlstorage/main.go#L872).
 - Per-query storage I/O histograms are updated in [`UpdatePerQueryStatsMetrics`](../app/vlstorage/query_stats.go#L28).
 
 ---
@@ -233,24 +233,24 @@ Any wire format change must bump the corresponding protocol constant and both se
 If you need to change:
 
 - Public ingestion endpoint behavior:
-  - [`app/vlinsert/main.go`](../app/vlinsert/main.go#L38)
+  - [`app/vlinsert/main.go`](../app/vlinsert/main.go#L91)
   - Protocol handler under `app/vlinsert/<protocol>/`
 - Common ingestion params or row buffering:
-  - [`app/vlinsert/insertutil/common_params.go`](../app/vlinsert/insertutil/common_params.go#L50)
+  - [`app/vlinsert/insertutil/common_params.go`](../app/vlinsert/insertutil/common_params.go#L121)
 - Public select routing, limits, timeouts:
-  - [`app/vlselect/main.go`](../app/vlselect/main.go#L90)
+  - [`app/vlselect/main.go`](../app/vlselect/main.go#L189)
 - LogsQL parse/exec glue in API layer:
-  - [`app/vlselect/logsql/logsql.go`](../app/vlselect/logsql/logsql.go#L1149)
+  - [`app/vlselect/logsql/logsql.go`](../app/vlselect/logsql/logsql.go#L1323)
 - Cluster internal select/insert protocol behavior:
-  - [`app/vlselect/internalselect/internalselect.go`](../app/vlselect/internalselect/internalselect.go#L31)
-  - [`app/vlinsert/internalinsert/internalinsert.go`](../app/vlinsert/internalinsert/internalinsert.go#L24)
-  - [`app/vlstorage/netselect/netselect.go`](../app/vlstorage/netselect/netselect.go#L29)
-  - [`app/vlstorage/netinsert/netinsert.go`](../app/vlstorage/netinsert/netinsert.go#L30)
+  - [`app/vlselect/internalselect/internalselect.go`](../app/vlselect/internalselect/internalselect.go#L84)
+  - [`app/vlinsert/internalinsert/internalinsert.go`](../app/vlinsert/internalinsert/internalinsert.go#L70)
+  - [`app/vlstorage/netselect/netselect.go`](../app/vlstorage/netselect/netselect.go#L73)
+  - [`app/vlstorage/netinsert/netinsert.go`](../app/vlstorage/netinsert/netinsert.go#L71)
 - Local storage write/read/retention behavior:
   - [`lib/logstorage/storage.go`](../lib/logstorage/storage.go#L115)
-  - [`lib/logstorage/storage_search.go`](../lib/logstorage/storage_search.go#L208)
+  - [`lib/logstorage/storage_search.go`](../lib/logstorage/storage_search.go#L274)
 - LogsQL parser internals:
-  - [`lib/logstorage/parser.go`](../lib/logstorage/parser.go#L1671)
+  - [`lib/logstorage/parser.go`](../lib/logstorage/parser.go#L1806)
 
 ---
 
