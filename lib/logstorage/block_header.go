@@ -27,6 +27,30 @@ import (
 // blockHeader contains top-level metadata for a single block.
 //
 // It is stored in `indexFilename` and points to timestamps/columns metadata blocks.
+//
+// STORAGE LAYOUT:
+//
+//	┌──────────────────────────────────────────────────────────────────────────┐
+//	│                           indexFilename                                  │
+//	│  ┌────────────────────────────────────────────────────────────────────┐  │
+//	│  │ blockHeader[0] ──► points to timestampsHeader[0], columnsHeader[0] │  │
+//	│  │ blockHeader[1] ──► points to timestampsHeader[1], columnsHeader[1] │  │
+//	│  │ ...                                                                │  │
+//	│  └────────────────────────────────────────────────────────────────────┘  │
+//	└──────────────────────────────────────────────────────────────────────────┘
+//
+// Each blockHeader is the root of navigation for a single block. It contains:
+//   - streamID: Identifies which log stream this block belongs to (for partitioning)
+//   - rowsCount/uncompressedSizeBytes: Stats for query planning and metrics
+//   - timestampsHeader: Embedded directly (fixed-size), points to timestampsFilename
+//   - columnsHeaderIndex* fields: Point to columnsHeaderIndexFilename for column lookup
+//   - columnsHeader* fields: Point to columnsHeaderFilename for column metadata
+//
+// READ PATH:
+//  1. Load blockHeader from indexFilename
+//  2. Use timestampsHeader.blockOffset to read timestamps from timestampsFilename
+//  3. Use columnsHeaderIndexOffset/Size to read index from columnsHeaderIndexFilename
+//  4. Use columnsHeaderOffset/Size to read column metadata from columnsHeaderFilename
 type blockHeader struct {
 	// streamID is a stream id for entries in the block
 	streamID streamID
@@ -54,6 +78,7 @@ type blockHeader struct {
 }
 
 // reset clears all blockHeader fields for object reuse.
+// This is important for pooled objects to prevent data leakage between uses.
 func (bh *blockHeader) reset() {
 	bh.streamID.reset()
 	bh.uncompressedSizeBytes = 0
@@ -65,6 +90,7 @@ func (bh *blockHeader) reset() {
 	bh.columnsHeaderSize = 0
 }
 
+// copyFrom performs a deep copy of src into bh, including embedded structs.
 func (bh *blockHeader) copyFrom(src *blockHeader) {
 	bh.reset()
 
@@ -79,6 +105,16 @@ func (bh *blockHeader) copyFrom(src *blockHeader) {
 }
 
 // marshal appends a compact binary representation of bh to dst.
+//
+// BINARY FORMAT (all integers are varint-encoded for space efficiency):
+//
+//	[streamID bytes] [uncompressedSizeBytes] [rowsCount] [timestampsHeader fixed]
+//	[columnsHeaderIndexOffset] [columnsHeaderIndexSize] [columnsHeaderOffset] [columnsHeaderSize]
+//
+// The streamID is marshaled first because it's used for block ordering and filtering.
+// timestampsHeader is embedded inline (fixed 33 bytes) since it's always needed for queries.
+// Column header offsets/sizes are stored separately because they're only needed when
+// accessing specific columns.
 func (bh *blockHeader) marshal(dst []byte) []byte {
 	dst = bh.streamID.marshal(dst)
 	dst = encoding.MarshalVarUint64(dst, bh.uncompressedSizeBytes)
@@ -94,6 +130,14 @@ func (bh *blockHeader) marshal(dst []byte) []byte {
 
 // unmarshal reads bh from src according to partFormatVersion and returns remaining tail.
 // For format versions < 1, some nested structures include legacy fields.
+//
+// VERSION COMPATIBILITY:
+//   - partFormatVersion >= 1: Includes columnsHeaderIndexOffset/Size fields
+//   - partFormatVersion < 1:  These fields are omitted (legacy format)
+//
+// This versioning allows reading older parts without migration, enabling rolling upgrades.
+// The columnsHeaderIndex was added in format version 1 to enable O(1) column lookup
+// by name ID instead of linear scan.
 func (bh *blockHeader) unmarshal(src []byte, partFormatVersion uint) ([]byte, error) {
 	bh.reset()
 
@@ -172,6 +216,8 @@ func (bh *blockHeader) unmarshal(src []byte, partFormatVersion uint) ([]byte, er
 	return src, nil
 }
 
+// getBlockHeader returns a blockHeader from the pool, allocating if necessary.
+// Use putBlockHeader to return it after use to reduce GC pressure.
 func getBlockHeader() *blockHeader {
 	v := blockHeaderPool.Get()
 	if v == nil {
@@ -180,6 +226,8 @@ func getBlockHeader() *blockHeader {
 	return v.(*blockHeader)
 }
 
+// putBlockHeader returns a blockHeader to the pool after resetting it.
+// Always use this instead of letting blockHeaders be garbage collected.
 func putBlockHeader(bh *blockHeader) {
 	bh.reset()
 	blockHeaderPool.Put(bh)
@@ -188,6 +236,15 @@ func putBlockHeader(bh *blockHeader) {
 var blockHeaderPool sync.Pool
 
 // unmarshalBlockHeaders appends block headers decoded from src to dst and validates ordering invariants.
+//
+// ORDERING GUARANTEES (enforced by validateBlockHeaders):
+//  1. BlockHeaders are sorted by streamID (ascending)
+//  2. Within the same streamID, blocks are sorted by minTimestamp (ascending)
+//
+// These invariants enable:
+//   - Binary search to find blocks by streamID
+//   - Binary search to find blocks by time range within a stream
+//   - Efficient merge-join when reading from multiple parts
 func unmarshalBlockHeaders(dst []blockHeader, src []byte, partFormatVersion uint) ([]blockHeader, error) {
 	dstLen := len(dst)
 	for len(src) > 0 {
@@ -209,6 +266,16 @@ func unmarshalBlockHeaders(dst []blockHeader, src []byte, partFormatVersion uint
 	return dst, nil
 }
 
+// validateBlockHeaders verifies that block headers maintain required ordering invariants.
+//
+// INVARIANTS:
+//   - streamIDs must be non-decreasing across the array
+//   - Within same streamID, minTimestamps must be non-decreasing
+//
+// These invariants are critical for:
+//   - Correct binary search during block lookup
+//   - Proper merge-join behavior when combining parts
+//   - Time-based query optimization (early termination)
 func validateBlockHeaders(bhs []blockHeader) error {
 	for i := 1; i < len(bhs); i++ {
 		bhCurr := &bhs[i]
@@ -228,6 +295,8 @@ func validateBlockHeaders(bhs []blockHeader) error {
 	return nil
 }
 
+// resetBlockHeaders resets all headers in the slice and returns a zero-length slice
+// with the same underlying capacity, ready for reuse.
 func resetBlockHeaders(bhs []blockHeader) []blockHeader {
 	for i := range bhs {
 		bhs[i].reset()
@@ -236,6 +305,24 @@ func resetBlockHeaders(bhs []blockHeader) []blockHeader {
 }
 
 // columnHeaderRef points to a marshaled column header within a columnsHeader blob.
+//
+// This indirection layer enables O(1) column lookup by name ID:
+//
+//	┌─────────────────────────────────────────────────────────────────────────┐
+//	│                      columnsHeaderIndex                                 │
+//	│  columnHeaderRef[0]: columnNameID=5, offset=0    ──┐                    │
+//	│  columnHeaderRef[1]: columnNameID=2, offset=128  ──┼─┐                  │
+//	│  ...                                               │ │                  │
+//	└─────────────────────────────────────────────────────┼─┼────────────────┘
+//	                                                      │ │
+//	┌─────────────────────────────────────────────────────┼─┼────────────────┐
+//	│                      columnsHeader                  │ │                │
+//	│  [0:128]   columnHeader for column name ID 5    <───┘ │                │
+//	│  [128:256] columnHeader for column name ID 2    <─────┘                │
+//	│  ...                                                                    │
+//	└─────────────────────────────────────────────────────────────────────────┘
+//
+// The columnNameID maps to part.columnNames[columnNameID] to get the actual string.
 type columnHeaderRef struct {
 	// columnNameID is the ID of the column name. The column name can be obtained from part.columnNames.
 	columnNameID uint64
@@ -246,6 +333,19 @@ type columnHeaderRef struct {
 
 // columnsHeaderIndex contains offset tables for marshaled column and const-column headers.
 // Offsets are relative to the start of the associated marshaled columnsHeader blob.
+//
+// PURPOSE:
+// This index enables direct access to a specific column's metadata without parsing
+// all preceding columns. During query execution, when filtering on column "foo":
+//  1. Look up columnNameID for "foo" from part.columnNames
+//  2. Binary search columnsHeaderIndex.columnHeadersRefs for matching columnNameID
+//  3. Read columnsHeader blob at the stored offset
+//  4. Unmarshal just that single columnHeader
+//
+// CONST COLUMNS:
+// constColumns contain fields with identical values across all rows in the block
+// (e.g., static labels like hostname, environment). They're stored separately
+// because they don't need per-row value storage.
 type columnsHeaderIndex struct {
 	// columnHeadersRefs contains references to columnHeaders.
 	columnHeadersRefs []columnHeaderRef
@@ -254,6 +354,7 @@ type columnsHeaderIndex struct {
 	constColumnsRefs []columnHeaderRef
 }
 
+// getColumnsHeaderIndex returns a columnsHeaderIndex from the pool.
 func getColumnsHeaderIndex() *columnsHeaderIndex {
 	v := columnsHeaderIndexPool.Get()
 	if v == nil {
@@ -262,6 +363,7 @@ func getColumnsHeaderIndex() *columnsHeaderIndex {
 	return v.(*columnsHeaderIndex)
 }
 
+// putColumnsHeaderIndex returns a columnsHeaderIndex to the pool after resetting.
 func putColumnsHeaderIndex(cshIndex *columnsHeaderIndex) {
 	cshIndex.reset()
 	columnsHeaderIndexPool.Put(cshIndex)
@@ -269,6 +371,8 @@ func putColumnsHeaderIndex(cshIndex *columnsHeaderIndex) {
 
 var columnsHeaderIndexPool sync.Pool
 
+// reset clears all columnsHeaderIndex fields for reuse.
+// Uses clear() to zero out backing arrays for GC, then resets slice length.
 func (cshIndex *columnsHeaderIndex) reset() {
 	clear(cshIndex.columnHeadersRefs)
 	cshIndex.columnHeadersRefs = cshIndex.columnHeadersRefs[:0]
@@ -277,16 +381,24 @@ func (cshIndex *columnsHeaderIndex) reset() {
 	cshIndex.constColumnsRefs = cshIndex.constColumnsRefs[:0]
 }
 
+// resizeConstColumnsRefs resizes constColumnsRefs to n elements, returning the resized slice.
 func (cshIndex *columnsHeaderIndex) resizeConstColumnsRefs(n int) []columnHeaderRef {
 	cshIndex.constColumnsRefs = slicesutil.SetLength(cshIndex.constColumnsRefs, n)
 	return cshIndex.constColumnsRefs
 }
 
+// resizeColumnHeadersRefs resizes columnHeadersRefs to n elements, returning the resized slice.
 func (cshIndex *columnsHeaderIndex) resizeColumnHeadersRefs(n int) []columnHeaderRef {
 	cshIndex.columnHeadersRefs = slicesutil.SetLength(cshIndex.columnHeadersRefs, n)
 	return cshIndex.columnHeadersRefs
 }
 
+// marshal serializes the index as two consecutive ref arrays:
+//
+//	[count][columnHeaderRef[0]][columnHeaderRef[1]]...
+//	[count][constColumnRef[0]][constColumnRef[1]]...
+//
+// Each ref is varint-encoded: [columnNameID][offset]
 func (cshIndex *columnsHeaderIndex) marshal(dst []byte) []byte {
 	dst = marshalColumnHeadersRefs(dst, cshIndex.columnHeadersRefs)
 	dst = marshalColumnHeadersRefs(dst, cshIndex.constColumnsRefs)
@@ -294,6 +406,7 @@ func (cshIndex *columnsHeaderIndex) marshal(dst []byte) []byte {
 }
 
 // unmarshalInplace unmarshals cshIndex from src without copying payload bytes.
+// "Inplace" means the columnHeaderRef slices point into src.
 //
 // cshIndex is valid until src is changed.
 func (cshIndex *columnsHeaderIndex) unmarshalInplace(src []byte) error {
@@ -318,6 +431,16 @@ func (cshIndex *columnsHeaderIndex) unmarshalInplace(src []byte) error {
 	return nil
 }
 
+// marshalColumnHeadersRefs serializes a slice of columnHeaderRef to dst.
+//
+// BINARY FORMAT:
+//
+//	[VarUint64: count]
+//	[VarUint64: columnNameID[0]] [VarUint64: offset[0]]
+//	[VarUint64: columnNameID[1]] [VarUint64: offset[1]]
+//	...
+//
+// VarUint64 encoding saves space when IDs/offsets are small (common case).
 func marshalColumnHeadersRefs(dst []byte, refs []columnHeaderRef) []byte {
 	dst = encoding.MarshalVarUint64(dst, uint64(len(refs)))
 	for _, r := range refs {
@@ -329,6 +452,7 @@ func marshalColumnHeadersRefs(dst []byte, refs []columnHeaderRef) []byte {
 
 // unmarshalColumnHeadersRefsInplace appends unmarshaled from src column headers to dst and returns the result.
 //
+// "Inplace" means the returned columnHeaderRef structs point into src without copying.
 // The returned result is valid until src is changed.
 func unmarshalColumnHeadersRefsInplace(dst []columnHeaderRef, src []byte) ([]columnHeaderRef, []byte, error) {
 	srcOrig := src
@@ -361,6 +485,7 @@ func unmarshalColumnHeadersRefsInplace(dst []columnHeaderRef, src []byte) ([]col
 	return dst, src, nil
 }
 
+// getColumnsHeader returns a columnsHeader from the pool.
 func getColumnsHeader() *columnsHeader {
 	v := columnsHeaderPool.Get()
 	if v == nil {
@@ -369,6 +494,7 @@ func getColumnsHeader() *columnsHeader {
 	return v.(*columnsHeader)
 }
 
+// putColumnsHeader returns a columnsHeader to the pool after resetting.
 func putColumnsHeader(csh *columnsHeader) {
 	csh.reset()
 	columnsHeaderPool.Put(csh)
@@ -379,6 +505,13 @@ var columnsHeaderPool sync.Pool
 // columnsHeader contains metadata for all columns in a single block.
 //
 // It is stored in `columnsHeaderFilename` and paired with columnsHeaderIndex metadata.
+//
+// TWO COLUMN TYPES:
+//   - columnHeaders: Per-row columns with varying values (most log fields)
+//   - constColumns: Columns with identical values across all rows (e.g., _stream, static labels)
+//
+// Const columns are optimized: they store the value once in the header rather than
+// repeating it for each row. This saves significant space for high-cardinality static labels.
 type columnsHeader struct {
 	// columnHeaders contains the information about every column seen in the block.
 	columnHeaders []columnHeader
@@ -387,6 +520,7 @@ type columnsHeader struct {
 	constColumns []Field
 }
 
+// reset clears columnsHeader for reuse, resetting nested structs and clearing slice contents.
 func (csh *columnsHeader) reset() {
 	chs := csh.columnHeaders
 	for i := range chs {
@@ -401,16 +535,27 @@ func (csh *columnsHeader) reset() {
 	csh.constColumns = ccs[:0]
 }
 
+// resizeConstColumns resizes constColumns to n elements, returning the resized slice.
 func (csh *columnsHeader) resizeConstColumns(n int) []Field {
 	csh.constColumns = slicesutil.SetLength(csh.constColumns, n)
 	return csh.constColumns
 }
 
+// resizeColumnHeaders resizes columnHeaders to n elements, returning the resized slice.
 func (csh *columnsHeader) resizeColumnHeaders(n int) []columnHeader {
 	csh.columnHeaders = slicesutil.SetLength(csh.columnHeaders, n)
 	return csh.columnHeaders
 }
 
+// setColumnNames resolves columnNameID references to actual column names.
+//
+// This is called during block reading after:
+//  1. columnsHeaderIndex is unmarshaled (contains columnNameIDs and offsets)
+//  2. columnsHeader is unmarshaled (contains column metadata without names)
+//  3. part.columnNames is loaded (the global ID→name mapping)
+//
+// The function populates columnHeader.name and Field.Name fields by looking up
+// each columnNameID in the provided columnNames slice.
 func (csh *columnsHeader) setColumnNames(cshIndex *columnsHeaderIndex, columnNames []string) error {
 	if len(cshIndex.columnHeadersRefs) != len(csh.columnHeaders) {
 		return fmt.Errorf("unexpected number of column headers; got %d; want %d", len(cshIndex.columnHeadersRefs), len(csh.columnHeaders))
@@ -437,20 +582,65 @@ func (csh *columnsHeader) setColumnNames(cshIndex *columnsHeaderIndex, columnNam
 	return nil
 }
 
+// mustWriteTo serializes columnsHeader and its index to disk, updating blockHeader with locations.
+//
+// STORAGE ARCHITECTURE OVERVIEW:
+// This function writes two separate files that work together for column metadata lookup:
+//
+//	┌─────────────────────────────────────────────────────────────────────────┐
+//	│                          blockHeader (in indexFilename)                 │
+//	│  ┌─────────────────────────────────────────────────────────────────┐   │
+//	│  │ columnsHeaderIndexOffset/Size ──► columnsHeaderIndexFilename    │   │
+//	│  │ columnsHeaderOffset/Size ──────► columnsHeaderFilename          │   │
+//	│  └─────────────────────────────────────────────────────────────────┘   │
+//	└─────────────────────────────────────────────────────────────────────────┘
+//
+// READ PATH (during querying):
+//  1. Load blockHeader from indexFilename to get offsets/sizes
+//  2. Read columnsHeaderIndex blob from columnsHeaderIndexFilename
+//  3. Resolve column name IDs via part.columnNames (global name→ID mapping)
+//  4. Read columnsHeader blob from columnsHeaderFilename
+//  5. Use columnsHeaderIndex to locate specific columnHeader by columnNameID
+//
+// WHY TWO FILES?
+//   - columnsHeaderFilename: Contains variable-length columnHeader data (value ranges, bloom locations)
+//   - columnsHeaderIndexFilename: Fixed-size offset table for O(1) column lookup by name ID
+//   - Separation enables efficient random access to specific columns without parsing entire blob
+//
+// RELATIONSHIP TO OTHER COMPONENTS:
+//   - blockHeader: Receives offset/size pairs for both files, stored in indexFilename
+//   - streamWriters: Manages append-only writers for columnsHeaderIndexFilename and columnsHeaderFilename
+//   - columnNameIDGenerator: Assigns unique IDs to column names (shared across all blocks in a part)
+//   - part.columnNames: Global slice that maps columnNameID → actual string (stored separately)
 func (csh *columnsHeader) mustWriteTo(bh *blockHeader, sw *streamWriters) {
+	// Acquire a buffer from the pool for marshaling both blobs.
+	// This buffer is shared across the function and reused for both outputs.
 	bb := longTermBufPool.Get()
 	defer longTermBufPool.Put(bb)
 
+	// Allocate an index structure that will track where each columnHeader
+	// is located within the serialized columnsHeader blob.
 	cshIndex := getColumnsHeaderIndex()
 
+	// PHASE 1: Marshal columnsHeader while building the index.
+	// The marshal method populates cshIndex with columnNameID→offset mappings
+	// as it serializes each columnHeader and constColumn.
+	// columnNameIDGenerator ensures consistent ID assignment across all blocks.
 	bb.B = csh.marshal(bb.B, cshIndex, &sw.columnNameIDGenerator)
 	columnsHeaderData := bb.B
 
+	// PHASE 2: Marshal the index itself.
+	// The index is appended after the header data in the same buffer.
+	// columnsHeaderIndexData is a slice pointing to the index portion.
 	bb.B = cshIndex.marshal(bb.B)
 	columnsHeaderIndexData := bb.B[len(columnsHeaderData):]
 
+	// Return the index to the pool now that we've captured its serialized form.
 	putColumnsHeaderIndex(cshIndex)
 
+	// PHASE 3: Write columnsHeaderIndex to columnsHeaderIndexFilename.
+	// Record the file offset and size in blockHeader so readers can locate this blob.
+	// The offset is the current write position before writing (append-only semantics).
 	bh.columnsHeaderIndexOffset = sw.columnsHeaderIndexWriter.bytesWritten
 	bh.columnsHeaderIndexSize = uint64(len(columnsHeaderIndexData))
 	if bh.columnsHeaderIndexSize > maxColumnsHeaderIndexSize {
@@ -458,6 +648,9 @@ func (csh *columnsHeader) mustWriteTo(bh *blockHeader, sw *streamWriters) {
 	}
 	sw.columnsHeaderIndexWriter.MustWrite(columnsHeaderIndexData)
 
+	// PHASE 4: Write columnsHeader to columnsHeaderFilename.
+	// Same pattern: record offset/size in blockHeader for later retrieval.
+	// The offset points into columnsHeaderFilename, separate from the index file.
 	bh.columnsHeaderOffset = sw.columnsHeaderWriter.bytesWritten
 	bh.columnsHeaderSize = uint64(len(columnsHeaderData))
 	if bh.columnsHeaderSize > maxColumnsHeaderSize {
@@ -466,6 +659,17 @@ func (csh *columnsHeader) mustWriteTo(bh *blockHeader, sw *streamWriters) {
 	sw.columnsHeaderWriter.MustWrite(columnsHeaderData)
 }
 
+// marshal serializes columnsHeader while simultaneously building the index.
+//
+// DUAL OUTPUT:
+//   - Returns marshaled columnsHeader data appended to dst
+//   - Populates cshIndex with columnNameID→offset mappings
+//
+// WHY BUILD INDEX DURING MARSHAL?
+// The offset of each columnHeader is only known as we serialize (variable-length encoding).
+// By building the index simultaneously, we capture exact offsets without a two-pass approach.
+//
+// columnNameIDGenerator ensures column names get consistent IDs across all blocks in a part.
 func (csh *columnsHeader) marshal(dst []byte, cshIndex *columnsHeaderIndex, g *columnNameIDGenerator) []byte {
 	dstLen := len(dst)
 
@@ -500,7 +704,12 @@ func (csh *columnsHeader) marshal(dst []byte, cshIndex *columnsHeaderIndex, g *c
 
 // unmarshalInplace unmarshals csh from src, enforcing hard limits on column counts.
 //
-// csh is valid until src is changed.
+// "Inplace" means the columnHeaders and constColumns slices point directly into src
+// without copying. This is a performance optimization but means:
+//   - csh is only valid while src remains unchanged
+//   - Caller must not modify or free src while using csh
+//
+// SECURITY: The 1e6 limit prevents memory exhaustion from malformed data.
 func (csh *columnsHeader) unmarshalInplace(src []byte, partFormatVersion uint) error {
 	csh.reset()
 
@@ -564,6 +773,8 @@ func (csh *columnsHeader) unmarshalInplace(src []byte, partFormatVersion uint) e
 	return nil
 }
 
+// getNamesFromColumnHeaders extracts column names from a slice of columnHeader.
+// Used in error messages to help diagnose issues with too many columns.
 func getNamesFromColumnHeaders(chs []columnHeader) []string {
 	a := make([]string, 0, len(chs))
 	for _, ch := range chs {
@@ -596,6 +807,15 @@ func getNamesFromColumnHeaders(chs []columnHeader) []string {
 // Bloom filters for main column with an empty name is stored in messageBloomFilename,
 // while the rest of columns are stored in smallBloomFilename or bigBloomFilename depending on their size
 // (see maxSmallBloomFilterBlockSize).
+//
+// ON-DISK LAYOUT FOR A COLUMN:
+//
+//	┌─────────────────────────────────────────────────────────────────────────┐
+//	│                         columnHeader (in columnsHeaderFilename)         │
+//	│  valueType, minValue, maxValue, valuesDict (if dict),                  │
+//	│  valuesOffset/Size ──────────────────────────────► [values file]       │
+//	│  bloomFilterOffset/Size ─────────────────────────► [bloom file]        │
+//	└─────────────────────────────────────────────────────────────────────────┘
 type columnHeader struct {
 	// name contains column name aka label name
 	name string
@@ -629,7 +849,7 @@ type columnHeader struct {
 	bloomFilterSize uint64
 }
 
-// reset clears ch for reuse.
+// reset clears ch for reuse, zeroing all fields including nested valuesDict.
 func (ch *columnHeader) reset() {
 	ch.name = ""
 	ch.valueType = 0
@@ -647,6 +867,24 @@ func (ch *columnHeader) reset() {
 
 // marshal appends binary-encoded column metadata to dst.
 // The encoding format depends on valueType.
+//
+// NOTE: Column name is NOT encoded here. It's stored separately in columnsHeaderIndex
+// to enable deduplication across blocks (same name → same ID).
+//
+// BINARY FORMAT BY valueType:
+//
+//	All types start with: [1 byte: valueType]
+//
+//	valueTypeString:     [valuesOffset] [valuesSize] [bloomFilterOffset] [bloomFilterSize]
+//	valueTypeDict:       [valuesDict...] [valuesOffset] [valuesSize]  (no bloom)
+//	valueTypeUint8:      [1 byte: minValue] [1 byte: maxValue] [values...] [bloom...]
+//	valueTypeUint16:     [2 bytes: minValue] [2 bytes: maxValue] [values...] [bloom...]
+//	valueTypeUint32:     [4 bytes: minValue] [4 bytes: maxValue] [values...] [bloom...]
+//	valueTypeUint64:     [8 bytes: minValue] [8 bytes: maxValue] [values...] [bloom...]
+//	valueTypeInt64:      [8 bytes: minValue] [8 bytes: maxValue] [values...] [bloom...]
+//	valueTypeFloat64:    [8 bytes: minValue] [8 bytes: maxValue] [values...] [bloom...]
+//	valueTypeIPv4:       [4 bytes: minValue] [4 bytes: maxValue] [values...] [bloom...]
+//	valueTypeTimestamp:  [8 bytes: minValue] [8 bytes: maxValue] [values...] [bloom...]
 func (ch *columnHeader) marshal(dst []byte) []byte {
 	// check minValue/maxValue
 	switch ch.valueType {
@@ -727,18 +965,29 @@ func (ch *columnHeader) marshal(dst []byte) []byte {
 	return dst
 }
 
+// marshalValuesAndBloomFilters is a helper that marshals both values and bloom filter locations.
 func (ch *columnHeader) marshalValuesAndBloomFilters(dst []byte) []byte {
 	dst = ch.marshalValues(dst)
 	dst = ch.marshalBloomFilters(dst)
 	return dst
 }
 
+// marshalValues encodes the values file location (offset and size).
+// The actual values file depends on column name:
+//   - Empty name (""): messageValuesFilename
+//   - Other columns: smallValuesFilename or bigValuesFilename based on size
 func (ch *columnHeader) marshalValues(dst []byte) []byte {
 	dst = encoding.MarshalVarUint64(dst, ch.valuesOffset)
 	dst = encoding.MarshalVarUint64(dst, ch.valuesSize)
 	return dst
 }
 
+// marshalBloomFilters encodes the bloom filter file location.
+// Bloom filters enable fast negative lookups: if a token isn't in the filter,
+// the column definitely doesn't contain that value.
+//
+// File selection matches values file: messageBloomFilename for message column,
+// smallBloomFilename/bigBloomFilename for others.
 func (ch *columnHeader) marshalBloomFilters(dst []byte) []byte {
 	dst = encoding.MarshalVarUint64(dst, ch.bloomFilterOffset)
 	dst = encoding.MarshalVarUint64(dst, ch.bloomFilterSize)
@@ -748,7 +997,12 @@ func (ch *columnHeader) marshalBloomFilters(dst []byte) []byte {
 // unmarshalInplace unmarshals ch from src and returns remaining tail.
 // For part format versions < 1, the column name is embedded in this payload.
 //
+// "Inplace" means strings/slices point into src without copying.
 // ch is valid until src is changed.
+//
+// VERSION DIFFERENCES:
+//   - partFormatVersion < 1: Column name is read from src (legacy inline storage)
+//   - partFormatVersion >= 1: Column name is resolved via columnsHeaderIndex
 func (ch *columnHeader) unmarshalInplace(src []byte, partFormatVersion uint) ([]byte, error) {
 	ch.reset()
 
@@ -904,6 +1158,7 @@ func (ch *columnHeader) unmarshalInplace(src []byte, partFormatVersion uint) ([]
 	return src, nil
 }
 
+// unmarshalValuesAndBloomFilters is a helper that unmarshals both values and bloom filter locations.
 func (ch *columnHeader) unmarshalValuesAndBloomFilters(src []byte) ([]byte, error) {
 	srcOrig := src
 
@@ -922,6 +1177,7 @@ func (ch *columnHeader) unmarshalValuesAndBloomFilters(src []byte) ([]byte, erro
 	return src, nil
 }
 
+// unmarshalValues reads the values file offset/size, validating against maxValuesBlockSize.
 func (ch *columnHeader) unmarshalValues(src []byte) ([]byte, error) {
 	srcOrig := src
 
@@ -945,6 +1201,7 @@ func (ch *columnHeader) unmarshalValues(src []byte) ([]byte, error) {
 	return src, nil
 }
 
+// unmarshalBloomFilters reads the bloom filter file offset/size, validating against maxBloomFilterBlockSize.
 func (ch *columnHeader) unmarshalBloomFilters(src []byte) ([]byte, error) {
 	srcOrig := src
 
@@ -969,6 +1226,18 @@ func (ch *columnHeader) unmarshalBloomFilters(src []byte) ([]byte, error) {
 }
 
 // timestampsHeader contains location and encoding info for a block's timestamps payload.
+//
+// Unlike columnsHeader (stored in separate file), timestampsHeader is embedded directly
+// in blockHeader because:
+//   - It's always needed for queries (time-based filtering is universal)
+//   - It has a fixed size (33 bytes), so no need for separate indexing
+//
+// TIME RANGE OPTIMIZATION:
+// minTimestamp/maxTimestamp enable fast time-based query pruning:
+//   - If query range is [start, end] and maxTimestamp < start, skip entire block
+//   - If minTimestamp > end, skip entire block
+//
+// This avoids reading the timestamps file for non-matching blocks.
 type timestampsHeader struct {
 	// blockOffset is an offset of timestamps block inside timestampsFilename file
 	blockOffset uint64
@@ -995,6 +1264,7 @@ func (th *timestampsHeader) reset() {
 	th.marshalType = 0
 }
 
+// copyFrom copies all fields from src timestampsHeader.
 func (th *timestampsHeader) copyFrom(src *timestampsHeader) {
 	th.blockOffset = src.blockOffset
 	th.blockSize = src.blockSize
@@ -1003,6 +1273,8 @@ func (th *timestampsHeader) copyFrom(src *timestampsHeader) {
 	th.marshalType = src.marshalType
 }
 
+// subTimeOffset adjusts timestamps by subtracting a time offset.
+// Used when merging parts with different time bases to normalize timestamps.
 func (th *timestampsHeader) subTimeOffset(timeOffset int64) {
 	if timeOffset != 0 {
 		th.minTimestamp = SubInt64NoOverflow(th.minTimestamp, timeOffset)
@@ -1011,6 +1283,16 @@ func (th *timestampsHeader) subTimeOffset(timeOffset int64) {
 }
 
 // marshal appends fixed-width binary encoding of th to dst.
+//
+// BINARY FORMAT (fixed 33 bytes total):
+//
+//	[8 bytes: blockOffset] [8 bytes: blockSize]
+//	[8 bytes: minTimestamp] [8 bytes: maxTimestamp]
+//	[1 byte: marshalType]
+//
+// Fixed-width encoding enables:
+//   - Predictable offsets for binary search over blockHeaders
+//   - No varint decoding overhead for hot-path timestamp access
 func (th *timestampsHeader) marshal(dst []byte) []byte {
 	dst = encoding.MarshalUint64(dst, th.blockOffset)
 	dst = encoding.MarshalUint64(dst, th.blockSize)
