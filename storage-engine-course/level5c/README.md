@@ -39,11 +39,16 @@ part_20240315_093000.000_20240315_094500.000_ABC123/
   index.bin                  ← block headers grouped into index blocks
   columns_header_index.bin   ← per-block column lookup table
   columns_header.bin         ← per-block column metadata (type, offsets, min/max)
-  timestamps.bin             ← compressed timestamp arrays, one per block
+  timestamps.bin             ← compressed timestamp arrays, one array per block (not per column —
+                                every row has exactly one timestamp; they are stored together as a
+                                single array for the whole block)
   message_bloom.bin          ← bloom filters for the _msg column
   message_values.bin         ← encoded values for the _msg column
-  bloom.bin0 ... bloom.binN  ← bloom filters for field columns (sharded)
-  values.bin0 ... values.binN← encoded values for field columns (sharded)
+  bloom.bin0 ... bloom.binN  ← bloom filters for field columns (sharded by column, multiple blocks
+                                per file — offset stored in columnHeader locates a specific
+                                block's data for a specific column)
+  values.bin0 ... values.binN← encoded values for field columns (same sharding: multiple blocks ×
+                                multiple columns packed into each shard file)
 ```
 
 Each file is append-only during construction. The writer streams blocks sequentially, recording offsets as it goes. The reader uses those offsets for random access.
@@ -95,8 +100,10 @@ blockHeader {
     rowsCount                  ← rows in this block
     uncompressedSizeBytes      ← original data size
     timestampsHeader {
-        blockOffset            ← byte position in timestamps.bin
-        blockSize              ← compressed size in timestamps.bin
+        blockOffset            ← byte position in timestamps.bin where THIS block's
+                                  timestamp array begins (timestamps are per-block, not
+                                  per-column; all rows in the block share one array)
+        blockSize              ← compressed size of that array in timestamps.bin
         minTimestamp            ← earliest timestamp in block
         maxTimestamp            ← latest timestamp in block
     }
@@ -175,6 +182,42 @@ columnHeader {
     bloomFilterSize    ← compressed size in bloom.binN
 }
 ```
+
+Concretely, for a block containing `{host="web-01", env="prod", level, status, _msg}` where
+`host` and `env` are identical across all rows, the blob looks like:
+
+```
+columns_header.bin  (this block's blob, starting at bh.columnsHeaderOffset)
+┌────────────────────────────────────────────────────────────────────────┐
+│  columnHeader for "level"                           bytes [0 .. 63]    │
+│    valueType    = valueTypeDict                                         │
+│    valuesDict   = {"error", "info", "warn"}  ← inline, no bloom needed │
+│    minValue     = 0  (unused for dict type)                             │
+│    maxValue     = 0                                                     │
+│    valuesOffset = 4096  ← seek here in values.bin0                     │
+│    valuesSize   = 12                                                    │
+│    bloomOffset  = 0    (dict type skips bloom filter)                   │
+│    bloomSize    = 0                                                     │
+├────────────────────────────────────────────────────────────────────────┤
+│  columnHeader for "status"                          bytes [64 .. 127]  │
+│    valueType    = valueTypeUint16                                       │
+│    minValue     = 200  ← range pruning: skip block if query min > 503  │
+│    maxValue     = 503                                                   │
+│    valuesOffset = 512   ← seek here in values.bin1                     │
+│    valuesSize   = 10                                                    │
+│    bloomOffset  = 128  ← seek here in bloom.bin1                       │
+│    bloomSize    = 32                                                    │
+├────────────────────────────────────────────────────────────────────────┤
+│  constColumn: host = "web-01"               bytes [128 .. 143]         │
+│  constColumn: env  = "prod"                 bytes [144 .. 159]         │
+│    (value stored once here; no entry in values.binN needed)            │
+└────────────────────────────────────────────────────────────────────────┘
+
+Note: _msg uses message_values.bin / message_bloom.bin — not in this blob.
+```
+
+`host` and `env` are **const columns**: all rows in the block share the same value, so the
+value is stored once in the header itself rather than in a values file.
 
 The `minValue`/`maxValue` fields are what make range queries efficient. A query like `status >= 400` can skip any block where `columnHeader.maxValue < 400` without reading the values file at all.
 
